@@ -195,7 +195,7 @@ def generate_signal_chart(
 
         # Title
         fig.suptitle(
-            f"{'🟢' if direction == 'BUY' else '🔴'} {symbol} — {company_name}\n"
+            f"[{direction}] {symbol} — {company_name}\n"
             f"Signal: {signal_label}"
             + (f" ({indicator_value:.2f})" if indicator_value else ""),
             color=COLORS["fg"],

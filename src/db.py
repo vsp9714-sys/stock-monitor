@@ -8,7 +8,7 @@ Manages:
   - signal_log     : full historical signal log
 """
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -114,7 +114,7 @@ class Signal(Base):
     chart_path = Column(String(300))                    # local path to chart image
     notified = Column(Boolean, default=False)
     notified_at = Column(DateTime)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
         UniqueConstraint(
@@ -173,7 +173,7 @@ def upsert_signal(session: Session, symbol: str, signal_date: date, signal_type:
         indicator_value=indicator_value,
         indicator_detail=indicator_detail,
         chart_path=chart_path,
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
     )
     session.add(sig)
     session.commit()
@@ -185,7 +185,7 @@ def mark_signal_notified(session: Session, signal_id: int) -> None:
     sig = session.get(Signal, signal_id)
     if sig:
         sig.notified = True
-        sig.notified_at = datetime.utcnow()
+        sig.notified_at = datetime.now(timezone.utc)
         session.commit()
 
 
