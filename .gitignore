@@ -1,0 +1,34 @@
+# Gitignore for stock-monitor
+# Secrets (NEVER commit)
+config/secrets.yaml
+
+# Database
+data/
+
+# Generated charts
+charts/output/
+
+# Virtual environment
+.venv/
+venv/
+
+# Token cache
+data/upstox_token.json
+
+# Logs
+logs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Environment files
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp

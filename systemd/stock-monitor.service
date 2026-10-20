@@ -1,0 +1,32 @@
+[Unit]
+Description=Stock Monitor — Indian Market Swing Trading Signal Detector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+
+WorkingDirectory=/home/ubuntu/repos/stock-monitor
+Environment="PATH=/home/ubuntu/repos/stock-monitor/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONPATH=/home/ubuntu/repos/stock-monitor"
+
+ExecStart=/home/ubuntu/repos/stock-monitor/.venv/bin/python -m src.main
+
+# Restart policy — restart on crash, but not on clean exit (e.g., shutdown)
+Restart=on-failure
+RestartSec=30s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Logging
+StandardOutput=append:/home/ubuntu/repos/stock-monitor/logs/systemd.log
+StandardError=append:/home/ubuntu/repos/stock-monitor/logs/systemd_error.log
+
+# Resource limits (OCI instance friendly)
+LimitNOFILE=65536
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

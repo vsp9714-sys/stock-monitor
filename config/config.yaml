@@ -1,0 +1,115 @@
+# stock-monitor configuration
+# Copy this to config/secrets.yaml for actual keys (secrets.yaml is gitignored)
+
+# ─── Upstox API ────────────────────────────────────────────────────────────────
+upstox:
+  api_key: "YOUR_UPSTOX_API_KEY"
+  api_secret: "YOUR_UPSTOX_API_SECRET"
+  redirect_uri: "http://localhost:8080/callback"
+  # Token is auto-refreshed. Initial token must be generated manually once.
+  # See docs/upstox_auth.md for setup steps.
+  access_token: ""
+
+# ─── Market Schedule ──────────────────────────────────────────────────────────
+market:
+  timezone: "Asia/Kolkata"
+  open_time: "09:15"
+  close_time: "15:30"
+  # Scan interval in minutes (during market hours)
+  scan_interval_minutes: 15
+  # Days of the week to scan (0=Mon, 6=Sun)
+  trading_days: [0, 1, 2, 3, 4]
+
+# ─── Signal Configuration ─────────────────────────────────────────────────────
+signals:
+  rsi:
+    enabled: true
+    period: 14
+    oversold_threshold: 30       # RSI below this → BUY signal
+    overbought_threshold: 70     # RSI above this → SELL signal
+
+  macd:
+    enabled: true
+    fast_period: 12
+    slow_period: 26
+    signal_period: 9
+
+  ema_crossover:
+    enabled: true
+    # Pairs to monitor: [fast, slow]
+    pairs:
+      - [9, 21]
+      - [21, 50]
+      - [50, 200]
+
+  volume_breakout:
+    enabled: true
+    # Volume must be N× the 20-day average to trigger
+    volume_multiplier: 2.0
+    # Price must break above N-day high
+    breakout_lookback_days: 20
+
+# ─── Stock Universe ──────────────────────────────────────────────────────────
+universe:
+  # Options: "all_nse", "all_bse", "nifty50", "nifty500", "custom"
+  mode: "all_nse"
+  # Custom list (only used when mode = "custom")
+  custom_symbols: []
+  # Minimum market cap filter (in Crores). 0 = no filter.
+  min_mcap_cr: 0
+  # Exclude penny stocks below this price (INR)
+  min_price: 10
+
+# ─── Fundamental Data ─────────────────────────────────────────────────────────
+fundamentals:
+  # Screener.in scraping (respects rate limits)
+  screener_base_url: "https://www.screener.in"
+  # Cache TTL in hours (fundamental data doesn't change frequently)
+  cache_ttl_hours: 24
+  # Rate limit delay between requests (seconds)
+  request_delay_seconds: 2.0
+
+# ─── Notifications ───────────────────────────────────────────────────────────
+notifications:
+  # Enable/disable individual notifiers
+  telegram:
+    enabled: true
+    bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
+    chat_id: "YOUR_TELEGRAM_CHAT_ID"
+    # Send chart image with alert?
+    send_chart: true
+
+  discord:
+    enabled: false
+    webhook_url: "YOUR_DISCORD_WEBHOOK_URL"
+    send_chart: true
+
+  email:
+    enabled: false
+    smtp_host: "smtp.gmail.com"
+    smtp_port: 587
+    username: "YOUR_EMAIL@gmail.com"
+    password: "YOUR_APP_PASSWORD"
+    from_addr: "YOUR_EMAIL@gmail.com"
+    to_addrs:
+      - "YOUR_EMAIL@gmail.com"
+    send_chart: false  # Email attachments are slow
+
+  whatsapp:
+    enabled: false
+    # Uses Twilio WhatsApp sandbox
+    account_sid: "YOUR_TWILIO_SID"
+    auth_token: "YOUR_TWILIO_AUTH_TOKEN"
+    from_number: "whatsapp:+14155238886"
+    to_number: "whatsapp:+91XXXXXXXXXX"
+
+# ─── Database ─────────────────────────────────────────────────────────────────
+database:
+  path: "data/stocks.db"
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+logging:
+  level: "INFO"
+  log_dir: "logs"
+  # Rotate logs daily, keep 7 days
+  backup_count: 7
