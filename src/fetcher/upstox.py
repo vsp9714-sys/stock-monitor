@@ -135,8 +135,11 @@ class UpstoxFetcher:
             compression="gzip",
             dtype=str,
         )
-        # Filter equity instruments only
-        df = df[df["instrument_type"] == "EQ"].copy()
+        # Filter equity company stocks only (Upstox uses EQUITY and instrument_key with INE for company stocks)
+        is_eq = (df["instrument_type"].isin(["EQ", "EQUITY"])) & (
+            df["instrument_key"].str.contains(r"\|INE", na=False)
+        )
+        df = df[is_eq].copy()
         logger.info(f"Downloaded {len(df)} {exchange} equity instruments.")
         return df
 
@@ -145,10 +148,15 @@ class UpstoxFetcher:
         df = self.download_instruments(exchange)
         records = []
         for _, row in df.iterrows():
+            inst_key = str(row.get("instrument_key", "")).strip()
+            isin = str(row.get("isin", "")).strip()
+            if not isin and "|" in inst_key:
+                isin = inst_key.split("|", 1)[1]
+
             records.append({
                 "symbol": str(row.get("tradingsymbol", "")).strip(),
-                "instrument_key": str(row.get("instrument_key", "")).strip(),
-                "isin": str(row.get("isin", "")).strip(),
+                "instrument_key": inst_key,
+                "isin": isin,
                 "company_name": str(row.get("name", "")).strip(),
                 "exchange": exchange,
                 "series": str(row.get("series", "EQ")).strip(),

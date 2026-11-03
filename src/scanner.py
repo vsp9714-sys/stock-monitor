@@ -26,6 +26,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Optional
 
+import pandas as pd
+
 from src.config_loader import get_config
 from src.db import (
     Stock,
@@ -129,11 +131,21 @@ class Scanner:
         finally:
             session.close()
 
-    def get_active_stocks(self) -> list[Stock]:
+    def get_active_stocks(self, limit: Optional[int] = None) -> list[Stock]:
         """Get all active stocks from the DB."""
         session = get_session()
         try:
-            stocks = session.query(Stock).filter_by(is_active=True).all()
+            mode = self.universe_cfg.get("mode", "all_nse")
+            custom_symbols = self.universe_cfg.get("custom_symbols", [])
+
+            query = session.query(Stock).filter_by(is_active=True)
+            if mode == "custom" and custom_symbols:
+                query = query.filter(Stock.symbol.in_(custom_symbols))
+
+            if limit:
+                query = query.limit(limit)
+
+            stocks = query.all()
             # Detach from session (avoid lazy loading issues in threads)
             session.expunge_all()
             return stocks
@@ -142,21 +154,21 @@ class Scanner:
 
     # ─── Single Stock Scan ───────────────────────────────────────────────
 
-    def _scan_stock(self, stock: Stock) -> list[dict]:
+    def _scan_stock(self, stock: Stock) -> tuple[list[dict], Optional[pd.DataFrame]]:
         """
         Scan a single stock for all enabled signals.
-        Returns list of triggered signal dicts.
+        Returns (list of triggered signal dicts, df of daily candles).
         """
         triggered = []
         try:
             # Fetch 250 days of daily candles
             df = self.fetcher.get_daily_candles(stock.instrument_key, days=250)
             if df.empty or len(df) < 30:
-                return []
+                return [], None
 
             price_floor = self.universe_cfg.get("min_price", 10)
             if df["close"].iloc[-1] < price_floor:
-                return []  # Skip penny stocks
+                return [], None  # Skip penny stocks
 
             # ── RSI ─────────────────────────────────────────────────────
             if self.signal_cfg.get("rsi", {}).get("enabled", True):
@@ -237,21 +249,21 @@ class Scanner:
                         },
                     })
 
-            return triggered
+            return triggered, df
 
         except Exception as e:
             logger.error(f"Error scanning {stock.symbol}: {e}", exc_info=False)
-            return []
+            return [], None
 
     # ─── Full Scan Cycle ─────────────────────────────────────────────────
 
-    def run_scan(self) -> int:
+    def run_scan(self, limit: Optional[int] = None) -> int:
         """
-        Run a full scan across all active stocks.
+        Run a full scan across active stocks.
         Returns number of new signals detected.
         """
         logger.info("Starting market scan...")
-        stocks = self.get_active_stocks()
+        stocks = self.get_active_stocks(limit=limit)
         if not stocks:
             logger.warning("No stocks in database. Run refresh_instrument_master() first.")
             return 0
@@ -268,10 +280,10 @@ class Scanner:
             for future in as_completed(futures):
                 stock = futures[future]
                 try:
-                    signals = future.result()
+                    signals, df = future.result()
                 except Exception as e:
                     logger.error(f"Future error for {stock.symbol}: {e}")
-                    signals = []
+                    signals, df = [], None
 
                 if not signals:
                     continue
@@ -283,9 +295,8 @@ class Scanner:
                         fund = self.fundamentals.get_fundamentals(stock.symbol, stock.isin or "")
 
                         # Generate chart
-                        df = self.fetcher.get_daily_candles(stock.instrument_key, days=250)
                         chart_path = None
-                        if not df.empty:
+                        if df is not None and not df.empty:
                             from charts.chart_generator import generate_signal_chart
                             chart_path = generate_signal_chart(
                                 symbol=stock.symbol,
