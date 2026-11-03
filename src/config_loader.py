@@ -25,8 +25,36 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+def _load_dotenv() -> None:
+    """Load key-value pairs from .env file into os.environ if present."""
+    candidate_paths = [
+        Path(__file__).parent.parent / ".env",
+        Path.home() / ".env",
+        Path("/home/ubuntu/.env"),
+    ]
+    for env_path in candidate_paths:
+        if env_path.exists() and env_path.is_file():
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        if line.startswith("export "):
+                            line = line[len("export "):].strip()
+                        key, val = line.split("=", 1)
+                        key = key.strip()
+                        val = val.strip().strip("'\"")
+                        if key and key not in os.environ:
+                            os.environ[key] = val
+            except Exception:
+                pass
+
+
 def load_config() -> dict[str, Any]:
-    """Load and merge config.yaml + secrets.yaml."""
+    """Load and merge config.yaml + secrets.yaml + .env + environment variables."""
+    _load_dotenv()
+
     with open(_CONFIG_FILE) as f:
         config = yaml.safe_load(f)
 
@@ -35,10 +63,13 @@ def load_config() -> dict[str, Any]:
             secrets = yaml.safe_load(f) or {}
         config = _deep_merge(config, secrets)
     else:
-        print(
-            f"[config] WARNING: {_SECRETS_FILE} not found. "
-            "Copy secrets.yaml.example → secrets.yaml and fill in your keys."
-        )
+        # Check if critical secrets are supplied via env variables before warning
+        has_env_token = bool(os.environ.get("UPSTOX_STATIC_TOKEN") or os.environ.get("UPSTOX_ACCESS_TOKEN"))
+        if not has_env_token:
+            print(
+                f"[config] WARNING: {_SECRETS_FILE} not found. "
+                "Copy secrets.yaml.example → secrets.yaml and fill in your keys, or set in .env."
+            )
 
     # Allow environment variable overrides for critical secrets
     _apply_env_overrides(config)
@@ -46,11 +77,13 @@ def load_config() -> dict[str, Any]:
 
 
 def _apply_env_overrides(config: dict) -> None:
-    """Override config values from environment variables (useful for Docker/CI)."""
+    """Override config values from environment variables (useful for Docker/CI/.env)."""
     env_map = {
         "UPSTOX_API_KEY": ("upstox", "api_key"),
         "UPSTOX_API_SECRET": ("upstox", "api_secret"),
         "UPSTOX_ACCESS_TOKEN": ("upstox", "access_token"),
+        "UPSTOX_STATIC_TOKEN": ("upstox", "access_token"),
+        "UPSTOX_TOKEN": ("upstox", "access_token"),
         "UPSTOX_REFRESH_TOKEN": ("upstox", "refresh_token"),
         "TELEGRAM_BOT_TOKEN": ("notifications", "telegram", "bot_token"),
         "TELEGRAM_CHAT_ID": ("notifications", "telegram", "chat_id"),

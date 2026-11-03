@@ -241,7 +241,11 @@ class UpstoxFetcher:
                 resp.raise_for_status()
                 data = resp.json().get("data", {})
                 for key, val in data.items():
-                    results[key] = float(val.get("last_price", 0))
+                    price = float(val.get("last_price", 0))
+                    results[key] = price
+                    token = val.get("instrument_token")
+                    if token:
+                        results[token] = price
             except Exception as e:
                 logger.error(f"LTP batch error: {e}")
             time.sleep(0.2)  # Respect rate limits
