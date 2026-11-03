@@ -49,6 +49,16 @@ signals:
     # Price must break above N-day high
     breakout_lookback_days: 20
 
+# ─── Signal Confluence ────────────────────────────────────────────────────────
+confluence:
+  # Minimum number of signals that must agree to trigger an alert
+  # Set to 2 or 3 depending on desired signal selectivity
+  min_signals_to_alert: 2
+  # Require unanimous direction consensus (discards stocks with conflicting BUY vs SELL signals)
+  direction_consensus: true
+  # Mode: "crossover" (checks only crossover/breakout triggers) or "trend" (allows trend continuation)
+  mode: "crossover"
+
 # ─── Stock Universe ──────────────────────────────────────────────────────────
 universe:
   # Options: "all_nse", "all_bse", "nifty50", "nifty500", "custom"

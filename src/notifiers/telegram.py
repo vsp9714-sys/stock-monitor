@@ -14,6 +14,7 @@ Setup:
 4. Get your chat_id via: https://api.telegram.org/bot<TOKEN>/getUpdates
 5. Add to config/secrets.yaml
 """
+import html
 import logging
 import time
 from pathlib import Path
@@ -53,15 +54,31 @@ class TelegramNotifier(BaseNotifier):
             payload.cap_category or "", "📊"
         )
 
+        confluence_tag = f" ({payload.confluence_score}/{payload.total_signals} Confluence)" if payload.total_signals > 1 else ""
+
         lines = [
-            f"{direction_emoji} <b>{payload.symbol}</b> — {payload.direction} Signal",
+            f"{direction_emoji} <b>{payload.symbol}</b> — {payload.direction} Signal{confluence_tag}",
             f"📌 <b>{payload.format_signal_label()}</b>",
             "",
             f"🏢 <b>{payload.company_name}</b>",
             f"💰 Price: <b>₹{payload.price:,.2f}</b>",
         ]
 
-        if payload.indicator_value is not None:
+        # Multi-signal check list
+        if payload.checks:
+            lines.append("")
+            lines.append(f"🎯 <b>Signal Confluence ({payload.confluence_score}/{payload.total_signals} Met)</b>")
+            for chk in payload.checks:
+                name_esc = html.escape(str(chk.get('name', '')))
+                desc_esc = html.escape(str(chk.get('description', '')))
+                val_esc = html.escape(str(chk.get('value_text', '')))
+                if chk.get("met"):
+                    icon = "✅"
+                    lines.append(f"{icon} <b>{name_esc}</b>: {desc_esc} ({val_esc})")
+                else:
+                    icon = "❌"
+                    lines.append(f"{icon} {name_esc}: {desc_esc} ({val_esc})")
+        elif payload.indicator_value is not None:
             ind_label = self._indicator_label(payload.signal_type)
             lines.append(f"📈 {ind_label}: <b>{payload.indicator_value:.2f}</b>")
 
@@ -72,7 +89,10 @@ class TelegramNotifier(BaseNotifier):
         if payload.mcap_cr is not None:
             lines.append(f"{cap_emoji} Market Cap: <b>{payload.format_mcap()}</b> ({(payload.cap_category or 'N/A').title()} Cap)")
         if payload.sector:
-            lines.append(f"🏭 Sector: {payload.sector}")
+            sec_text = payload.sector
+            if payload.industry and payload.industry != payload.sector:
+                sec_text += f" ({payload.industry})"
+            lines.append(f"🏭 Sector: {sec_text}")
         if payload.pe_ratio is not None:
             lines.append(f"📐 P/E Ratio: <b>{payload.pe_ratio:.1f}x</b>")
         if payload.pb_ratio is not None:
@@ -170,9 +190,10 @@ class TelegramNotifier(BaseNotifier):
             logger.warning(f"Chart not found for {payload.symbol}, sending text-only.")
             return self.send_alert(payload)
 
+        confluence_tag = f" ({payload.confluence_score}/{payload.total_signals} Confluence)" if payload.total_signals > 1 else ""
         caption = (
             f"{('🟢' if payload.direction == 'BUY' else '🔴')} "
-            f"<b>{payload.symbol}</b> — {payload.format_signal_label()}\n"
+            f"<b>{payload.symbol}</b> — {payload.direction} Signal{confluence_tag}\n"
             f"Price: ₹{payload.price:,.2f} | "
             f"MCap: {payload.format_mcap()} ({(payload.cap_category or 'N/A').title()} Cap)"
         )

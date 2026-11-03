@@ -5,25 +5,26 @@ Flow per scan cycle:
 1. Get list of all active stocks from DB (refreshed daily from Upstox instruments)
 2. For each stock (batched):
    a. Fetch daily OHLCV history (250 days) from Upstox
-   b. Run all enabled signal detectors
-   c. For any triggered signal:
+   b. Run all enabled signal detectors to perform multi-factor checks:
+      - RSI (Oversold / Overbought)
+      - MACD Crossover
+      - EMA Crossovers (9×21, 21×50, etc.)
+      - Volume Breakout
+   c. Evaluate Confluence:
+      - Require consensus direction (no conflicting BUY vs SELL)
+      - Require at least N signals to agree (confluence threshold)
+   d. For any stock meeting confluence:
       - Fetch fundamental data (from cache or Screener.in)
-      - Generate chart
-      - Save signal to DB
-      - Queue for notification
-3. Dispatch queued signals to all enabled notifiers
-
-Performance notes:
-- 5000+ stocks fetched in parallel (thread pool, respect API rate limits)
-- Chart generation is lazy (only on triggered signals)
-- Fundamentals fetched from SQLite cache (refreshed every 24h)
-- Deduplication: one alert per stock per signal_type per trading day
+      - Generate multi-panel chart
+      - Save single consolidated signal to DB
+      - Send ONE rich alert with all check statuses to Telegram/Discord/Email
+3. Deduplication: one alert per stock per direction per trading day
 """
 import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional
 
 import pandas as pd
@@ -39,7 +40,7 @@ from src.db import (
 from src.fetcher.fundamentals import FundamentalsFetcher
 from src.fetcher.upstox import UpstoxFetcher
 from src.notifiers.base import AlertPayload, BaseNotifier
-from src.signals.ema_cross import detect_all_ema_crossovers
+from src.signals.ema_cross import detect_ema_crossover
 from src.signals.macd import detect_macd_signal
 from src.signals.rsi import detect_rsi_signal
 from src.signals.volume_breakout import detect_volume_breakout
@@ -82,7 +83,7 @@ def _build_notifiers(cfg: dict) -> list[BaseNotifier]:
 
 
 class Scanner:
-    """Main scanning engine."""
+    """Main scanning engine with confluence filtering."""
 
     def __init__(self):
         self.cfg = get_config()
@@ -91,6 +92,7 @@ class Scanner:
         self.notifiers = _build_notifiers(self.cfg)
         self.signal_cfg = self.cfg.get("signals", {})
         self.universe_cfg = self.cfg.get("universe", {})
+        self.confluence_cfg = self.cfg.get("confluence", {})
 
     # ─── Stock Universe ──────────────────────────────────────────────────
 
@@ -100,17 +102,18 @@ class Scanner:
         session = get_session()
         try:
             count = 0
-            for exchange in ["NSE"]:  # Add "BSE" if needed
+            for exchange in ["NSE"]:
                 instruments = self.fetcher.get_all_eq_symbols(exchange)
                 for inst in instruments:
                     existing = session.query(Stock).filter_by(
                         symbol=inst["symbol"], exchange=exchange
                     ).first()
+                    now = datetime.now(timezone.utc)
                     if existing:
                         existing.instrument_key = inst["instrument_key"]
                         existing.isin = inst.get("isin", "")
                         existing.company_name = inst.get("company_name", "")
-                        existing.last_updated = datetime.utcnow()
+                        existing.last_updated = now
                     else:
                         session.add(Stock(
                             symbol=inst["symbol"],
@@ -120,7 +123,7 @@ class Scanner:
                             instrument_key=inst["instrument_key"],
                             series=inst.get("series", "EQ"),
                             is_active=True,
-                            last_updated=datetime.utcnow(),
+                            last_updated=now,
                         ))
                     count += 1
                 if count % 500 == 0:
@@ -146,49 +149,63 @@ class Scanner:
                 query = query.limit(limit)
 
             stocks = query.all()
-            # Detach from session (avoid lazy loading issues in threads)
             session.expunge_all()
             return stocks
         finally:
             session.close()
 
-    # ─── Single Stock Scan ───────────────────────────────────────────────
+    # ─── Single Stock Scan & Confluence Evaluation ────────────────────────
 
-    def _scan_stock(self, stock: Stock) -> tuple[list[dict], Optional[pd.DataFrame]]:
+    def _scan_stock(self, stock: Stock) -> tuple[Optional[dict], Optional[pd.DataFrame]]:
         """
-        Scan a single stock for all enabled signals.
-        Returns (list of triggered signal dicts, df of daily candles).
+        Scan a single stock across all indicator checks and evaluate confluence.
+        Returns (confluence_dict or None, df of daily candles).
         """
-        triggered = []
         try:
             # Fetch 250 days of daily candles
             df = self.fetcher.get_daily_candles(stock.instrument_key, days=250)
             if df.empty or len(df) < 30:
-                return [], None
+                return None, None
 
             price_floor = self.universe_cfg.get("min_price", 10)
-            if df["close"].iloc[-1] < price_floor:
-                return [], None  # Skip penny stocks
+            current_price = float(df["close"].iloc[-1])
+            if current_price < price_floor:
+                return None, None  # Skip penny stocks
 
-            # ── RSI ─────────────────────────────────────────────────────
+            checks = []
+
+            # ── 1. RSI Check ────────────────────────────────────────────
             if self.signal_cfg.get("rsi", {}).get("enabled", True):
                 rsi_cfg = self.signal_cfg["rsi"]
+                oversold = rsi_cfg.get("oversold_threshold", 30)
+                overbought = rsi_cfg.get("overbought_threshold", 70)
                 rsi_result = detect_rsi_signal(
                     stock.symbol, df,
                     period=rsi_cfg.get("period", 14),
-                    oversold=rsi_cfg.get("oversold_threshold", 30),
-                    overbought=rsi_cfg.get("overbought_threshold", 70),
+                    oversold=oversold,
+                    overbought=overbought,
                 )
+                rsi_val = rsi_result.rsi_value
                 if rsi_result.triggered:
-                    triggered.append({
-                        "type": rsi_result.signal_type,
+                    checks.append({
+                        "name": "RSI (14)",
+                        "signal_type": "rsi",
+                        "met": True,
                         "direction": rsi_result.direction,
-                        "price": rsi_result.price,
-                        "indicator_value": rsi_result.rsi_value,
-                        "detail": {"rsi": rsi_result.rsi_value},
+                        "value_text": f"RSI {rsi_val:.1f}",
+                        "description": f"Oversold (≤ {oversold})" if rsi_result.direction == "BUY" else f"Overbought (≥ {overbought})",
+                    })
+                else:
+                    checks.append({
+                        "name": "RSI (14)",
+                        "signal_type": "rsi",
+                        "met": False,
+                        "direction": None,
+                        "value_text": f"RSI {rsi_val:.1f}",
+                        "description": "Neutral (30–70)",
                     })
 
-            # ── MACD ────────────────────────────────────────────────────
+            # ── 2. MACD Check ───────────────────────────────────────────
             if self.signal_cfg.get("macd", {}).get("enabled", True):
                 macd_cfg = self.signal_cfg["macd"]
                 macd_result = detect_macd_signal(
@@ -198,36 +215,63 @@ class Scanner:
                     signal_period=macd_cfg.get("signal_period", 9),
                 )
                 if macd_result.triggered:
-                    triggered.append({
-                        "type": macd_result.signal_type,
+                    checks.append({
+                        "name": "MACD (12,26,9)",
+                        "signal_type": "macd",
+                        "met": True,
                         "direction": macd_result.direction,
-                        "price": macd_result.price,
-                        "indicator_value": macd_result.macd_value,
-                        "detail": {
-                            "macd": macd_result.macd_value,
-                            "signal": macd_result.signal_value,
-                            "histogram": macd_result.histogram,
-                        },
+                        "value_text": f"MACD {macd_result.macd_value:.2f}",
+                        "description": "Bullish Crossover" if macd_result.direction == "BUY" else "Bearish Crossover",
+                    })
+                else:
+                    checks.append({
+                        "name": "MACD (12,26,9)",
+                        "signal_type": "macd",
+                        "met": False,
+                        "direction": None,
+                        "value_text": f"Hist {macd_result.histogram:+.2f}",
+                        "description": "No Cross",
                     })
 
-            # ── EMA Crossovers ──────────────────────────────────────────
+            # ── 3. EMA Crossover Checks ─────────────────────────────────
             if self.signal_cfg.get("ema_crossover", {}).get("enabled", True):
                 ema_cfg = self.signal_cfg["ema_crossover"]
-                pairs = [tuple(p) for p in ema_cfg.get("pairs", [[9, 21], [21, 50], [50, 200]])]
-                ema_results = detect_all_ema_crossovers(stock.symbol, df, pairs=pairs)
-                for r in ema_results:
-                    triggered.append({
-                        "type": r.signal_type,
-                        "direction": r.direction,
-                        "price": r.price,
-                        "indicator_value": r.fast_ema_value,
-                        "detail": {
-                            f"ema_{r.fast_period}": r.fast_ema_value,
-                            f"ema_{r.slow_period}": r.slow_ema_value,
-                        },
-                    })
+                pairs = [tuple(p) for p in ema_cfg.get("pairs", [[9, 21], [21, 50]])]
+                for fast_p, slow_p in pairs:
+                    chk_name = f"EMA {fast_p}×{slow_p}"
+                    ema_res = detect_ema_crossover(stock.symbol, df, fast_p, slow_p)
+                    if pd.isna(ema_res.fast_ema_value) or pd.isna(ema_res.slow_ema_value):
+                        checks.append({
+                            "name": chk_name,
+                            "signal_type": f"ema_{fast_p}x{slow_p}",
+                            "met": False,
+                            "direction": None,
+                            "value_text": "N/A",
+                            "description": "Insufficient Data",
+                        })
+                        continue
 
-            # ── Volume Breakout ─────────────────────────────────────────
+                    rel = f"{fast_p} above {slow_p}" if ema_res.fast_ema_value > ema_res.slow_ema_value else f"{fast_p} below {slow_p}"
+                    if ema_res.triggered:
+                        checks.append({
+                            "name": chk_name,
+                            "signal_type": f"ema_{fast_p}x{slow_p}",
+                            "met": True,
+                            "direction": ema_res.direction,
+                            "value_text": f"₹{ema_res.fast_ema_value:.1f} vs ₹{ema_res.slow_ema_value:.1f}",
+                            "description": f"{ema_res.direction.title()} Cross",
+                        })
+                    else:
+                        checks.append({
+                            "name": chk_name,
+                            "signal_type": f"ema_{fast_p}x{slow_p}",
+                            "met": False,
+                            "direction": None,
+                            "value_text": f"₹{ema_res.fast_ema_value:.1f} ({rel})",
+                            "description": "No Cross",
+                        })
+
+            # ── 4. Volume Breakout Check ────────────────────────────────
             if self.signal_cfg.get("volume_breakout", {}).get("enabled", True):
                 vol_cfg = self.signal_cfg["volume_breakout"]
                 vol_result = detect_volume_breakout(
@@ -235,34 +279,97 @@ class Scanner:
                     volume_multiplier=vol_cfg.get("volume_multiplier", 2.0),
                     lookback_days=vol_cfg.get("breakout_lookback_days", 20),
                 )
+                vol_ratio = vol_result.volume_ratio
                 if vol_result.triggered:
-                    triggered.append({
-                        "type": vol_result.signal_type,
-                        "direction": vol_result.direction,
-                        "price": vol_result.current_price,
-                        "indicator_value": vol_result.volume_ratio,
-                        "detail": {
-                            "volume_ratio": vol_result.volume_ratio,
-                            "current_volume": vol_result.current_volume,
-                            "avg_volume": vol_result.avg_volume,
-                            "breakout_level": vol_result.breakout_level,
-                        },
+                    if vol_result.direction in ("BUY", "SELL"):
+                        checks.append({
+                            "name": "Volume Breakout",
+                            "signal_type": "volume_breakout",
+                            "met": True,
+                            "direction": vol_result.direction,
+                            "value_text": f"{vol_ratio:.1f}× Avg Vol",
+                            "description": "Bullish Breakout" if vol_result.direction == "BUY" else "Bearish Breakdown",
+                        })
+                    else:
+                        checks.append({
+                            "name": "Volume Breakout",
+                            "signal_type": "volume_breakout",
+                            "met": False,
+                            "direction": None,
+                            "value_text": f"{vol_ratio:.1f}× Avg Vol",
+                            "description": "Spike (No Price Breakout)",
+                        })
+                else:
+                    checks.append({
+                        "name": "Volume Breakout",
+                        "signal_type": "volume_breakout",
+                        "met": False,
+                        "direction": None,
+                        "value_text": f"{vol_ratio:.1f}× Avg Vol",
+                        "description": "Normal Volume",
                     })
 
-            return triggered, df
+            # ── Evaluate Confluence ─────────────────────────────────────
+            buy_met = [c for c in checks if c["met"] and c["direction"] == "BUY"]
+            sell_met = [c for c in checks if c["met"] and c["direction"] == "SELL"]
+
+            min_signals = self.confluence_cfg.get("min_signals_to_alert", 2)
+            direction_consensus = self.confluence_cfg.get("direction_consensus", True)
+
+            if len(buy_met) > len(sell_met):
+                consensus_dir = "BUY"
+                met_count = len(buy_met)
+                conflicting_count = len(sell_met)
+            elif len(sell_met) > len(buy_met):
+                consensus_dir = "SELL"
+                met_count = len(sell_met)
+                conflicting_count = len(buy_met)
+            else:
+                consensus_dir = None
+                met_count = 0
+                conflicting_count = 0
+
+            # Discard if no consensus direction
+            if consensus_dir is None:
+                return None, df
+
+            # Discard if there are conflicting BUY vs SELL signals
+            if direction_consensus and conflicting_count > 0:
+                logger.debug(
+                    f"{stock.symbol}: Skipping due to conflicting signals "
+                    f"({len(buy_met)} BUY vs {len(sell_met)} SELL)"
+                )
+                return None, df
+
+            # Check if confluence threshold is reached
+            if met_count < min_signals:
+                return None, df
+
+            # Confluence criteria satisfied!
+            result = {
+                "symbol": stock.symbol,
+                "company_name": stock.company_name or stock.symbol,
+                "direction": consensus_dir,
+                "confluence_score": met_count,
+                "total_signals": len(checks),
+                "price": current_price,
+                "checks": checks,
+                "signal_type": f"confluence_{consensus_dir.lower()}",
+            }
+            return result, df
 
         except Exception as e:
             logger.error(f"Error scanning {stock.symbol}: {e}", exc_info=False)
-            return [], None
+            return None, None
 
     # ─── Full Scan Cycle ─────────────────────────────────────────────────
 
     def run_scan(self, limit: Optional[int] = None) -> int:
         """
-        Run a full scan across active stocks.
-        Returns number of new signals detected.
+        Run a full scan across active stocks with confluence filtering.
+        Returns number of confluence alerts dispatched.
         """
-        logger.info("Starting market scan...")
+        logger.info("Starting market scan with confluence filtering...")
         stocks = self.get_active_stocks(limit=limit)
         if not stocks:
             logger.warning("No stocks in database. Run refresh_instrument_master() first.")
@@ -272,88 +379,101 @@ class Scanner:
         new_signal_count = 0
         db = get_session()
 
-        # Scan stocks in parallel (thread pool, Upstox rate limit aware)
-        max_workers = 10  # Conservative to respect Upstox rate limits
+        max_workers = 10  # Conservative Upstox rate limit concurrency
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(self._scan_stock, stock): stock for stock in stocks}
 
             for future in as_completed(futures):
                 stock = futures[future]
                 try:
-                    signals, df = future.result()
+                    res, df = future.result()
                 except Exception as e:
                     logger.error(f"Future error for {stock.symbol}: {e}")
-                    signals, df = [], None
+                    res, df = None, None
 
-                if not signals:
+                if not res:
                     continue
 
-                # Process each triggered signal
-                for sig in signals:
-                    try:
-                        # Fetch fundamentals (cached)
-                        fund = self.fundamentals.get_fundamentals(stock.symbol, stock.isin or "")
+                try:
+                    # Fetch fundamentals (cached)
+                    fund = self.fundamentals.get_fundamentals(stock.symbol, stock.isin or "")
 
-                        # Generate chart
-                        chart_path = None
-                        if df is not None and not df.empty:
-                            from charts.chart_generator import generate_signal_chart
-                            chart_path = generate_signal_chart(
-                                symbol=stock.symbol,
-                                company_name=stock.company_name or stock.symbol,
-                                df=df,
-                                signal_type=sig["type"],
-                                direction=sig["direction"],
-                                indicator_value=sig.get("indicator_value"),
-                            )
-
-                        # Save signal to DB (deduplicated)
-                        saved = upsert_signal(
-                            session=db,
-                            symbol=stock.symbol,
-                            signal_date=today,
-                            signal_type=sig["type"],
-                            direction=sig["direction"],
-                            price=sig["price"],
-                            indicator_value=sig.get("indicator_value", 0),
-                            indicator_detail=json.dumps(sig.get("detail", {})),
-                            chart_path=chart_path,
-                        )
-
-                        # Build alert payload and notify
-                        payload = AlertPayload(
+                    # Generate multi-panel chart
+                    chart_path = None
+                    if df is not None and not df.empty:
+                        from charts.chart_generator import generate_signal_chart
+                        chart_path = generate_signal_chart(
                             symbol=stock.symbol,
                             company_name=stock.company_name or stock.symbol,
-                            signal_type=sig["type"],
-                            direction=sig["direction"],
-                            price=sig["price"],
-                            indicator_value=sig.get("indicator_value"),
-                            indicator_detail=sig.get("detail", {}),
-                            chart_path=chart_path,
-                            mcap_cr=fund.get("mcap_cr") if fund else None,
-                            cap_category=fund.get("cap_category") if fund else None,
-                            sector=fund.get("sector") if fund else None,
-                            pe_ratio=fund.get("pe_ratio") if fund else None,
-                            pb_ratio=fund.get("pb_ratio") if fund else None,
-                            roe=fund.get("roe") if fund else None,
-                            profit_q1_cr=fund.get("profit_q1_cr") if fund else None,
-                            profit_q2_cr=fund.get("profit_q2_cr") if fund else None,
-                            profit_q3_cr=fund.get("profit_q3_cr") if fund else None,
-                            profit_q4_cr=fund.get("profit_q4_cr") if fund else None,
-                            profit_ttm_cr=fund.get("profit_ttm_cr") if fund else None,
-                            promoter_holding_pct=fund.get("promoter_holding_pct") if fund else None,
-                            screener_url=fund.get("screener_url") if fund else None,
+                            df=df,
+                            signal_type=res["signal_type"],
+                            direction=res["direction"],
+                            indicator_value=float(res["confluence_score"]),
                         )
 
-                        self._dispatch_alert(payload)
-                        mark_signal_notified(db, saved.id)
-                        new_signal_count += 1
+                    # Save consolidated signal to DB (deduplicated per symbol + date + signal_type)
+                    saved = upsert_signal(
+                        session=db,
+                        symbol=stock.symbol,
+                        signal_date=today,
+                        signal_type=res["signal_type"],
+                        direction=res["direction"],
+                        price=res["price"],
+                        indicator_value=float(res["confluence_score"]),
+                        indicator_detail=json.dumps({
+                            "confluence_score": res["confluence_score"],
+                            "total_signals": res["total_signals"],
+                            "checks": res["checks"],
+                        }),
+                        chart_path=chart_path,
+                    )
 
-                    except Exception as e:
-                        logger.error(f"Error processing signal for {stock.symbol}: {e}", exc_info=True)
+                    # Build multi-signal alert payload
+                    payload = AlertPayload(
+                        symbol=stock.symbol,
+                        company_name=stock.company_name or stock.symbol,
+                        signal_type=res["signal_type"],
+                        direction=res["direction"],
+                        price=res["price"],
+                        indicator_value=float(res["confluence_score"]),
+                        indicator_detail={
+                            "confluence_score": res["confluence_score"],
+                            "checks": res["checks"],
+                        },
+                        confluence_score=res["confluence_score"],
+                        total_signals=res["total_signals"],
+                        checks=res["checks"],
+                        chart_path=chart_path,
+                        mcap_cr=fund.get("mcap_cr") if fund else None,
+                        cap_category=fund.get("cap_category") if fund else None,
+                        sector=fund.get("sector") if fund else None,
+                        industry=fund.get("industry") if fund else None,
+                        pe_ratio=fund.get("pe_ratio") if fund else None,
+                        pb_ratio=fund.get("pb_ratio") if fund else None,
+                        roe=fund.get("roe") if fund else None,
+                        profit_q1_cr=fund.get("profit_q1_cr") if fund else None,
+                        profit_q2_cr=fund.get("profit_q2_cr") if fund else None,
+                        profit_q3_cr=fund.get("profit_q3_cr") if fund else None,
+                        profit_q4_cr=fund.get("profit_q4_cr") if fund else None,
+                        profit_ttm_cr=fund.get("profit_ttm_cr") if fund else None,
+                        promoter_holding_pct=fund.get("promoter_holding_pct") if fund else None,
+                        screener_url=fund.get("screener_url") if fund else None,
+                    )
+
+                    # Dispatch single consolidated alert
+                    self._dispatch_alert(payload)
+                    mark_signal_notified(db, saved.id)
+                    new_signal_count += 1
+                    logger.info(
+                        f"Confluence alert dispatched for {stock.symbol}: "
+                        f"{res['direction']} ({res['confluence_score']}/{res['total_signals']} signals met)"
+                    )
+
+                except Exception as e:
+                    logger.error(f"Error processing confluence alert for {stock.symbol}: {e}", exc_info=True)
 
         db.close()
-        logger.info(f"Scan complete. {new_signal_count} new signals detected and dispatched.")
+        logger.info(f"Scan complete. {new_signal_count} confluence alerts detected and dispatched.")
         return new_signal_count
 
     def _dispatch_alert(self, payload: AlertPayload) -> None:

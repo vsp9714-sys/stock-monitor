@@ -10,7 +10,7 @@ Upstox API v2 docs: https://upstox.com/developer/api-documentation/
 import json
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
@@ -68,7 +68,7 @@ class UpstoxAuth:
 
     def _save_token(self, data: dict) -> None:
         TOKEN_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        data["saved_at"] = datetime.utcnow().isoformat()
+        data["saved_at"] = datetime.now(timezone.utc).isoformat()
         with open(TOKEN_CACHE, "w") as f:
             json.dump(data, f, indent=2)
         logger.info("Upstox token saved to cache.")
@@ -80,8 +80,10 @@ class UpstoxAuth:
         with open(TOKEN_CACHE) as f:
             data = json.load(f)
         saved_at = datetime.fromisoformat(data.get("saved_at", "2000-01-01"))
+        if saved_at.tzinfo is None:
+            saved_at = saved_at.replace(tzinfo=timezone.utc)
         # Upstox access tokens are valid for 1 day
-        if datetime.utcnow() - saved_at < timedelta(hours=23):
+        if datetime.now(timezone.utc) - saved_at < timedelta(hours=23):
             self._access_token = data.get("access_token", "")
             self._refresh_token = data.get("refresh_token", "")
             logger.info("Loaded Upstox token from cache.")

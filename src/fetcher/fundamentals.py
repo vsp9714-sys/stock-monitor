@@ -13,8 +13,9 @@ Rate limited to be respectful to the server (configurable delay).
 Data is cached in SQLite with a configurable TTL.
 """
 import logging
+import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import requests
@@ -42,6 +43,29 @@ def classify_cap(mcap_cr: Optional[float]) -> str:
     if mcap_cr >= SMALL_CAP_THRESHOLD:
         return "small"
     return "micro"
+
+
+def _parse_indian_number(text: str) -> Optional[float]:
+    """
+    Parse Indian-format numbers from Screener.in.
+    Handles: '17,71,283', '1,308', '21.6', '0.46%', '₹17,71,283Cr.', '₹ 3,450.50 Cr', empty strings.
+    """
+    if not text:
+        return None
+    cleaned = text.strip()
+    # Remove currency symbol, Cr/cr, %, whitespace
+    cleaned = re.sub(r'₹', '', cleaned)
+    cleaned = re.sub(r'Cr\.?', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'%', '', cleaned)
+    cleaned = cleaned.strip()
+    if not cleaned or cleaned == '-':
+        return None
+    # Remove commas
+    cleaned = cleaned.replace(',', '')
+    try:
+        return float(cleaned)
+    except (ValueError, TypeError):
+        return None
 
 
 class FundamentalsFetcher:
@@ -86,13 +110,13 @@ class FundamentalsFetcher:
         """Return cached fundamental if within TTL."""
         fund = db.query(Fundamental).filter_by(symbol=symbol).first()
         if fund and fund.fetched_at:
-            age = datetime.utcnow() - fund.fetched_at
+            age = datetime.now(timezone.utc) - fund.fetched_at.replace(tzinfo=timezone.utc)
             if age < timedelta(hours=self.cache_ttl_hours):
                 return fund
         return None
 
     def _fetch_from_screener(self, symbol: str, isin: str = "") -> Optional[dict]:
-        """Fetch fundamental data from Screener.in JSON API."""
+        """Fetch fundamental data from Screener.in HTML page."""
         time.sleep(self.request_delay)
 
         # Screener.in company page URL
@@ -104,6 +128,7 @@ class FundamentalsFetcher:
             if resp.status_code == 404:
                 # Try standalone (non-consolidated) version
                 url = f"{self.BASE_URL}/company/{symbol}/"
+                screener_url = url
                 resp = self.session.get(url, timeout=15)
 
             if resp.status_code != 200:
@@ -140,39 +165,79 @@ class FundamentalsFetcher:
                 "promoter_holding_pct": None,
             }
 
-            # ── Market Cap ──────────────────────────────────────────────────
+            # ── Top Ratios (Market Cap, P/E, ROE, etc.) ──────────────────────
+            current_price = None
+            book_value = None
+
             for li in soup.select("#top-ratios li"):
-                label = li.find("span", class_="name")
-                value = li.find("span", class_="nowrap")
-                if not label or not value:
+                label_el = li.find("span", class_="name")
+                if not label_el:
                     continue
-                label_text = label.get_text(strip=True).lower()
-                value_text = value.get_text(strip=True).replace(",", "").replace("Cr.", "").strip()
+                label_text = label_el.get_text(strip=True).lower()
+
+                # Prefer <span class="number"> (clean value) over <span class="nowrap">
+                number_el = li.find("span", class_="number")
+                nowrap_el = li.find("span", class_="nowrap")
+
+                # Get raw text from the cleanest source available
+                if number_el:
+                    raw_val = number_el.get_text(strip=True)
+                elif nowrap_el:
+                    raw_val = nowrap_el.get_text(strip=True)
+                else:
+                    continue
+
+                parsed = _parse_indian_number(raw_val)
+                if parsed is None:
+                    continue
 
                 try:
                     if "market cap" in label_text:
-                        result["mcap_cr"] = float(value_text)
-                    elif "p/e" in label_text and "industry" not in label_text:
-                        result["pe_ratio"] = float(value_text)
-                    elif "p/b" in label_text or "price to book" in label_text:
-                        result["pb_ratio"] = float(value_text)
+                        result["mcap_cr"] = parsed
+                    elif "current price" in label_text:
+                        current_price = parsed
+                    elif label_text.startswith("stock p/e") or label_text == "p/e":
+                        result["pe_ratio"] = parsed
+                    elif "book value" in label_text:
+                        book_value = parsed
+                    elif "price to book" in label_text or label_text == "p/b":
+                        result["pb_ratio"] = parsed
                     elif "roe" in label_text or "return on equity" in label_text:
-                        result["roe"] = float(value_text.replace("%", ""))
-                    elif "debt to equity" in label_text or "d/e" in label_text:
-                        result["debt_to_equity"] = float(value_text)
+                        result["roe"] = parsed
+                    elif "debt to equity" in label_text or label_text == "d/e":
+                        result["debt_to_equity"] = parsed
                 except (ValueError, TypeError):
                     pass
 
+            if result["pb_ratio"] is None and current_price and book_value and book_value > 0:
+                result["pb_ratio"] = round(current_price / book_value, 2)
+
             # ── Sector / Industry ───────────────────────────────────────────
-            company_info = soup.select_one(".company-info")
-            if company_info:
-                for row in company_info.select(".tag, .sub"):
-                    text = row.get_text(strip=True)
-                    if result["sector"] is None:
-                        result["sector"] = text
-                    elif result["industry"] is None:
-                        result["industry"] = text
-                        break
+            # Screener.in peers section has hierarchy: <section id="peers"><p class="sub"><a href="/market/...">Sector</a>...
+            peers_section = soup.find("section", id="peers")
+            if peers_section:
+                sub_p = peers_section.find("p", class_="sub")
+                if sub_p:
+                    market_links = sub_p.find_all("a", href=lambda h: h and "/market/" in h)
+                    if market_links:
+                        result["sector"] = market_links[0].get_text(strip=True)
+                        result["industry"] = market_links[-1].get_text(strip=True)
+
+            # Fallback for sector/industry if peers section didn't match
+            if not result["sector"]:
+                company_info = soup.select_one(".company-info")
+                if company_info:
+                    for link in company_info.select("a"):
+                        href = link.get("href", "")
+                        text = link.get_text(strip=True)
+                        if not text or len(text) > 80:
+                            continue
+                        if "/sector/" in href or "/industry/" in href or "/market/" in href:
+                            if result["sector"] is None:
+                                result["sector"] = text
+                            elif result["industry"] is None:
+                                result["industry"] = text
+                                break
 
             # ── Quarterly Profit ────────────────────────────────────────────
             profit_table = None
@@ -190,36 +255,34 @@ class FundamentalsFetcher:
                         continue
                     row_label = cells[0].get_text(strip=True).lower()
                     if "net profit" in row_label or "profit after tax" in row_label:
+                        # Get last 4 quarters (rightmost columns = most recent)
                         values = []
-                        for cell in cells[1:5]:  # Last 4 quarters
-                            val_text = cell.get_text(strip=True).replace(",", "")
-                            try:
-                                values.append(float(val_text))
-                            except (ValueError, TypeError):
-                                values.append(None)
-                        if len(values) >= 1:
-                            result["profit_q1_cr"] = values[0] if values else None
-                        if len(values) >= 2:
-                            result["profit_q2_cr"] = values[1]
-                        if len(values) >= 3:
-                            result["profit_q3_cr"] = values[2]
+                        for cell in cells[-4:]:
+                            val = _parse_indian_number(cell.get_text(strip=True))
+                            values.append(val)
                         if len(values) >= 4:
-                            result["profit_q4_cr"] = values[3]
+                            result["profit_q4_cr"] = values[0]
+                            result["profit_q3_cr"] = values[1]
+                            result["profit_q2_cr"] = values[2]
+                            result["profit_q1_cr"] = values[3]
                         result["profit_ttm_cr"] = sum(
-                            v for v in values[:4] if v is not None
+                            v for v in values if v is not None
                         ) or None
                         break
 
             # ── Promoter Holding ─────────────────────────────────────────────
-            for row in soup.select("table tbody tr"):
-                cells = row.find_all("td")
-                if cells and "promoter" in cells[0].get_text(strip=True).lower():
-                    try:
-                        result["promoter_holding_pct"] = float(
-                            cells[-1].get_text(strip=True).replace("%", "")
-                        )
-                    except (ValueError, TypeError):
-                        pass
+            # Look specifically in the shareholding section
+            for section in soup.select("section"):
+                h2 = section.find("h2")
+                if h2 and "shareholding" in h2.get_text(strip=True).lower():
+                    for row in section.select("table tbody tr"):
+                        cells = row.find_all("td")
+                        if cells and "promoter" in cells[0].get_text(strip=True).lower():
+                            # Get the most recent quarter's value (last column)
+                            val = _parse_indian_number(cells[-1].get_text(strip=True))
+                            if val is not None:
+                                result["promoter_holding_pct"] = val
+                            break
                     break
 
             # ── Classify cap category ─────────────────────────────────────────
@@ -243,7 +306,7 @@ class FundamentalsFetcher:
         for key, val in data.items():
             if hasattr(obj, key):
                 setattr(obj, key, val)
-        obj.fetched_at = datetime.utcnow()
+        obj.fetched_at = datetime.now(timezone.utc)
         db.commit()
 
     @staticmethod

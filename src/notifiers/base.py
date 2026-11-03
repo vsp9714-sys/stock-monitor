@@ -4,7 +4,7 @@ All notifiers implement send_alert() and send_alert_with_chart().
 """
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -21,10 +21,16 @@ class AlertPayload:
     indicator_value: Optional[float]
     indicator_detail: dict              # Full indicator snapshot
 
+    # Confluence metadata
+    confluence_score: int = 1
+    total_signals: int = 1
+    checks: list[dict] = field(default_factory=list)
+
     # Fundamental data (may be None if not available)
     mcap_cr: Optional[float] = None
     cap_category: Optional[str] = None
     sector: Optional[str] = None
+    industry: Optional[str] = None
     pe_ratio: Optional[float] = None
     pb_ratio: Optional[float] = None
     roe: Optional[float] = None
@@ -40,6 +46,8 @@ class AlertPayload:
     chart_path: Optional[str] = None
 
     def format_signal_label(self) -> str:
+        if self.signal_type.startswith("confluence"):
+            return f"Confluence {self.direction} ({self.confluence_score}/{self.total_signals} Signals Met)"
         labels = {
             "rsi_oversold": "RSI Oversold",
             "rsi_overbought": "RSI Overbought",
