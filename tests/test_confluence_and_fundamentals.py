@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from src.fetcher.fundamentals import _parse_indian_number, classify_cap
+from src.fetcher.upstox import UpstoxFetcher
 from src.notifiers.base import AlertPayload
 from src.notifiers.telegram import TelegramNotifier
 from src.scanner import Scanner
@@ -109,3 +110,67 @@ def test_telegram_message_formatting_confluence():
     assert "❌ EMA 21×50: No Cross" in msg
     assert "Market Cap: <b>₹17.7L Cr</b> (Large Cap)" in msg
     assert "Energy" in msg
+
+
+def test_nse_equity_master_parser_excludes_non_share_series():
+    csv_text = (
+        "SYMBOL,NAME OF COMPANY, SERIES,ISIN NUMBER\n"
+        "ABC,ABC Limited,EQ,INE000A01000\n"
+        "XYZ,XYZ Limited,BE,INE000B01000\n"
+        "DEBT,Issuer 8.05% 2035,DEBT,INE000C01000\n"
+    )
+    parsed = UpstoxFetcher.parse_nse_equity_master(csv_text)
+    assert set(parsed) == {"INE000A01000", "INE000B01000"}
+    assert parsed["INE000A01000"]["symbol"] == "ABC"
+    assert parsed["INE000B01000"]["series"] == "BE"
+
+
+def test_nse_sme_equity_master_parser_normalizes_underscore_headers():
+    csv_text = (
+        "SYMBOL,NAME_OF_COMPANY,SERIES,ISIN_NUMBER\n"
+        "SMALLCO,Small Company Limited,SM,INE000D01000\n"
+        "SMALLRE,Small Company RE,ST,INE000E01000\n"
+    )
+    parsed = UpstoxFetcher.parse_nse_equity_master(csv_text)
+    assert parsed["INE000D01000"]["series"] == "SM"
+    assert parsed["INE000E01000"]["series"] == "ST"
+
+
+def test_upstox_universe_matches_nse_equity_master_by_isin(monkeypatch):
+    monkeypatch.setattr(UpstoxFetcher, "MIN_MATCHED_NSE_EQUITIES", 1)
+    fetcher = object.__new__(UpstoxFetcher)
+    fetcher.download_instruments = lambda exchange: pd.DataFrame([
+        {"instrument_type": "EQUITY", "instrument_key": "NSE_EQ|INE000A01000",
+         "tradingsymbol": "ABC", "name": "ABC Limited", "isin": "INE000A01000"},
+        {"instrument_type": "EQUITY", "instrument_key": "NSE_EQ|INE000C01000",
+         "tradingsymbol": "DEBT", "name": "Issuer 8.05% 2035", "isin": "INE000C01000"},
+    ])
+    fetcher.download_nse_equity_master = lambda: {
+        "INE000A01000": {"symbol": "ABC", "company_name": "ABC Limited", "series": "EQ"},
+    }
+    rows = fetcher.get_all_eq_symbols("NSE")
+    assert [row["symbol"] for row in rows] == ["ABC"]
+
+
+def test_telegram_individual_and_group_routes_are_configurable(monkeypatch):
+    cfg = {"notifications": {"telegram": {
+        "bot_token": "dummy_token",
+        "individual_alert": "N",
+        "group_alert": "Y",
+        "group_chat_id": "-1001234567890",
+    }}}
+    notifier = TelegramNotifier(cfg)
+    assert notifier.delivery_targets() == ["telegram:group"]
+
+    observed = {}
+
+    class Response:
+        ok = True
+
+    def fake_post(url, json=None, data=None, files=None, timeout=None):
+        observed.update(json or data or {})
+        return Response()
+
+    monkeypatch.setattr("src.notifiers.telegram.requests.post", fake_post)
+    assert notifier._send_message("test", notifier.group_chat_id)
+    assert observed["chat_id"] == "-1001234567890"

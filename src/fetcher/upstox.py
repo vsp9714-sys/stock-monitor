@@ -8,6 +8,7 @@ Upstox data fetcher — handles:
 Upstox API v2 docs: https://upstox.com/developer/api-documentation/
 """
 import json
+import io
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -114,6 +115,13 @@ class UpstoxFetcher:
     # Instrument CSV URL (updated regularly by Upstox)
     INSTRUMENT_CSV_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz"
     INSTRUMENT_CSV_BSE_URL = "https://assets.upstox.com/market-quote/instruments/exchange/BSE.csv.gz"
+    # Upstox classifies some listed bonds as EQUITY. Cross-check NSE instruments
+    # against its common-equity master, whose ISIN/series fields distinguish shares.
+    NSE_EQUITY_MASTER_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+    NSE_SME_EQUITY_MASTER_URL = "https://nsearchives.nseindia.com/emerge/corporates/content/SME_EQUITY_L.csv"
+    NSE_SHARE_SERIES = {"EQ", "BE", "BZ", "SM", "ST", "SZ"}
+    MIN_NSE_MASTER_EQUITIES = 1000
+    MIN_MATCHED_NSE_EQUITIES = 1000
 
     def __init__(self):
         self.cfg = get_config()
@@ -133,7 +141,7 @@ class UpstoxFetcher:
         resp.raise_for_status()
 
         df = pd.read_csv(
-            url,
+            io.BytesIO(resp.content),
             compression="gzip",
             dtype=str,
         )
@@ -145,9 +153,62 @@ class UpstoxFetcher:
         logger.info(f"Downloaded {len(df)} {exchange} equity instruments.")
         return df
 
+    @classmethod
+    def parse_nse_equity_master(cls, csv_content: str | bytes) -> dict[str, dict[str, str]]:
+        """Parse NSE's official listed-equity file, keyed by ISIN.
+
+        Only ordinary share-trading series are retained. NSE's published file has
+        leading spaces in several CSV headers, so normalize headers and values.
+        """
+        source = io.BytesIO(csv_content) if isinstance(csv_content, bytes) else io.StringIO(csv_content)
+        df = pd.read_csv(source, dtype=str)
+        df.columns = [str(column).strip().upper().replace("_", " ") for column in df.columns]
+        required = {"SYMBOL", "NAME OF COMPANY", "SERIES", "ISIN NUMBER"}
+        if not required.issubset(df.columns):
+            raise ValueError(f"NSE equity master missing columns: {sorted(required - set(df.columns))}")
+
+        equities = {}
+        for _, row in df.iterrows():
+            isin_value = row["ISIN NUMBER"]
+            series_value = row["SERIES"]
+            if pd.isna(isin_value) or pd.isna(series_value):
+                continue
+            isin = str(isin_value).strip().upper()
+            series = str(series_value).strip().upper()
+            if not isin or series not in cls.NSE_SHARE_SERIES:
+                continue
+            equities[isin] = {
+                "symbol": str(row["SYMBOL"]).strip(),
+                "company_name": str(row["NAME OF COMPANY"]).strip(),
+                "series": series,
+            }
+        if not equities:
+            raise ValueError("NSE equity master contained no recognized share listings")
+        return equities
+
+    def download_nse_equity_master(self) -> dict[str, dict[str, str]]:
+        """Fetch NSE's main-board and SME share masters, failing closed on bad data."""
+        equities = {}
+        for url in (self.NSE_EQUITY_MASTER_URL, self.NSE_SME_EQUITY_MASTER_URL):
+            response = requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "text/csv,*/*"},
+                timeout=30,
+            )
+            response.raise_for_status()
+            equities.update(self.parse_nse_equity_master(response.content))
+        # A truncated/error page must not deactivate the production universe.
+        if len(equities) < self.MIN_NSE_MASTER_EQUITIES:
+            raise ValueError(f"NSE equity masters unexpectedly small ({len(equities)} ISINs)")
+        logger.info(f"Loaded {len(equities)} main-board/SME shares from NSE equity masters.")
+        return equities
+
     def get_all_eq_symbols(self, exchange: str = "NSE") -> list[dict]:
-        """Return list of {symbol, instrument_key, isin, company_name} for all EQ stocks."""
+        """Return NSE ordinary shares cross-checked by ISIN against NSE's equity master."""
+        if exchange != "NSE":
+            raise ValueError("Only NSE has an authoritative common-equity cross-check configured")
         df = self.download_instruments(exchange)
+        nse_equities = self.download_nse_equity_master()
         records = []
         for _, row in df.iterrows():
             inst_key = str(row.get("instrument_key", "")).strip()
@@ -155,14 +216,23 @@ class UpstoxFetcher:
             if not isin and "|" in inst_key:
                 isin = inst_key.split("|", 1)[1]
 
+            equity = nse_equities.get(isin.upper())
+            if not equity:
+                continue
+
             records.append({
-                "symbol": str(row.get("tradingsymbol", "")).strip(),
+                "symbol": equity["symbol"],
                 "instrument_key": inst_key,
                 "isin": isin,
-                "company_name": str(row.get("name", "")).strip(),
+                "company_name": equity["company_name"],
                 "exchange": exchange,
-                "series": str(row.get("series", "EQ")).strip(),
+                "series": equity["series"],
             })
+        if len(records) < self.MIN_MATCHED_NSE_EQUITIES:
+            raise ValueError(
+                f"Only {len(records)} Upstox instruments matched the NSE share masters; refusing partial refresh"
+            )
+        logger.info(f"Matched {len(records)} NSE common equities between Upstox and NSE masters.")
         return records
 
     # ─── Historical OHLCV ───────────────────────────────────────────────────
