@@ -36,14 +36,28 @@ class TelegramNotifier(BaseNotifier):
         tg = cfg.get("notifications", {}).get("telegram", {})
         self.bot_token = tg.get("bot_token", "")
         self.chat_id = tg.get("chat_id", "")
+        self.group_chat_id = tg.get("group_chat_id", "")
+        self.destinations: dict[str, str] = {}
         self.send_chart_cfg = tg.get("send_chart", True)
 
-        if not self.bot_token or not self.chat_id:
-            raise ValueError(
-                "Telegram bot_token and chat_id must be configured in secrets.yaml"
-            )
+        if not self.bot_token:
+            raise ValueError("Telegram bot_token must be configured in secrets.yaml")
+
+        if _config_switch(tg.get("individual_alert", "Y")):
+            if not self.chat_id:
+                raise ValueError("Telegram individual_alert is enabled but chat_id is empty")
+            self.destinations["telegram:individual"] = str(self.chat_id)
+        if _config_switch(tg.get("group_alert", "N")):
+            if not self.group_chat_id:
+                raise ValueError("Telegram group_alert is enabled but group_chat_id is empty")
+            self.destinations["telegram:group"] = str(self.group_chat_id)
+        if not self.destinations:
+            raise ValueError("Enable individual_alert or group_alert for Telegram")
 
         self._base_url = TELEGRAM_API.format(token=self.bot_token)
+
+    def delivery_targets(self) -> list[str]:
+        return list(self.destinations)
 
     # ─── Message Formatting ───────────────────────────────────────────────
 
@@ -132,11 +146,15 @@ class TelegramNotifier(BaseNotifier):
 
     # ─── API Calls ────────────────────────────────────────────────────────
 
-    def _send_message(self, text: str, retries: int = 3) -> bool:
+    def _send_message(self, text: str, chat_id: Optional[str] = None, retries: int = 3) -> bool:
         """Send a text message via Telegram."""
+        if chat_id is None:
+            if len(self.destinations) != 1:
+                raise ValueError("chat_id is required when Telegram has multiple destinations")
+            chat_id = next(iter(self.destinations.values()))
         url = f"{self._base_url}/sendMessage"
         payload = {
-            "chat_id": self.chat_id,
+            "chat_id": chat_id,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": False,
@@ -152,8 +170,12 @@ class TelegramNotifier(BaseNotifier):
             time.sleep(2 ** attempt)
         return False
 
-    def _send_photo(self, caption: str, photo_path: str, retries: int = 3) -> bool:
+    def _send_photo(self, caption: str, photo_path: str, chat_id: Optional[str] = None, retries: int = 3) -> bool:
         """Send a photo with caption via Telegram."""
+        if chat_id is None:
+            if len(self.destinations) != 1:
+                raise ValueError("chat_id is required when Telegram has multiple destinations")
+            chat_id = next(iter(self.destinations.values()))
         url = f"{self._base_url}/sendPhoto"
         for attempt in range(retries):
             try:
@@ -161,7 +183,7 @@ class TelegramNotifier(BaseNotifier):
                     resp = requests.post(
                         url,
                         data={
-                            "chat_id": self.chat_id,
+                            "chat_id": chat_id,
                             "caption": caption[:1024],  # Telegram caption limit
                             "parse_mode": "HTML",
                         },
@@ -180,29 +202,48 @@ class TelegramNotifier(BaseNotifier):
 
     def send_alert(self, payload: AlertPayload) -> bool:
         msg = self._format_message(payload)
-        success = self._send_message(msg)
+        results = [self._send_message(msg, chat_id) for chat_id in self.destinations.values()]
+        success = all(results)
         if success:
             logger.info(f"Telegram alert sent for {payload.symbol} [{payload.signal_type}]")
         return success
 
     def send_alert_with_chart(self, payload: AlertPayload) -> bool:
-        if not payload.chart_path or not Path(payload.chart_path).exists():
-            logger.warning(f"Chart not found for {payload.symbol}, sending text-only.")
-            return self.send_alert(payload)
+        results = [
+            self.notify_target(payload, target, send_chart=True)
+            for target in self.delivery_targets()
+        ]
+        return all(results)
 
-        confluence_tag = f" ({payload.confluence_score}/{payload.total_signals} Confluence)" if payload.total_signals > 1 else ""
-        caption = (
-            f"{('🟢' if payload.direction == 'BUY' else '🔴')} "
-            f"<b>{payload.symbol}</b> — {payload.direction} Signal{confluence_tag}\n"
-            f"Price: ₹{payload.price:,.2f} | "
-            f"MCap: {payload.format_mcap()} ({(payload.cap_category or 'N/A').title()} Cap)"
-        )
+    def notify_target(self, payload: AlertPayload, target: str, send_chart: bool = True) -> bool:
+        """Deliver to an enabled individual or group chat independently."""
+        chat_id = self.destinations.get(target)
+        if not chat_id:
+            raise ValueError(f"Unknown or disabled Telegram target: {target}")
 
-        # Send chart as photo with brief caption
-        success = self._send_photo(caption, payload.chart_path)
+        detail_msg = self._format_message(payload)
+        text_sent = self._send_message(detail_msg, chat_id)
+        photo_sent = False
+        if send_chart and self.send_chart_cfg and payload.chart_path and Path(payload.chart_path).exists():
+            confluence_tag = f" ({payload.confluence_score}/{payload.total_signals} Confluence)" if payload.total_signals > 1 else ""
+            caption = (
+                f"{('🟢' if payload.direction == 'BUY' else '🔴')} "
+                f"<b>{payload.symbol}</b> — {payload.direction} Signal{confluence_tag}\n"
+                f"Price: ₹{payload.price:,.2f} | "
+                f"MCap: {payload.format_mcap()} ({(payload.cap_category or 'N/A').title()} Cap)"
+            )
+            photo_sent = self._send_photo(caption, payload.chart_path, chat_id)
+        elif send_chart and self.send_chart_cfg and payload.chart_path:
+            logger.warning(f"Chart not found for {payload.symbol}; text alert sent to {target} only.")
+
+        success = text_sent or photo_sent
         if success:
-            # Send full detail as follow-up text message
-            detail_msg = self._format_message(payload)
-            self._send_message(detail_msg)
-            logger.info(f"Telegram chart alert sent for {payload.symbol}")
+            logger.info(f"Telegram alert sent for {payload.symbol} to {target}")
         return success
+
+
+def _config_switch(value) -> bool:
+    """Accept documented Y/N values and common YAML boolean equivalents."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"y", "yes", "true", "1", "on"}

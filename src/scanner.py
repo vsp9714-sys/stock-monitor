@@ -31,10 +31,14 @@ import pandas as pd
 
 from src.config_loader import get_config
 from src.db import (
+    Signal,
     Stock,
+    get_delivery_score,
     get_session,
-    mark_signal_notified,
+    mark_delivery_sent,
     prune_ohlcv_cache,
+    refresh_signal_notified_state,
+    seed_legacy_deliveries,
     upsert_signal,
 )
 from src.fetcher.fundamentals import FundamentalsFetcher
@@ -97,13 +101,16 @@ class Scanner:
     # ─── Stock Universe ──────────────────────────────────────────────────
 
     def refresh_instrument_master(self) -> int:
-        """Download fresh instrument list from Upstox and upsert into DB."""
-        logger.info("Refreshing instrument master from Upstox...")
+        """Refresh NSE ordinary shares, deactivating bonds and stale listings."""
+        logger.info("Refreshing NSE common-equity instrument master...")
         session = get_session()
         try:
             count = 0
             for exchange in ["NSE"]:
                 instruments = self.fetcher.get_all_eq_symbols(exchange)
+                active_symbols = {inst["symbol"] for inst in instruments}
+                if not active_symbols:
+                    raise RuntimeError("Refusing to deactivate the NSE universe: refreshed list is empty")
                 for inst in instruments:
                     existing = session.query(Stock).filter_by(
                         symbol=inst["symbol"], exchange=exchange
@@ -113,6 +120,8 @@ class Scanner:
                         existing.instrument_key = inst["instrument_key"]
                         existing.isin = inst.get("isin", "")
                         existing.company_name = inst.get("company_name", "")
+                        existing.series = inst.get("series", existing.series)
+                        existing.is_active = True
                         existing.last_updated = now
                     else:
                         session.add(Stock(
@@ -126,10 +135,17 @@ class Scanner:
                             last_updated=now,
                         ))
                     count += 1
-                if count % 500 == 0:
-                    session.commit()
+                    if count % 500 == 0:
+                        session.commit()
+                # Upstox's NSE_EQ/EQUITY classification includes bonds; anything
+                # absent from the verified NSE common-equity cross-check is inactive.
+                session.query(Stock).filter(
+                    Stock.exchange == exchange,
+                    Stock.is_active.is_(True),
+                    ~Stock.symbol.in_(active_symbols),
+                ).update({Stock.is_active: False}, synchronize_session=False)
             session.commit()
-            logger.info(f"Instrument master refreshed: {count} stocks.")
+            logger.info(f"Instrument master refreshed: {count} common stocks; stale/debt rows deactivated.")
             return count
         finally:
             session.close()
@@ -378,6 +394,14 @@ class Scanner:
         today = date.today()
         new_signal_count = 0
         db = get_session()
+        destinations = [
+            target
+            for notifier in self.notifiers
+            for target in notifier.delivery_targets()
+        ]
+        # Seed old `notified` rows once, so deploying this change doesn't resend
+        # alerts that were already delivered by the previous version.
+        seed_legacy_deliveries(db, destinations)
 
         max_workers = 10  # Conservative Upstox rate limit concurrency
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -398,9 +422,21 @@ class Scanner:
                     # Fetch fundamentals (cached)
                     fund = self.fundamentals.get_fundamentals(stock.symbol, stock.isin or "")
 
-                    # Generate multi-panel chart
+                    signal_type = res["signal_type"]
+                    existing = db.query(Signal).filter_by(
+                        symbol=stock.symbol,
+                        signal_date=today,
+                        signal_type=signal_type,
+                    ).first()
+                    old_score = int(existing.indicator_value or 0) if existing else 0
+
+                    # Only regenerate a chart for a new/highest confluence snapshot.
                     chart_path = None
-                    if df is not None and not df.empty:
+                    if existing and res["confluence_score"] < old_score:
+                        chart_path = existing.chart_path
+                    elif existing and res["confluence_score"] == old_score:
+                        chart_path = existing.chart_path
+                    elif df is not None and not df.empty:
                         from charts.chart_generator import generate_signal_chart
                         chart_path = generate_signal_chart(
                             symbol=stock.symbol,
@@ -416,7 +452,7 @@ class Scanner:
                         session=db,
                         symbol=stock.symbol,
                         signal_date=today,
-                        signal_type=res["signal_type"],
+                        signal_type=signal_type,
                         direction=res["direction"],
                         price=res["price"],
                         indicator_value=float(res["confluence_score"]),
@@ -427,6 +463,10 @@ class Scanner:
                         }),
                         chart_path=chart_path,
                     )
+                    saved_detail = json.loads(saved.indicator_detail or "{}")
+                    saved_score = int(saved.indicator_value or 0)
+                    saved_checks = saved_detail.get("checks", res["checks"])
+                    saved_total = int(saved_detail.get("total_signals", res["total_signals"]))
 
                     # Build multi-signal alert payload
                     payload = AlertPayload(
@@ -435,15 +475,15 @@ class Scanner:
                         signal_type=res["signal_type"],
                         direction=res["direction"],
                         price=res["price"],
-                        indicator_value=float(res["confluence_score"]),
+                        indicator_value=float(saved_score),
                         indicator_detail={
-                            "confluence_score": res["confluence_score"],
-                            "checks": res["checks"],
+                            "confluence_score": saved_score,
+                            "checks": saved_checks,
                         },
-                        confluence_score=res["confluence_score"],
-                        total_signals=res["total_signals"],
-                        checks=res["checks"],
-                        chart_path=chart_path,
+                        confluence_score=saved_score,
+                        total_signals=saved_total,
+                        checks=saved_checks,
+                        chart_path=saved.chart_path,
                         mcap_cr=fund.get("mcap_cr") if fund else None,
                         cap_category=fund.get("cap_category") if fund else None,
                         sector=fund.get("sector") if fund else None,
@@ -460,14 +500,14 @@ class Scanner:
                         screener_url=fund.get("screener_url") if fund else None,
                     )
 
-                    # Dispatch single consolidated alert
-                    self._dispatch_alert(payload)
-                    mark_signal_notified(db, saved.id)
-                    new_signal_count += 1
-                    logger.info(
-                        f"Confluence alert dispatched for {stock.symbol}: "
-                        f"{res['direction']} ({res['confluence_score']}/{res['total_signals']} signals met)"
-                    )
+                    # Dispatch only to targets that have not received this score.
+                    sent_any = self._dispatch_alert(payload, db, saved.id)
+                    if sent_any:
+                        new_signal_count += 1
+                        logger.info(
+                            f"Confluence alert/update dispatched for {stock.symbol}: "
+                            f"{res['direction']} ({saved_score}/{saved_total} signals met)"
+                        )
 
                 except Exception as e:
                     logger.error(f"Error processing confluence alert for {stock.symbol}: {e}", exc_info=True)
@@ -476,10 +516,26 @@ class Scanner:
         logger.info(f"Scan complete. {new_signal_count} confluence alerts detected and dispatched.")
         return new_signal_count
 
-    def _dispatch_alert(self, payload: AlertPayload) -> None:
-        """Send alert to all enabled notifiers."""
+    def _dispatch_alert(self, payload: AlertPayload, db, signal_id: int) -> bool:
+        """Send only score escalations, tracking success independently per target."""
+        sent_any = False
+        destinations = [
+            target
+            for notifier in self.notifiers
+            for target in notifier.delivery_targets()
+        ]
         for notifier in self.notifiers:
-            try:
-                notifier.notify(payload, send_chart=True)
-            except Exception as e:
-                logger.error(f"Notifier {type(notifier).__name__} failed: {e}")
+            for target in notifier.delivery_targets():
+                previous_score = get_delivery_score(db, signal_id, target)
+                if previous_score is not None and previous_score >= payload.confluence_score:
+                    continue
+                try:
+                    if notifier.notify_target(payload, target, send_chart=True):
+                        mark_delivery_sent(db, signal_id, target, payload.confluence_score)
+                        sent_any = True
+                    else:
+                        logger.warning(f"Notifier {type(notifier).__name__} returned failure for {target}.")
+                except Exception as e:
+                    logger.error(f"Notifier {type(notifier).__name__} failed for {target}: {e}")
+        refresh_signal_notified_state(db, signal_id, destinations)
+        return sent_any

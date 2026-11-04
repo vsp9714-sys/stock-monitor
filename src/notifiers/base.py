@@ -102,3 +102,13 @@ class BaseNotifier(ABC):
         if send_chart and payload.chart_path:
             return self.send_alert_with_chart(payload)
         return self.send_alert(payload)
+
+    def delivery_targets(self) -> list[str]:
+        """Stable destination keys used for per-recipient escalation deduplication."""
+        return [type(self).__name__.lower()]
+
+    def notify_target(self, payload: AlertPayload, target: str, send_chart: bool = True) -> bool:
+        """Deliver to one target; single-target notifiers use their normal path."""
+        if target not in self.delivery_targets():
+            raise ValueError(f"Unknown notification target: {target}")
+        return self.notify(payload, send_chart=send_chart)

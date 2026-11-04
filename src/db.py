@@ -18,6 +18,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     Float,
+    ForeignKey,
     Integer,
     String,
     Text,
@@ -124,6 +125,21 @@ class Signal(Base):
     )
 
 
+class SignalDelivery(Base):
+    """Last confluence score successfully delivered to each notification target."""
+    __tablename__ = "signal_deliveries"
+
+    id = Column(Integer, primary_key=True)
+    signal_id = Column(Integer, ForeignKey("signals.id", ondelete="CASCADE"), nullable=False, index=True)
+    destination = Column(String(80), nullable=False)
+    last_sent_score = Column(Integer, nullable=False, default=0)
+    sent_at = Column(DateTime)
+
+    __table_args__ = (
+        UniqueConstraint("signal_id", "destination", name="uq_signal_delivery_destination"),
+    )
+
+
 # ─── Engine & Session ─────────────────────────────────────────────────────────
 
 _engine = None
@@ -155,13 +171,25 @@ def get_session() -> Session:
 def upsert_signal(session: Session, symbol: str, signal_date: date, signal_type: str,
                   direction: str, price: float, indicator_value: float,
                   indicator_detail: str, chart_path: Optional[str] = None) -> Signal:
-    """Insert or ignore a signal (deduplicated per symbol+date+type)."""
+    """Create a daily signal or persist its latest highest confluence snapshot."""
     existing = (
         session.query(Signal)
         .filter_by(symbol=symbol, signal_date=signal_date, signal_type=signal_type)
         .first()
     )
     if existing:
+        old_score = int(existing.indicator_value or 0)
+        new_score = int(indicator_value or 0)
+        if new_score >= old_score:
+            existing.direction = direction
+            existing.price = price
+            existing.indicator_value = indicator_value
+            existing.indicator_detail = indicator_detail
+            existing.chart_path = chart_path
+            if new_score > old_score:
+                existing.notified = False
+                existing.notified_at = None
+            session.commit()
         return existing
 
     sig = Signal(
@@ -187,6 +215,63 @@ def mark_signal_notified(session: Session, signal_id: int) -> None:
         sig.notified = True
         sig.notified_at = datetime.now(timezone.utc)
         session.commit()
+
+
+def get_delivery_score(session: Session, signal_id: int, destination: str) -> Optional[int]:
+    delivery = session.query(SignalDelivery).filter_by(
+        signal_id=signal_id, destination=destination
+    ).first()
+    return delivery.last_sent_score if delivery else None
+
+
+def mark_delivery_sent(session: Session, signal_id: int, destination: str, score: int) -> None:
+    """Record a successful escalation delivery for one recipient/channel."""
+    delivery = session.query(SignalDelivery).filter_by(
+        signal_id=signal_id, destination=destination
+    ).first()
+    if delivery is None:
+        delivery = SignalDelivery(
+            signal_id=signal_id,
+            destination=destination,
+            last_sent_score=score,
+            sent_at=datetime.now(timezone.utc),
+        )
+        session.add(delivery)
+    elif score > delivery.last_sent_score:
+        delivery.last_sent_score = score
+        delivery.sent_at = datetime.now(timezone.utc)
+    session.commit()
+
+
+def seed_legacy_deliveries(session: Session, destinations: list[str]) -> None:
+    """Prevent rollout duplicates for old destinations, but not newly-added group chats."""
+    legacy_signals = session.query(Signal).filter(
+        Signal.notified.is_(True), Signal.signal_type.like("confluence_%")
+    ).all()
+    # The previous implementation could only address the configured personal
+    # chat. A newly enabled group has never received these historical alerts.
+    legacy_destinations = [target for target in destinations if target != "telegram:group"]
+    for sig in legacy_signals:
+        score = int(sig.indicator_value or 0)
+        for destination in legacy_destinations:
+            if get_delivery_score(session, sig.id, destination) is None:
+                mark_delivery_sent(session, sig.id, destination, score)
+
+
+def refresh_signal_notified_state(session: Session, signal_id: int, destinations: list[str]) -> None:
+    """Keep legacy notified flag true only when every configured target got latest score."""
+    sig = session.get(Signal, signal_id)
+    if not sig:
+        return
+    score = int(sig.indicator_value or 0)
+    delivered = bool(destinations) and all(
+        (get_delivery_score(session, signal_id, destination) or 0) >= score
+        for destination in destinations
+    )
+    sig.notified = delivered
+    if delivered:
+        sig.notified_at = datetime.now(timezone.utc)
+    session.commit()
 
 
 def get_pending_signals(session: Session) -> list[Signal]:

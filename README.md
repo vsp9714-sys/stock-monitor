@@ -1,15 +1,15 @@
 # Stock Monitor
 
-Swing trading signal detector for all 5000+ NSE/BSE listed stocks. Runs on an OCI instance and sends real-time alerts via Telegram (+ Discord/Email) when signals are detected.
+Swing trading signal detector for NSE-listed ordinary shares. Runs on an OCI instance and sends alerts via Telegram (+ Discord/Email) when signals are detected.
 
 ## Features
 - **Signals**: RSI oversold/overbought, MACD crossover, EMA crossovers (9×21, 21×50, 50×200 Golden/Death Cross), Volume breakout
-- **Universe**: All NSE/BSE EQ stocks (~5000+)
+- **Universe**: NSE mainboard and SME ordinary shares verified against NSE's official equity masters by ISIN (including EQ/BE/BZ and SM/ST/SZ series; bonds and other non-share instruments are excluded)
 - **Data**: Real-time via Upstox API (free tier)
 - **Fundamentals**: Market cap, cap category, P/E, ROE, promoter holding, last 4Q profit
 - **Charts**: Candlestick + EMA overlays + RSI + MACD (dark theme)
 - **Notifications**: Telegram (+ Discord, Email, WhatsApp — pluggable)
-- **Schedule**: Every 15 min during market hours (9:15 AM – 3:30 PM IST, Mon–Fri)
+- **Schedule**: Internal Python scheduler scans every 15 min; market-hours gate is 9:15 AM – 3:30 PM IST, Mon–Fri
 - **Persistent**: systemd service with auto-restart
 
 ## Quick Start
@@ -26,7 +26,20 @@ nano config/secrets.yaml
 ```
 Required:
 - `upstox.api_key` + `upstox.api_secret` (from [Upstox Developer](https://developer.upstox.com/))
-- `notifications.telegram.bot_token` + `chat_id`
+- `notifications.telegram.bot_token` + the enabled Telegram destination(s)
+
+Telegram recipient routing is controlled in `config/config.yaml`:
+
+```yaml
+notifications:
+  telegram:
+    individual_alert: "Y"   # send to chat_id
+    chat_id: "YOUR_TELEGRAM_CHAT_ID"
+    group_alert: "N"        # change to Y to send to group_chat_id
+    group_chat_id: ""       # Telegram group chat ID, commonly starts with -100
+```
+
+`individual_alert` and `group_alert` accept Y/N (or YAML boolean values). At least one must be enabled, and its corresponding chat ID must be populated. Keep `bot_token` in the ignored `config/secrets.yaml`; the config loader merges secrets over `config.yaml`. The bot must be added to the group and allowed to post. Enabling both switches sends independently to both destinations.
 
 ### 3. Upstox OAuth2 (required daily — Upstox tokens expire every 24h)
 ```bash
@@ -42,9 +55,17 @@ sudo systemctl enable stock-monitor   # Auto-start on reboot
 
 ### 5. Monitor
 ```bash
+systemctl status stock-monitor
+systemctl show stock-monitor -p ActiveState -p SubState -p MainPID -p ActiveEnterTimestamp
 tail -f logs/stock_monitor.log
 journalctl -u stock-monitor -f
 ```
+
+The service is scheduled by the Python `schedule` loop inside the systemd-managed process, so an empty `crontab -l` is expected. Check for systemd timers separately with `systemctl list-timers --all | grep -i stock-monitor`; this project does not use a systemd timer. The verified stock universe is refreshed on startup and daily at 08:30 using the server's local timezone (the scan market-hours gate itself uses Asia/Kolkata). Startup fails closed if the official source masters cannot be validated, preventing scans against a stale universe that may contain bonds.
+
+## Alert escalation and delivery deduplication
+
+For each stock, direction, and calendar date, the scanner stores one confluence signal row. It sends the initial qualifying score (for example, 2/6), then sends again only when the score increases (for example, 3/6). The row's score, price, check snapshot, and chart reference are updated to the highest observed score. Delivery scores are recorded independently per destination, so an unchanged score is not resent and a failed destination can be retried without resending to destinations that succeeded. Existing `notified` confluence rows are migrated as already delivered at their stored score for pre-existing destinations to avoid rollout duplicates; a newly enabled group still receives its first alert.
 
 ## Project Structure
 ```

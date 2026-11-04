@@ -2,7 +2,7 @@
 Main entry point — scheduler and lifecycle manager.
 
 Responsibilities:
-1. Initialize DB and instrument master on first run
+1. Initialize DB and refresh the verified share universe before scanning
 2. Schedule scans every 15 minutes during market hours (IST)
 3. Refresh instrument master daily (before market open)
 4. Handle graceful shutdown on SIGTERM/SIGINT
@@ -148,24 +148,18 @@ def main() -> None:
     # Initialize scanner
     scanner = Scanner()
 
-    # First-run instrument refresh if DB is empty
-    from src.db import Stock, get_session
-    session = get_session()
-    stock_count = session.query(Stock).count()
-    session.close()
-
-    if stock_count == 0:
-        logger.info("First run detected — downloading instrument master...")
-        scanner.refresh_instrument_master()
-    else:
-        logger.info(f"Loaded {stock_count} stocks from database.")
+    # Refresh the verified share universe before any scan. Besides keeping
+    # listings current, this deactivates legacy non-share rows (e.g. bonds).
+    # The refresh validates both source masters and fails closed on bad data.
+    logger.info("Refreshing verified NSE share universe before scanning...")
+    scanner.refresh_instrument_master()
 
     scan_interval = cfg["market"].get("scan_interval_minutes", 15)
 
     # Schedule: scan every N minutes
     schedule.every(scan_interval).minutes.do(run_scan_job)
 
-    # Schedule: refresh instruments daily at 8:30 AM IST (before market open)
+    # Schedule: refresh instruments daily at 08:30 server-local time.
     schedule.every().day.at("08:30").do(refresh_instruments_job)
 
     logger.info(f"Scheduler started. Scan interval: every {scan_interval} minutes.")

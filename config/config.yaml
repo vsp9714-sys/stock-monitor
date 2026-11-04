@@ -85,7 +85,11 @@ notifications:
   telegram:
     enabled: true
     bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
+    # Recipient switches: Y sends to that destination; N disables it.
+    individual_alert: "Y"
     chat_id: "YOUR_TELEGRAM_CHAT_ID"
+    group_alert: "N"
+    group_chat_id: ""
     # Send chart image with alert?
     send_chart: true
 
