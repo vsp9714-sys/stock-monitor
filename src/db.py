@@ -27,6 +27,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from src.config_loader import get_config
 
@@ -294,3 +295,27 @@ def prune_ohlcv_cache(session: Session, symbol: str, interval: str, keep_rows: i
         ~OHLCVCache.id.in_(subq),
     ).delete(synchronize_session=False)
     session.commit()
+
+
+def upsert_ohlcv_rows(session: Session, rows: list[dict], *, commit: bool = True) -> int:
+    """Insert/update OHLCV rows idempotently using the cache's unique key."""
+    if not rows:
+        return 0
+    # Stay below SQLite's bind-variable limit on older system packages.
+    # 100 rows × 7 values stays under SQLite's historical 999-variable limit.
+    for offset in range(0, len(rows), 100):
+        statement = sqlite_insert(OHLCVCache).values(rows[offset:offset + 100])
+        statement = statement.on_conflict_do_update(
+            index_elements=["symbol", "interval", "ts"],
+            set_={
+                "open": statement.excluded.open,
+                "high": statement.excluded.high,
+                "low": statement.excluded.low,
+                "close": statement.excluded.close,
+                "volume": statement.excluded.volume,
+            },
+        )
+        session.execute(statement)
+    if commit:
+        session.commit()
+    return len(rows)

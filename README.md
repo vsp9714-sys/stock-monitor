@@ -63,6 +63,29 @@ journalctl -u stock-monitor -f
 
 The service is scheduled by the Python `schedule` loop inside the systemd-managed process, so an empty `crontab -l` is expected. Check for systemd timers separately with `systemctl list-timers --all | grep -i stock-monitor`; this project does not use a systemd timer. The verified stock universe is refreshed on startup and daily at 08:30 using the server's local timezone (the scan market-hours gate itself uses Asia/Kolkata). Startup fails closed if the official source masters cannot be validated, preventing scans against a stale universe that may contain bonds.
 
+## Upstox pacing and daily candle cache
+
+The scanner stores historical daily OHLCV in SQLite (`ohlcv_cache`) and uses Upstox V3 full-market quotes in batches for each scan. The quote API supports up to 500 instrument keys per request; this project defaults to 100 keys per request to keep URLs comfortably sized. With 3,207 active shares that is about 33 quote requests, rather than 3,207 individual history requests on every scan. If an HTTP quote batch fails, the sweep fails closed before sending alerts. If a successful response omits individual symbols (for example, an illiquid instrument with no quote), only those symbols are skipped; alerts may be sent for fully quoted/evaluated symbols, and the summary is explicitly marked incomplete.
+
+On a new deployment, warm the history cache before expecting complete scans:
+
+```bash
+cd /home/ubuntu/repos/stock-monitor
+./.venv/bin/python -m src.cache_warmup
+```
+
+The warm-up is resumable: it commits every 20 completed symbols, and reruns skip symbols that already have the required history. The required history follows the slowest configured indicator (currently 210 daily bars). Historical requests are paced at 1 second each; a first full backfill of ~3,200 shares therefore takes at least 54 minutes and may take longer if Upstox asks for retries. Do not start a second warm-up concurrently. A nonzero exit status means there are stocks that still need cache repair; use the printed failed-symbol list and rerun after addressing the cause.
+
+To intentionally send one manual full-universe alert sweep (uses the configured routes and normal per-destination escalation deduplication), run:
+
+```bash
+./.venv/bin/python -m src.scan_once
+```
+
+The command prints a JSON summary and exits nonzero if the scan is incomplete. Batch/API failures or mixed quote sessions fail closed and dispatch no alerts. Individual missing-quote symbols and shares with less than the required daily history are skipped; eligible, fully quoted shares can still alert, and the summary reports the scan as incomplete.
+
+`upstox.historical_min_interval_seconds`, `upstox.quote_min_interval_seconds`, `upstox.request_max_retries`, and `upstox.quote_batch_size` in `config/config.yaml` control pacing, bounded transient retries, and quote batching. HTTP 429 and 5xx/network errors use bounded backoff; permanent 4xx errors fail immediately. Historical backfill is paced below the standard user quota; normal recurring scans use batched quotes and cached history.
+
 ## Alert escalation and delivery deduplication
 
 For each stock, direction, and calendar date, the scanner stores one confluence signal row. It sends the initial qualifying score (for example, 2/6), then sends again only when the score increases (for example, 3/6). The row's score, price, check snapshot, and chart reference are updated to the highest observed score. Delivery scores are recorded independently per destination, so an unchanged score is not resent and a failed destination can be retried without resending to destinations that succeeded. Existing `notified` confluence rows are migrated as already delivered at their stored score for pre-existing destinations to avoid rollout duplicates; a newly enabled group still receives its first alert.

@@ -22,27 +22,30 @@ Flow per scan cycle:
 """
 import json
 import logging
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, time as datetime_time, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+from sqlalchemy import func
 
 from src.config_loader import get_config
 from src.db import (
+    OHLCVCache,
     Signal,
     Stock,
     get_delivery_score,
     get_session,
     mark_delivery_sent,
-    prune_ohlcv_cache,
     refresh_signal_notified_state,
     seed_legacy_deliveries,
     upsert_signal,
+    upsert_ohlcv_rows,
 )
 from src.fetcher.fundamentals import FundamentalsFetcher
-from src.fetcher.upstox import UpstoxFetcher
+from src.fetcher.upstox import UpstoxAPIError, UpstoxFetcher
 from src.notifiers.base import AlertPayload, BaseNotifier
 from src.signals.ema_cross import detect_ema_crossover
 from src.signals.macd import detect_macd_signal
@@ -50,6 +53,24 @@ from src.signals.rsi import detect_rsi_signal
 from src.signals.volume_breakout import detect_volume_breakout
 
 logger = logging.getLogger(__name__)
+IST = ZoneInfo("Asia/Kolkata")
+
+
+@dataclass(frozen=True)
+class ScanSummary:
+    universe_size: int
+    evaluated_count: int
+    failed_count: int
+    alerts_dispatched: int
+    complete: bool
+
+
+def _daily_timestamp(value) -> datetime:
+    """Normalize candle times to a naive IST midnight for daily cache keys."""
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert(IST)
+    return datetime.combine(ts.date(), datetime_time.min)
 
 
 def _build_notifiers(cfg: dict) -> list[BaseNotifier]:
@@ -170,16 +191,108 @@ class Scanner:
         finally:
             session.close()
 
+    def required_daily_candles(self) -> int:
+        pairs = self.signal_cfg.get("ema_crossover", {}).get("pairs", [[9, 21], [21, 50], [50, 200]])
+        slowest = max((int(pair[1]) for pair in pairs), default=50)
+        return max(slowest + 10, int(self.signal_cfg.get("rsi", {}).get("period", 14)) + 10, 30)
+
+    def warm_candle_cache(self, limit: Optional[int] = None, checkpoint_symbols: int = 20) -> dict:
+        """Idempotently backfill missing daily history; DB rows are resume checkpoints."""
+        stocks = self.get_active_stocks(limit=limit)
+        minimum = self.required_daily_candles()
+        session = get_session()
+        pending_rows = []
+        pending_symbols = 0
+        warmed = 0
+        skipped = 0
+        failures = []
+        insufficient_history = []
+        stopped_early = False
+        try:
+            counts = dict(
+                session.query(OHLCVCache.symbol, func.count(OHLCVCache.id))
+                .filter(OHLCVCache.interval == "1d")
+                .group_by(OHLCVCache.symbol)
+                .all()
+            )
+            for index, stock in enumerate(stocks, 1):
+                if counts.get(stock.symbol, 0) >= minimum:
+                    skipped += 1
+                    continue
+                try:
+                    candles = self.fetcher.get_daily_candles(stock.instrument_key, days=365)
+                    if candles.empty:
+                        failures.append(stock.symbol)
+                        logger.warning(
+                            "Cache warm-up received no daily bars for %s", stock.symbol,
+                        )
+                        continue
+                    for row in candles.itertuples(index=False):
+                        pending_rows.append({
+                            "symbol": stock.symbol,
+                            "interval": "1d",
+                            "ts": _daily_timestamp(row.ts),
+                            "open": float(row.open),
+                            "high": float(row.high),
+                            "low": float(row.low),
+                            "close": float(row.close),
+                            "volume": float(row.volume),
+                        })
+                    pending_symbols += 1
+                    warmed += 1
+                    counts[stock.symbol] = len(candles)
+                    if len(candles) < minimum:
+                        insufficient_history.append(stock.symbol)
+                        logger.info(
+                            "Cached %s bars for %s; %s are needed for every configured check",
+                            len(candles), stock.symbol, minimum,
+                        )
+                    if pending_symbols >= checkpoint_symbols:
+                        upsert_ohlcv_rows(session, pending_rows)
+                        pending_rows.clear()
+                        pending_symbols = 0
+                    if index % 100 == 0 or index == len(stocks):
+                        logger.info(
+                            "Daily cache warm-up progress: %s/%s visited; %s warmed, %s already complete, %s failed",
+                            index, len(stocks), warmed, skipped, len(failures),
+                        )
+                except Exception as exc:
+                    failures.append(stock.symbol)
+                    logger.warning("Cache warm-up failed for %s: %s", stock.symbol, exc)
+                    if isinstance(exc, UpstoxAPIError):
+                        # A provider-level failure (notably exhausted 429 retries
+                        # or an invalid token) should pause the job. Checkpointed
+                        # rows remain committed and the next invocation resumes.
+                        stopped_early = True
+                        break
+            if pending_rows:
+                upsert_ohlcv_rows(session, pending_rows)
+            session.commit()
+            result = {
+                "universe_size": len(stocks),
+                "warmed": warmed,
+                "already_complete": skipped,
+                "failed": len(failures),
+                "failed_symbols": failures,
+                "insufficient_history": len(insufficient_history),
+                "insufficient_history_symbols": insufficient_history,
+                "stopped_early": stopped_early,
+                "remaining": max(0, len(stocks) - warmed - skipped - len(failures)),
+                "minimum_daily_candles": minimum,
+            }
+            logger.info("Daily cache warm-up finished: %s", result)
+            return result
+        finally:
+            session.close()
+
     # ─── Single Stock Scan & Confluence Evaluation ────────────────────────
 
-    def _scan_stock(self, stock: Stock) -> tuple[Optional[dict], Optional[pd.DataFrame]]:
+    def _scan_stock(self, stock: Stock, df: pd.DataFrame) -> tuple[Optional[dict], pd.DataFrame]:
         """
         Scan a single stock across all indicator checks and evaluate confluence.
         Returns (confluence_dict or None, df of daily candles).
         """
         try:
-            # Fetch 250 days of daily candles
-            df = self.fetcher.get_daily_candles(stock.instrument_key, days=250)
             if df.empty or len(df) < 30:
                 return None, None
 
@@ -376,78 +489,171 @@ class Scanner:
 
         except Exception as e:
             logger.error(f"Error scanning {stock.symbol}: {e}", exc_info=False)
-            return None, None
+            raise
 
     # ─── Full Scan Cycle ─────────────────────────────────────────────────
 
-    def run_scan(self, limit: Optional[int] = None) -> int:
-        """
-        Run a full scan across active stocks with confluence filtering.
-        Returns number of confluence alerts dispatched.
-        """
-        logger.info("Starting market scan with confluence filtering...")
+    def _load_cached_daily_frames(self, stocks: list[Stock], session) -> dict[str, pd.DataFrame]:
+        symbols = [stock.symbol for stock in stocks]
+        grouped = {symbol: [] for symbol in symbols}
+        # Keep IN clauses portable to SQLite builds with the older 999-bind limit.
+        for offset in range(0, len(symbols), 400):
+            batch = symbols[offset:offset + 400]
+            rows = (
+                session.query(
+                    OHLCVCache.symbol, OHLCVCache.ts, OHLCVCache.open,
+                    OHLCVCache.high, OHLCVCache.low, OHLCVCache.close,
+                    OHLCVCache.volume,
+                )
+                .filter(OHLCVCache.interval == "1d", OHLCVCache.symbol.in_(batch))
+                .order_by(OHLCVCache.symbol, OHLCVCache.ts)
+                .yield_per(10000)
+            )
+            for row in rows:
+                grouped[row.symbol].append(tuple(row[1:]))
+        return {
+            symbol: pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+            for symbol, rows in grouped.items()
+        }
+
+    def run_scan(self, limit: Optional[int] = None) -> ScanSummary:
+        """Scan cached history plus batched live OHLCV and report coverage gaps."""
+        logger.info("Starting market scan with cached history and batched quotes...")
         stocks = self.get_active_stocks(limit=limit)
         if not stocks:
             logger.warning("No stocks in database. Run refresh_instrument_master() first.")
-            return 0
+            return ScanSummary(0, 0, 0, 0, True)
 
-        today = date.today()
-        new_signal_count = 0
         db = get_session()
-        destinations = [
-            target
-            for notifier in self.notifiers
-            for target in notifier.delivery_targets()
-        ]
-        # Seed old `notified` rows once, so deploying this change doesn't resend
-        # alerts that were already delivered by the previous version.
-        seed_legacy_deliveries(db, destinations)
+        try:
+            minimum = self.required_daily_candles()
+            frames = self._load_cached_daily_frames(stocks, db)
+            try:
+                quotes = self.fetcher.get_full_market_quotes(
+                    [stock.instrument_key for stock in stocks],
+                    batch_size=int(self.cfg.get("upstox", {}).get("quote_batch_size", 100)),
+                    allow_missing=True,
+                )
+            except Exception as exc:
+                logger.error("Scan incomplete: batched quote sweep failed; no alerts sent: %s", exc)
+                return ScanSummary(len(stocks), 0, len(stocks), 0, False)
 
-        max_workers = 10  # Conservative Upstox rate limit concurrency
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(self._scan_stock, stock): stock for stock in stocks}
+            quote_rows = []
+            quote_dates = set()
+            missing_quote_stocks = []
+            for stock in stocks:
+                quote = quotes.get(stock.instrument_key)
+                if quote is None:
+                    missing_quote_stocks.append(stock)
+                    continue
+                ts = datetime.fromtimestamp(quote["ts"] / 1000, timezone.utc).astimezone(IST)
+                quote_dates.add(ts.date())
+                cache_ts = datetime.combine(ts.date(), datetime_time.min)
+                quote_rows.append({
+                    "symbol": stock.symbol,
+                    "interval": "1d",
+                    "ts": cache_ts,
+                    "open": quote["open"],
+                    "high": quote["high"],
+                    "low": quote["low"],
+                    "close": quote["close"],
+                    "volume": quote["volume"],
+                })
+                frames[stock.symbol] = pd.concat([
+                    frames[stock.symbol].loc[
+                        frames[stock.symbol]["ts"].map(_daily_timestamp) != cache_ts
+                    ],
+                    pd.DataFrame([quote_rows[-1]]).drop(columns=["symbol", "interval"]),
+                ], ignore_index=True).sort_values("ts").reset_index(drop=True)
+            if missing_quote_stocks:
+                logger.warning(
+                    "Quote response omitted %s/%s symbols; skipping only those symbols: %s",
+                    len(missing_quote_stocks), len(stocks),
+                    ", ".join(stock.symbol for stock in missing_quote_stocks[:25]),
+                )
+            if not quote_dates:
+                logger.error("Scan incomplete: quote response contained no usable OHLCV; no alerts sent.")
+                return ScanSummary(len(stocks), 0, len(stocks), 0, False)
+            if len(quote_dates) != 1:
+                logger.error("Scan incomplete: quote batches returned mixed trading dates; no alerts sent.")
+                return ScanSummary(len(stocks), 0, len(stocks), 0, False)
+            upsert_ohlcv_rows(db, quote_rows)
 
-            for future in as_completed(futures):
-                stock = futures[future]
-                try:
-                    res, df = future.result()
-                except Exception as e:
-                    logger.error(f"Future error for {stock.symbol}: {e}")
-                    res, df = None, None
+            eligible_stocks = [
+                stock for stock in stocks
+                if stock.instrument_key in quotes and len(frames[stock.symbol]) >= minimum
+            ]
+            insufficient_count = sum(
+                stock.instrument_key in quotes and len(frames[stock.symbol]) < minimum
+                for stock in stocks
+            )
+            unavailable_count = len(missing_quote_stocks)
+            if insufficient_count:
+                logger.warning(
+                    "Scan has insufficient history for %s/%s stocks (<%s daily bars); "
+                    "those stocks are skipped, eligible stock alerts will still be sent.",
+                    insufficient_count, len(stocks), minimum,
+                )
 
+            # Evaluate the entire universe before writing signals or sending anything.
+            # A detector exception therefore cannot produce a misleading partial sweep.
+            evaluations = []
+            failed = []
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = {
+                    executor.submit(self._scan_stock, stock, frames[stock.symbol]): stock
+                    for stock in eligible_stocks
+                }
+                for future in as_completed(futures):
+                    stock = futures[future]
+                    try:
+                        result, frame = future.result()
+                        evaluations.append((stock, result, frame))
+                    except Exception as exc:
+                        logger.error("Signal evaluation failed for %s: %s", stock.symbol, exc)
+                        failed.append(stock.symbol)
+            if failed:
+                logger.error(
+                    "Scan incomplete: %s/%s signal evaluations failed; no alerts sent.",
+                    len(failed), len(stocks),
+                )
+                return ScanSummary(
+                    len(stocks), len(eligible_stocks) - len(failed),
+                    unavailable_count + insufficient_count + len(failed), 0, False,
+                )
+
+            # Alert deduplication follows the market-data session, not the host
+            # calendar date (important for manual scans after the market closes).
+            today = next(iter(quote_dates))
+            new_signal_count = 0
+            destinations = [
+                target for notifier in self.notifiers for target in notifier.delivery_targets()
+            ]
+            seed_legacy_deliveries(db, destinations)
+
+            for stock, res, df in evaluations:
                 if not res:
                     continue
-
                 try:
-                    # Fetch fundamentals (cached)
                     fund = self.fundamentals.get_fundamentals(stock.symbol, stock.isin or "")
-
                     signal_type = res["signal_type"]
                     existing = db.query(Signal).filter_by(
-                        symbol=stock.symbol,
-                        signal_date=today,
-                        signal_type=signal_type,
+                        symbol=stock.symbol, signal_date=today, signal_type=signal_type
                     ).first()
                     old_score = int(existing.indicator_value or 0) if existing else 0
-
-                    # Only regenerate a chart for a new/highest confluence snapshot.
-                    chart_path = None
-                    if existing and res["confluence_score"] < old_score:
+                    if existing and res["confluence_score"] <= old_score:
                         chart_path = existing.chart_path
-                    elif existing and res["confluence_score"] == old_score:
-                        chart_path = existing.chart_path
-                    elif df is not None and not df.empty:
+                    else:
                         from charts.chart_generator import generate_signal_chart
                         chart_path = generate_signal_chart(
                             symbol=stock.symbol,
                             company_name=stock.company_name or stock.symbol,
                             df=df,
-                            signal_type=res["signal_type"],
+                            signal_type=signal_type,
                             direction=res["direction"],
                             indicator_value=float(res["confluence_score"]),
                         )
 
-                    # Save consolidated signal to DB (deduplicated per symbol + date + signal_type)
                     saved = upsert_signal(
                         session=db,
                         symbol=stock.symbol,
@@ -467,19 +673,14 @@ class Scanner:
                     saved_score = int(saved.indicator_value or 0)
                     saved_checks = saved_detail.get("checks", res["checks"])
                     saved_total = int(saved_detail.get("total_signals", res["total_signals"]))
-
-                    # Build multi-signal alert payload
                     payload = AlertPayload(
                         symbol=stock.symbol,
                         company_name=stock.company_name or stock.symbol,
-                        signal_type=res["signal_type"],
+                        signal_type=signal_type,
                         direction=res["direction"],
                         price=res["price"],
                         indicator_value=float(saved_score),
-                        indicator_detail={
-                            "confluence_score": saved_score,
-                            "checks": saved_checks,
-                        },
+                        indicator_detail={"confluence_score": saved_score, "checks": saved_checks},
                         confluence_score=saved_score,
                         total_signals=saved_total,
                         checks=saved_checks,
@@ -499,22 +700,25 @@ class Scanner:
                         promoter_holding_pct=fund.get("promoter_holding_pct") if fund else None,
                         screener_url=fund.get("screener_url") if fund else None,
                     )
-
-                    # Dispatch only to targets that have not received this score.
-                    sent_any = self._dispatch_alert(payload, db, saved.id)
-                    if sent_any:
+                    if self._dispatch_alert(payload, db, saved.id):
                         new_signal_count += 1
                         logger.info(
-                            f"Confluence alert/update dispatched for {stock.symbol}: "
-                            f"{res['direction']} ({saved_score}/{saved_total} signals met)"
+                            "Confluence alert/update dispatched for %s: %s (%s/%s checks)",
+                            stock.symbol, res["direction"], saved_score, saved_total,
                         )
+                except Exception as exc:
+                    logger.error("Error processing alert for %s: %s", stock.symbol, exc, exc_info=True)
 
-                except Exception as e:
-                    logger.error(f"Error processing confluence alert for {stock.symbol}: {e}", exc_info=True)
-
-        db.close()
-        logger.info(f"Scan complete. {new_signal_count} confluence alerts detected and dispatched.")
-        return new_signal_count
+            logger.info(
+                "Scan complete: evaluated %s/%s symbols; %s alerts dispatched.",
+                len(eligible_stocks), len(stocks), new_signal_count,
+            )
+            return ScanSummary(
+                len(stocks), len(eligible_stocks), unavailable_count + insufficient_count,
+                new_signal_count, unavailable_count == 0 and insufficient_count == 0,
+            )
+        finally:
+            db.close()
 
     def _dispatch_alert(self, payload: AlertPayload, db, signal_id: int) -> bool:
         """Send only score escalations, tracking success independently per target."""
