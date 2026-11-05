@@ -33,6 +33,7 @@ from sqlalchemy import func
 
 from src.config_loader import get_config
 from src.db import (
+    DailyCandleRefresh,
     OHLCVCache,
     Signal,
     Stock,
@@ -307,8 +308,10 @@ class Scanner:
 
         The service's intraday quote sweep deliberately does not mutate this
         cache. This bounded, paced job fetches provider historical candles once
-        after close, starting at each symbol's last cached session so reruns are
-        idempotent and interrupted runs can resume safely.
+        after close. Same-day cache rows are not proof of finalization: an older
+        warm-up may have stored them before close. Per-symbol refresh state
+        makes verified rows resumable while unverified same-day rows are removed
+        before requests so a restart cannot treat them as confirmed data.
         """
         current = now or datetime.now(IST)
         if current.tzinfo is None:
@@ -331,6 +334,32 @@ class Scanner:
         pending_symbols = 0
         stopped_early = False
         try:
+            refresh_state = {
+                state.symbol: state
+                for state in session.query(DailyCandleRefresh).all()
+            }
+            current_day = current.date()
+            current_midnight = datetime.combine(current_day, datetime_time.min)
+            # Existing same-session rows have unknown provenance. Remove them
+            # unless this day's post-close fetch already confirmed that symbol.
+            unverified_symbols = [
+                stock.symbol for stock in stocks
+                if not (
+                    (state := refresh_state.get(stock.symbol))
+                    and state.session_date == current_day
+                    and state.status == "confirmed"
+                )
+            ]
+            for offset in range(0, len(unverified_symbols), 400):
+                batch = unverified_symbols[offset:offset + 400]
+                session.query(OHLCVCache).filter(
+                    OHLCVCache.interval == "1d",
+                    OHLCVCache.symbol.in_(batch),
+                    OHLCVCache.ts == current_midnight,
+                ).delete(synchronize_session=False)
+            # Persist the conservative cleanup before network work. If this
+            # process stops, scans fall back to prior confirmed sessions.
+            session.commit()
             latest_by_symbol = dict(
                 session.query(OHLCVCache.symbol, func.max(OHLCVCache.ts))
                 .filter(OHLCVCache.interval == "1d")
@@ -338,15 +367,17 @@ class Scanner:
                 .all()
             )
             for index, stock in enumerate(stocks, 1):
+                state = refresh_state.get(stock.symbol)
+                if state and state.session_date == current_day and state.status == "confirmed":
+                    unchanged += 1
+                    continue
                 last_cached = latest_by_symbol.get(stock.symbol)
                 if last_cached is not None:
                     last_date = pd.Timestamp(last_cached).date()
-                    if last_date >= current.date():
-                        unchanged += 1
-                        continue
                     from_date = last_date.isoformat()
                 else:
                     from_date = (current.date() - timedelta(days=365)).isoformat()
+                processed += 1
                 try:
                     candles = self.fetcher.get_historical_candles(
                         stock.instrument_key,
@@ -356,7 +387,19 @@ class Scanner:
                     )
                     if candles.empty:
                         failed.append(stock.symbol)
+                        refresh_state[stock.symbol] = DailyCandleRefresh(
+                            symbol=stock.symbol, session_date=current_day,
+                            status="no_bar", updated_at=datetime.now(timezone.utc),
+                        )
+                        session.merge(refresh_state[stock.symbol])
                         logger.warning("Daily refresh received no bars for %s", stock.symbol)
+                        pending_symbols += 1
+                        if pending_symbols >= checkpoint_symbols:
+                            if pending_rows:
+                                upsert_ohlcv_rows(session, pending_rows, commit=False)
+                                pending_rows.clear()
+                            session.commit()
+                            pending_symbols = 0
                         continue
                     symbol_rows = []
                     for row in candles.itertuples(index=False):
@@ -376,20 +419,33 @@ class Scanner:
                             "close": float(row.close),
                             "volume": float(row.volume),
                         })
+                    has_current_bar = any(row["ts"].date() == current_day for row in symbol_rows)
                     pending_rows.extend(symbol_rows)
                     pending_symbols += 1
-                    processed += 1
-                    if any(row["ts"].date() == current.date() for row in symbol_rows):
+                    if has_current_bar:
                         updated += 1
+                        refresh_state[stock.symbol] = DailyCandleRefresh(
+                            symbol=stock.symbol, session_date=current_day,
+                            status="confirmed", updated_at=datetime.now(timezone.utc),
+                        )
                     else:
-                        unchanged += 1
+                        # A successful response without today's completed bar
+                        # is not a valid confirmation. The unverified same-day
+                        # row was removed above and must stay absent.
+                        failed.append(stock.symbol)
+                        refresh_state[stock.symbol] = DailyCandleRefresh(
+                            symbol=stock.symbol, session_date=current_day,
+                            status="no_bar", updated_at=datetime.now(timezone.utc),
+                        )
+                    session.merge(refresh_state[stock.symbol])
                     latest_by_symbol[stock.symbol] = max(
                         (row["ts"] for row in symbol_rows),
                         default=last_cached,
                     )
                     if pending_symbols >= checkpoint_symbols:
-                        upsert_ohlcv_rows(session, pending_rows)
+                        upsert_ohlcv_rows(session, pending_rows, commit=False)
                         pending_rows.clear()
+                        session.commit()
                         pending_symbols = 0
                     if index % 100 == 0 or index == len(stocks):
                         logger.info(
@@ -398,12 +454,17 @@ class Scanner:
                         )
                 except Exception as exc:
                     failed.append(stock.symbol)
+                    refresh_state[stock.symbol] = DailyCandleRefresh(
+                        symbol=stock.symbol, session_date=current_day,
+                        status="failed", updated_at=datetime.now(timezone.utc),
+                    )
+                    session.merge(refresh_state[stock.symbol])
                     logger.warning("Daily refresh failed for %s: %s", stock.symbol, exc)
                     if isinstance(exc, UpstoxAPIError):
                         stopped_early = True
                         break
             if pending_rows:
-                upsert_ohlcv_rows(session, pending_rows)
+                upsert_ohlcv_rows(session, pending_rows, commit=False)
             session.commit()
             result = {
                 "universe_size": len(stocks),
@@ -413,7 +474,9 @@ class Scanner:
                 "failed": len(failed),
                 "failed_symbols": failed,
                 "stopped_early": stopped_early,
-                "remaining": max(0, len(stocks) - processed - unchanged - len(failed)),
+                # Failed symbols are included in processed because each was
+                # attempted; unchanged symbols are confirmed checkpoints.
+                "remaining": max(0, len(stocks) - processed - unchanged),
                 "session_date": current.date().isoformat(),
             }
             logger.info("Post-close daily candle refresh finished: %s", result)
