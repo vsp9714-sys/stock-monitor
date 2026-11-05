@@ -10,3 +10,7 @@ Upstox's official [Full Market Quotes V3 documentation](https://upstox.com/devel
 Therefore, quote `ohlc.close` is treated only as part of the live session snapshot. It is neither presumed to equal LTP nor persisted as a finalized daily close. `prev_close_price` is retained as the explicit prior-close field. Missing required LTP fields or an absent/stale trade timestamp makes that symbol unavailable for alerting; the scanner does not fall back to `ohlc.close`.
 
 A synthetic regression fixture intentionally provides different values for `ohlc.close`, `prev_close_price`, and `last_price` to guard this contract without live credentials.
+
+## Daily-bar completion and refresh
+
+The scanner's swing indicators consume only `ohlcv_cache` daily candles. Intraday quote snapshots never enter that cache. The service refreshes the cache at 15:45 Asia/Kolkata on weekdays using Upstox historical daily candles, not quote OHLC. The refresh starts from each symbol's latest cached session, uses the existing historical-request limiter and bounded retry behavior, commits in checkpoints, and is idempotent on replay. A refresh run before 15:45 or on weekends is skipped. If Upstox has not published a session's completed daily candle yet, that symbol is unchanged and a later post-close run can retrieve it.
