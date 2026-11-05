@@ -24,7 +24,7 @@ import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, time as datetime_time, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -227,25 +227,36 @@ class Scanner:
                             "Cache warm-up received no daily bars for %s", stock.symbol,
                         )
                         continue
+                    current_ist = datetime.now(IST)
+                    before_daily_finalization = current_ist.time() < datetime_time(15, 45)
+                    symbol_rows = []
                     for row in candles.itertuples(index=False):
-                        pending_rows.append({
+                        candle_ts = _daily_timestamp(row.ts)
+                        if before_daily_finalization and candle_ts.date() >= current_ist.date():
+                            continue
+                        symbol_rows.append({
                             "symbol": stock.symbol,
                             "interval": "1d",
-                            "ts": _daily_timestamp(row.ts),
+                            "ts": candle_ts,
                             "open": float(row.open),
                             "high": float(row.high),
                             "low": float(row.low),
                             "close": float(row.close),
                             "volume": float(row.volume),
                         })
+                    if not symbol_rows:
+                        insufficient_history.append(stock.symbol)
+                        logger.info("No finalized daily candles available yet for %s", stock.symbol)
+                        continue
+                    pending_rows.extend(symbol_rows)
                     pending_symbols += 1
                     warmed += 1
-                    counts[stock.symbol] = len(candles)
-                    if len(candles) < minimum:
+                    counts[stock.symbol] = len(symbol_rows)
+                    if len(symbol_rows) < minimum:
                         insufficient_history.append(stock.symbol)
                         logger.info(
                             "Cached %s bars for %s; %s are needed for every configured check",
-                            len(candles), stock.symbol, minimum,
+                            len(symbol_rows), stock.symbol, minimum,
                         )
                     if pending_symbols >= checkpoint_symbols:
                         upsert_ohlcv_rows(session, pending_rows)
@@ -281,6 +292,131 @@ class Scanner:
                 "minimum_daily_candles": minimum,
             }
             logger.info("Daily cache warm-up finished: %s", result)
+            return result
+        finally:
+            session.close()
+
+    def refresh_completed_daily_cache(
+        self,
+        limit: Optional[int] = None,
+        checkpoint_symbols: int = 20,
+        *,
+        now: Optional[datetime] = None,
+    ) -> dict:
+        """Refresh canonical daily candles after the exchange session closes.
+
+        The service's intraday quote sweep deliberately does not mutate this
+        cache. This bounded, paced job fetches provider historical candles once
+        after close, starting at each symbol's last cached session so reruns are
+        idempotent and interrupted runs can resume safely.
+        """
+        current = now or datetime.now(IST)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=IST)
+        current = current.astimezone(IST)
+        if current.weekday() >= 5:
+            logger.info("Daily candle refresh skipped on weekend.")
+            return {"universe_size": 0, "updated": 0, "failed": 0, "skipped": True}
+        if current.time() < datetime_time(15, 45):
+            logger.info("Daily candle refresh skipped before post-close finalization window.")
+            return {"universe_size": 0, "updated": 0, "failed": 0, "skipped": True}
+
+        stocks = self.get_active_stocks(limit=limit)
+        session = get_session()
+        updated = 0
+        unchanged = 0
+        processed = 0
+        failed = []
+        pending_rows = []
+        pending_symbols = 0
+        stopped_early = False
+        try:
+            latest_by_symbol = dict(
+                session.query(OHLCVCache.symbol, func.max(OHLCVCache.ts))
+                .filter(OHLCVCache.interval == "1d")
+                .group_by(OHLCVCache.symbol)
+                .all()
+            )
+            for index, stock in enumerate(stocks, 1):
+                last_cached = latest_by_symbol.get(stock.symbol)
+                if last_cached is not None:
+                    last_date = pd.Timestamp(last_cached).date()
+                    if last_date >= current.date():
+                        unchanged += 1
+                        continue
+                    from_date = last_date.isoformat()
+                else:
+                    from_date = (current.date() - timedelta(days=365)).isoformat()
+                try:
+                    candles = self.fetcher.get_historical_candles(
+                        stock.instrument_key,
+                        "day",
+                        from_date=from_date,
+                        to_date=current.date().isoformat(),
+                    )
+                    if candles.empty:
+                        failed.append(stock.symbol)
+                        logger.warning("Daily refresh received no bars for %s", stock.symbol)
+                        continue
+                    symbol_rows = []
+                    for row in candles.itertuples(index=False):
+                        ts = _daily_timestamp(row.ts)
+                        # Never persist today's unfinished bar. The refresh runs
+                        # after close; if the provider has not published today's
+                        # completed candle yet, a later run will fetch it.
+                        if ts.date() > current.date():
+                            continue
+                        symbol_rows.append({
+                            "symbol": stock.symbol,
+                            "interval": "1d",
+                            "ts": ts,
+                            "open": float(row.open),
+                            "high": float(row.high),
+                            "low": float(row.low),
+                            "close": float(row.close),
+                            "volume": float(row.volume),
+                        })
+                    pending_rows.extend(symbol_rows)
+                    pending_symbols += 1
+                    processed += 1
+                    if any(row["ts"].date() == current.date() for row in symbol_rows):
+                        updated += 1
+                    else:
+                        unchanged += 1
+                    latest_by_symbol[stock.symbol] = max(
+                        (row["ts"] for row in symbol_rows),
+                        default=last_cached,
+                    )
+                    if pending_symbols >= checkpoint_symbols:
+                        upsert_ohlcv_rows(session, pending_rows)
+                        pending_rows.clear()
+                        pending_symbols = 0
+                    if index % 100 == 0 or index == len(stocks):
+                        logger.info(
+                            "Post-close daily refresh progress: %s/%s visited; %s updated; %s failed",
+                            index, len(stocks), updated, len(failed),
+                        )
+                except Exception as exc:
+                    failed.append(stock.symbol)
+                    logger.warning("Daily refresh failed for %s: %s", stock.symbol, exc)
+                    if isinstance(exc, UpstoxAPIError):
+                        stopped_early = True
+                        break
+            if pending_rows:
+                upsert_ohlcv_rows(session, pending_rows)
+            session.commit()
+            result = {
+                "universe_size": len(stocks),
+                "processed": processed,
+                "updated": updated,
+                "unchanged": unchanged,
+                "failed": len(failed),
+                "failed_symbols": failed,
+                "stopped_early": stopped_early,
+                "remaining": max(0, len(stocks) - processed - unchanged - len(failed)),
+                "session_date": current.date().isoformat(),
+            }
+            logger.info("Post-close daily candle refresh finished: %s", result)
             return result
         finally:
             session.close()

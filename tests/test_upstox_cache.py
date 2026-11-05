@@ -1,4 +1,5 @@
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -198,6 +199,103 @@ def test_cache_warmup_resumes_completed_symbols(test_db_session, monkeypatch):
     assert len(fetcher.calls) == 2
 
 
+def test_post_close_refresh_updates_completed_daily_bars_and_is_idempotent(test_db_session, monkeypatch):
+    stock = type("StockRef", (), {"symbol": "AAA", "instrument_key": "NSE_EQ|AAA"})()
+    upsert_ohlcv_rows(test_db_session, [{
+        "symbol": "AAA", "interval": "1d", "ts": datetime(2026, 11, 4),
+        "open": 10, "high": 12, "low": 9, "close": 11, "volume": 100,
+    }])
+
+    class Fetcher:
+        calls = []
+
+        def get_historical_candles(self, instrument_key, interval, *, from_date, to_date):
+            self.calls.append((instrument_key, interval, from_date, to_date))
+            return pd.DataFrame([{
+                "ts": pd.Timestamp(to_date),
+                "open": 11, "high": 14, "low": 10, "close": 13, "volume": 250,
+            }])
+
+    fetcher = Fetcher()
+    scanner = object.__new__(Scanner)
+    scanner.fetcher = fetcher
+    scanner.get_active_stocks = lambda limit=None: [stock]
+    monkeypatch.setattr("src.scanner.get_session", lambda: test_db_session)
+    after_close = datetime(2026, 11, 5, 16, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+
+    result = scanner.refresh_completed_daily_cache(now=after_close, checkpoint_symbols=1)
+    assert result["processed"] == 1
+    assert result["updated"] == 1
+    assert result["failed"] == 0
+    assert fetcher.calls == [("NSE_EQ|AAA", "day", "2026-11-04", "2026-11-05")]
+    rows = test_db_session.query(OHLCVCache).order_by(OHLCVCache.ts).all()
+    assert [row.close for row in rows] == [11, 13]
+
+    replay = scanner.refresh_completed_daily_cache(now=after_close)
+    assert replay["unchanged"] == 1
+    assert replay["processed"] == 0
+    assert len(fetcher.calls) == 1
+    assert test_db_session.query(OHLCVCache).count() == 2
+
+    # Model a service restart and the next exchange session: it resumes from
+    # the last persisted session and adds the next finalized bar exactly once.
+    restarted_scanner = object.__new__(Scanner)
+    restarted_scanner.fetcher = fetcher
+    restarted_scanner.get_active_stocks = lambda limit=None: [stock]
+    next_session = datetime(2026, 11, 6, 16, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+    next_result = restarted_scanner.refresh_completed_daily_cache(now=next_session)
+    assert next_result["updated"] == 1
+    assert fetcher.calls[-1] == ("NSE_EQ|AAA", "day", "2026-11-05", "2026-11-06")
+    rows = test_db_session.query(OHLCVCache).order_by(OHLCVCache.ts).all()
+    assert len(rows) == 3
+    assert rows[-1].ts.date().isoformat() == "2026-11-06"
+
+
+def test_post_close_refresh_does_not_run_before_close(monkeypatch):
+    scanner = object.__new__(Scanner)
+    scanner.get_active_stocks = lambda **kwargs: pytest.fail("must not fetch before close")
+    before_close = datetime(2026, 11, 5, 15, 30, tzinfo=ZoneInfo("Asia/Kolkata"))
+    result = scanner.refresh_completed_daily_cache(now=before_close)
+    assert result["skipped"] is True
+
+
+def test_stale_ltp_cannot_reach_signal_evaluation(monkeypatch, caplog):
+    stock = type("StockRef", (), {"symbol": "AAA", "instrument_key": "NSE_EQ|AAA"})()
+    stale_ms = int((datetime.now(timezone.utc).timestamp() - 3600) * 1000)
+
+    class FakeDB:
+        def close(self):
+            pass
+
+    class Fetcher:
+        def get_full_market_quotes(self, *args, **kwargs):
+            return {"NSE_EQ|AAA": {
+                "last_price": 101, "prev_close_price": 99,
+                "last_trade_time": stale_ms,
+                "open": 99, "high": 110, "low": 98, "close": 105,
+                "volume": 10, "ts": stale_ms,
+            }}
+
+    scanner = object.__new__(Scanner)
+    scanner.cfg = {"upstox": {"quote_batch_size": 100, "max_quote_age_seconds": 300}}
+    scanner.fetcher = Fetcher()
+    scanner.get_active_stocks = lambda limit=None: [stock]
+    scanner.required_daily_candles = lambda: 1
+    scanner._load_cached_daily_frames = lambda stocks, db: {"AAA": pd.DataFrame([{
+        "ts": pd.Timestamp("2026-11-04"), "open": 10, "high": 12, "low": 9,
+        "close": 11, "volume": 100,
+    }])}
+    scanner._scan_stock = lambda *args: pytest.fail("stale quote must be skipped")
+    scanner.notifiers = []
+    monkeypatch.setattr("src.scanner.get_session", FakeDB)
+
+    result = scanner.run_scan()
+    assert result.complete is False
+    assert result.evaluated_count == 0
+    assert result.alerts_dispatched == 0
+    assert "Skipping AAA: missing, invalid, or stale Upstox last trade" in caplog.text
+
+
 def test_scan_stops_before_alerts_when_quote_batch_request_fails(monkeypatch):
     stock = type("StockRef", (), {
         "symbol": "ABC", "instrument_key": "NSE_EQ|INE000A01000",
@@ -288,9 +386,14 @@ def test_scan_skips_missing_symbol_but_dispatches_for_quoted_symbols(monkeypatch
     scanner._load_cached_daily_frames = lambda _stocks, _db: {"AAA": frame, "GNRL": frame}
     result_data = {"signal_type": "confluence", "direction": "BUY", "price": 11,
                    "confluence_score": 2, "total_signals": 6, "checks": []}
-    scanner._scan_stock = lambda stock, daily: (result_data, daily)
+    def evaluate_cached_daily(stock, daily):
+        # Daily signal inputs remain the finalized cache, distinct from the
+        # quote's prior close (95), session OHLC close (105), and LTP (112).
+        assert daily["close"].iloc[-1] == 11
+        return result_data, daily
+    scanner._scan_stock = evaluate_cached_daily
     sent = []
-    scanner._dispatch_alert = lambda payload, db, signal_id: sent.append((payload.symbol, payload.price)) or True
+    scanner._dispatch_alert = lambda payload, db, signal_id: sent.append(payload) or True
     monkeypatch.setattr("src.scanner.get_session", FakeDB)
     monkeypatch.setattr("src.scanner.upsert_ohlcv_rows", lambda *args: None)
     monkeypatch.setattr("src.scanner.seed_legacy_deliveries", lambda *args: None)
@@ -304,4 +407,7 @@ def test_scan_skips_missing_symbol_but_dispatches_for_quoted_symbols(monkeypatch
     assert result.evaluated_count == 1
     assert result.failed_count == 1
     assert result.alerts_dispatched == 1
-    assert sent == [("AAA", 112)]
+    assert len(sent) == 1
+    assert (sent[0].symbol, sent[0].price) == ("AAA", 112)
+    assert sent[0].price_source == "Upstox last_price"
+    assert sent[0].quote_timestamp

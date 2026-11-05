@@ -129,6 +129,16 @@ def refresh_instruments_job() -> None:
         logger.error(f"Instrument refresh failed: {e}", exc_info=True)
 
 
+def refresh_daily_cache_job() -> None:
+    """Refresh finalized daily candles after NSE's session close."""
+    logger.info("Refreshing completed daily candle cache (post-close job)...")
+    try:
+        result = scanner.refresh_completed_daily_cache()
+        logger.info("Post-close daily cache refresh result: %s", result)
+    except Exception as e:
+        logger.error(f"Post-close daily cache refresh failed: {e}", exc_info=True)
+
+
 def graceful_shutdown(signum, frame) -> None:
     global _shutdown
     logger.info(f"Received signal {signum}. Shutting down gracefully...")
@@ -171,6 +181,11 @@ def main() -> None:
 
     # Schedule: refresh instruments daily at 08:30 server-local time.
     schedule.every().day.at("08:30").do(refresh_instruments_job)
+
+    # Refresh canonical daily bars after the NSE close, in exchange-local time.
+    # Historical calls are paced and checkpointed; scans continue to use the
+    # prior confirmed cache until each provider candle is persisted.
+    schedule.every().day.at("15:45", "Asia/Kolkata").do(refresh_daily_cache_job)
 
     logger.info(f"Scheduler started. Scan interval: every {scan_interval} minutes.")
     logger.info("Market hours: 09:15 – 15:30 IST, Mon–Fri")
