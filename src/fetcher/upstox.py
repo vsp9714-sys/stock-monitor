@@ -377,7 +377,12 @@ class UpstoxFetcher:
     def get_full_market_quotes(
         self, instrument_keys: list[str], batch_size: int = 100, *, allow_missing: bool = False
     ) -> dict[str, dict]:
-        """Fetch V3 current-day OHLCV snapshots in provider-supported batches.
+        """Fetch V3 quote snapshots in provider-supported batches.
+
+        Upstox's V3 ``ohlc`` is a live session snapshot, not a finalized daily
+        candle. Its ``close`` can differ from ``last_price``; ``prev_close_price``
+        is the prior close. ``ohlc.ts`` is the candle start, so use
+        ``last_trade_time`` (epoch milliseconds) for LTP freshness checks.
 
         Upstox permits up to 500 keys. A default of 100 keeps GET URLs comfortably
         below common proxy limits while still reducing a 3,207-stock sweep to ~33 calls.
@@ -412,7 +417,15 @@ class UpstoxFetcher:
                     field: float(ohlc[field]) for field in ("open", "high", "low", "close", "volume")
                 }
                 result[key]["ts"] = int(ohlc["ts"])
-                result[key]["last_price"] = float(quote.get("last_price", ohlc["close"]))
+                # Required separately: never silently substitute an OHLC field for LTP.
+                if any(quote.get(field) is None for field in (
+                    "last_price", "prev_close_price", "last_trade_time"
+                )):
+                    result.pop(key, None)
+                    continue
+                result[key]["last_price"] = float(quote["last_price"])
+                result[key]["prev_close_price"] = float(quote["prev_close_price"])
+                result[key]["last_trade_time"] = int(quote["last_trade_time"])
         missing = expected - result.keys()
         if missing and not allow_missing:
             raise IncompleteQuoteBatch(set(missing))

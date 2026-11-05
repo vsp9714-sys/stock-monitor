@@ -47,7 +47,8 @@ def test_quote_fetcher_batches_and_maps_instrument_tokens(monkeypatch):
         return {"data": {
             f"key_{i}": {
                 "instrument_token": key,
-                "last_price": 101.0,
+                "last_price": 101.0, "prev_close_price": 99.0,
+                "last_trade_time": 1_800_000_000_000,
                 "ohlc": {"open": 1, "high": 2, "low": 0.5, "close": 1.5,
                          "volume": 42, "ts": 1_800_000_000_000},
             }
@@ -61,6 +62,8 @@ def test_quote_fetcher_batches_and_maps_instrument_tokens(monkeypatch):
     assert len(result) == 205
     assert result[keys[0]]["volume"] == 42.0
     assert result[keys[-1]]["last_price"] == 101.0
+    assert result[keys[-1]]["prev_close_price"] == 99.0
+    assert result[keys[-1]]["close"] == 1.5
 
 
 def test_quote_fetcher_fails_closed_on_missing_key(monkeypatch):
@@ -78,6 +81,7 @@ def test_quote_fetcher_can_return_available_quotes_and_skip_missing(monkeypatch)
     missing = "NSE_EQ|INE000A01001"
     monkeypatch.setattr(fetcher, "_get_json", lambda *args: {"data": {
         "row": {"instrument_token": available, "last_price": 10,
+                "prev_close_price": 9, "last_trade_time": 1_800_000_000_000,
                 "ohlc": {"open": 1, "high": 2, "low": 0.5, "close": 1.5,
                          "volume": 42, "ts": 1_800_000_000_000}}
     }})
@@ -242,7 +246,8 @@ def test_scan_skips_missing_symbol_but_dispatches_for_quoted_symbols(monkeypatch
                               "company_name": symbol, "isin": "INE000A01000"})()
         for symbol in ("AAA", "GNRL")
     ]
-    today_ms = 1_800_000_000_000
+    from datetime import timezone
+    today_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
     class FakeQuery:
         def filter_by(self, **kwargs):
@@ -260,8 +265,10 @@ def test_scan_skips_missing_symbol_but_dispatches_for_quoted_symbols(monkeypatch
 
     class Fetcher:
         def get_full_market_quotes(self, keys, **kwargs):
-            return {"NSE_EQ|AAA": {"open": 10, "high": 12, "low": 9,
-                                   "close": 11, "volume": 100, "ts": today_ms}}
+            return {"NSE_EQ|AAA": {"open": 100, "high": 120, "low": 90,
+                                   "close": 105, "volume": 100, "ts": today_ms,
+                                   "last_price": 112, "prev_close_price": 95,
+                                   "last_trade_time": today_ms}}
 
     class Fundamentals:
         def get_fundamentals(self, *args):
@@ -283,7 +290,7 @@ def test_scan_skips_missing_symbol_but_dispatches_for_quoted_symbols(monkeypatch
                    "confluence_score": 2, "total_signals": 6, "checks": []}
     scanner._scan_stock = lambda stock, daily: (result_data, daily)
     sent = []
-    scanner._dispatch_alert = lambda payload, db, signal_id: sent.append(payload.symbol) or True
+    scanner._dispatch_alert = lambda payload, db, signal_id: sent.append((payload.symbol, payload.price)) or True
     monkeypatch.setattr("src.scanner.get_session", FakeDB)
     monkeypatch.setattr("src.scanner.upsert_ohlcv_rows", lambda *args: None)
     monkeypatch.setattr("src.scanner.seed_legacy_deliveries", lambda *args: None)
@@ -297,4 +304,4 @@ def test_scan_skips_missing_symbol_but_dispatches_for_quoted_symbols(monkeypatch
     assert result.evaluated_count == 1
     assert result.failed_count == 1
     assert result.alerts_dispatched == 1
-    assert sent == ["AAA"]
+    assert sent == [("AAA", 112)]
