@@ -75,7 +75,8 @@ class TelegramNotifier(BaseNotifier):
             f"📌 <b>{payload.format_signal_label()}</b>",
             "",
             f"🏢 <b>{payload.company_name}</b>",
-            f"💰 Price: <b>₹{payload.price:,.2f}</b>",
+            f"💰 Price: <b>₹{payload.price:,.2f}</b> ({html.escape(payload.price_source)})",
+            f"🕒 Quote time: {html.escape(payload.quote_timestamp or 'unknown')}",
         ]
 
         # Multi-signal check list

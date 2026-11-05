@@ -20,6 +20,8 @@ class AlertPayload:
     price: float
     indicator_value: Optional[float]
     indicator_detail: dict              # Full indicator snapshot
+    price_source: str = "Upstox last_price"
+    quote_timestamp: Optional[str] = None
 
     # Confluence metadata
     confluence_score: int = 1

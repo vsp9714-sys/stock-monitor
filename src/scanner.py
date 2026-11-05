@@ -538,33 +538,28 @@ class Scanner:
                 logger.error("Scan incomplete: batched quote sweep failed; no alerts sent: %s", exc)
                 return ScanSummary(len(stocks), 0, len(stocks), 0, False)
 
-            quote_rows = []
             quote_dates = set()
             missing_quote_stocks = []
+            fresh_quotes = {}
+            now = datetime.now(timezone.utc)
+            max_age = int(self.cfg.get("upstox", {}).get("max_quote_age_seconds", 300))
             for stock in stocks:
                 quote = quotes.get(stock.instrument_key)
                 if quote is None:
                     missing_quote_stocks.append(stock)
                     continue
-                ts = datetime.fromtimestamp(quote["ts"] / 1000, timezone.utc).astimezone(IST)
-                quote_dates.add(ts.date())
-                cache_ts = datetime.combine(ts.date(), datetime_time.min)
-                quote_rows.append({
-                    "symbol": stock.symbol,
-                    "interval": "1d",
-                    "ts": cache_ts,
-                    "open": quote["open"],
-                    "high": quote["high"],
-                    "low": quote["low"],
-                    "close": quote["close"],
-                    "volume": quote["volume"],
-                })
-                frames[stock.symbol] = pd.concat([
-                    frames[stock.symbol].loc[
-                        frames[stock.symbol]["ts"].map(_daily_timestamp) != cache_ts
-                    ],
-                    pd.DataFrame([quote_rows[-1]]).drop(columns=["symbol", "interval"]),
-                ], ignore_index=True).sort_values("ts").reset_index(drop=True)
+                try:
+                    trade_time = datetime.fromtimestamp(quote["last_trade_time"] / 1000, timezone.utc)
+                    ltp = float(quote["last_price"])
+                    age = (now - trade_time).total_seconds()
+                    if ltp <= 0 or age < -30 or age > max_age:
+                        raise ValueError("stale or invalid LTP")
+                except (KeyError, TypeError, ValueError, OverflowError, OSError):
+                    logger.warning("Skipping %s: missing, invalid, or stale Upstox last trade", stock.symbol)
+                    missing_quote_stocks.append(stock)
+                    continue
+                quote_dates.add(trade_time.astimezone(IST).date())
+                fresh_quotes[stock.instrument_key] = quote
             if missing_quote_stocks:
                 logger.warning(
                     "Quote response omitted %s/%s symbols; skipping only those symbols: %s",
@@ -577,14 +572,14 @@ class Scanner:
             if len(quote_dates) != 1:
                 logger.error("Scan incomplete: quote batches returned mixed trading dates; no alerts sent.")
                 return ScanSummary(len(stocks), 0, len(stocks), 0, False)
-            upsert_ohlcv_rows(db, quote_rows)
-
+            # Quote OHLC is a live session snapshot: never append it to canonical
+            # daily candles or use it as a finalized input to swing indicators.
             eligible_stocks = [
                 stock for stock in stocks
-                if stock.instrument_key in quotes and len(frames[stock.symbol]) >= minimum
+                if stock.instrument_key in fresh_quotes and len(frames[stock.symbol]) >= minimum
             ]
             insufficient_count = sum(
-                stock.instrument_key in quotes and len(frames[stock.symbol]) < minimum
+                stock.instrument_key in fresh_quotes and len(frames[stock.symbol]) < minimum
                 for stock in stocks
             )
             unavailable_count = len(missing_quote_stocks)
@@ -637,6 +632,8 @@ class Scanner:
                 try:
                     fund = self.fundamentals.get_fundamentals(stock.symbol, stock.isin or "")
                     signal_type = res["signal_type"]
+                    quote = fresh_quotes[stock.instrument_key]
+                    res = {**res, "price": float(quote["last_price"])}
                     existing = db.query(Signal).filter_by(
                         symbol=stock.symbol, signal_date=today, signal_type=signal_type
                     ).first()
@@ -679,6 +676,10 @@ class Scanner:
                         signal_type=signal_type,
                         direction=res["direction"],
                         price=res["price"],
+                        price_source="Upstox last_price",
+                        quote_timestamp=datetime.fromtimestamp(
+                            quote["last_trade_time"] / 1000, timezone.utc
+                        ).isoformat(),
                         indicator_value=float(saved_score),
                         indicator_detail={"confluence_score": saved_score, "checks": saved_checks},
                         confluence_score=saved_score,

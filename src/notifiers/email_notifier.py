@@ -53,7 +53,7 @@ class EmailNotifier(BaseNotifier):
           <div style="padding: 20px;">
             <p><strong>{payload.company_name}</strong></p>
             <table style="width: 100%; border-collapse: collapse;">
-              <tr><td style="padding: 6px 0; color: #8b949e;">Price</td><td><strong>₹{payload.price:,.2f}</strong></td></tr>
+              <tr><td style="padding: 6px 0; color: #8b949e;">Price</td><td><strong>₹{payload.price:,.2f}</strong> ({payload.price_source})<br>{payload.quote_timestamp or 'unknown'}</td></tr>
               <tr><td style="padding: 6px 0; color: #8b949e;">Market Cap</td><td>{payload.format_mcap()} ({(payload.cap_category or 'N/A').title()} Cap)</td></tr>
               {'<tr><td style="padding: 6px 0; color: #8b949e;">Sector</td><td>' + str(payload.sector) + '</td></tr>' if payload.sector else ''}
               {'<tr><td style="padding: 6px 0; color: #8b949e;">P/E Ratio</td><td>' + f"{payload.pe_ratio:.1f}x" + '</td></tr>' if payload.pe_ratio else ''}
