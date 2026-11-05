@@ -103,8 +103,18 @@ def run_scan_job() -> None:
         return
     logger.info(f"[{next_scan_time()}] Running scheduled scan...")
     try:
-        count = scanner.run_scan()
-        logger.info(f"Scan completed: {count} signals dispatched.")
+        summary = scanner.run_scan()
+        if summary.complete:
+            logger.info(
+                "Scan complete: %s/%s evaluated; %s alerts dispatched.",
+                summary.evaluated_count, summary.universe_size, summary.alerts_dispatched,
+            )
+        else:
+            logger.error(
+                "Scan incomplete: %s/%s evaluated; %s failures; %s alerts dispatched.",
+                summary.evaluated_count, summary.universe_size,
+                summary.failed_count, summary.alerts_dispatched,
+            )
     except Exception as e:
         logger.error(f"Scan job failed: {e}", exc_info=True)
 

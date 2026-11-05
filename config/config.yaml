@@ -9,6 +9,13 @@ upstox:
   # Token is auto-refreshed. Initial token must be generated manually once.
   # See docs/upstox_auth.md for setup steps.
   access_token: ""
+  # Shared in-process pacing for market data calls. Historical candle history
+  # is one instrument/request; 1 second keeps a full backfill under the 30-minute
+  # standard API quota. Quotes are batched (max 500; default 100 for URL safety).
+  historical_min_interval_seconds: 1.0
+  quote_min_interval_seconds: 0.1
+  request_max_retries: 3
+  quote_batch_size: 100
 
 # ─── Market Schedule ──────────────────────────────────────────────────────────
 market:

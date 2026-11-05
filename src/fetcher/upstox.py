@@ -10,8 +10,10 @@ Upstox API v2 docs: https://upstox.com/developer/api-documentation/
 import json
 import io
 import logging
+import random
 import time
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
@@ -20,11 +22,27 @@ import pandas as pd
 import requests
 
 from src.config_loader import get_config
+from src.rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.upstox.com/v2"
+BASE_URL_V3 = "https://api.upstox.com/v3"
 TOKEN_CACHE = Path("data/upstox_token.json")
+
+
+class UpstoxAPIError(RuntimeError):
+    """Provider request failed after bounded retries."""
+
+
+class IncompleteQuoteBatch(UpstoxAPIError):
+    """Quote API response did not contain every requested instrument."""
+
+    def __init__(self, missing_keys: set[str]):
+        self.missing_keys = frozenset(missing_keys)
+        super().__init__(
+            f"Upstox quote response omitted {len(self.missing_keys)} requested instruments"
+        )
 
 
 class UpstoxAuth:
@@ -127,6 +145,77 @@ class UpstoxFetcher:
         self.cfg = get_config()
         self.auth = UpstoxAuth(self.cfg)
         self._instrument_map: dict[str, str] = {}  # symbol → instrument_key
+        upstox_cfg = self.cfg.get("upstox", {})
+        self._historical_limiter = RateLimiter(
+            upstox_cfg.get("historical_min_interval_seconds", 1.0)
+        )
+        self._quote_limiter = RateLimiter(
+            upstox_cfg.get("quote_min_interval_seconds", 0.1)
+        )
+        self._request_retries = int(upstox_cfg.get("request_max_retries", 3))
+
+    @staticmethod
+    def _retry_delay(response, attempt: int) -> float:
+        """Return a bounded Retry-After/exponential delay, with small jitter."""
+        retry_after = response.headers.get("Retry-After") if response is not None else None
+        delay = 0.0
+        if retry_after:
+            try:
+                delay = float(retry_after)
+            except ValueError:
+                try:
+                    delay = max(0.0, (parsedate_to_datetime(retry_after) - datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, ValueError, OverflowError):
+                    delay = 0.0
+        if delay <= 0:
+            delay = min(30.0, 2.0 ** attempt)
+        return min(60.0, delay + random.uniform(0.0, min(0.5, delay * 0.1)))
+
+    def _get_json(self, url: str, params: dict, limiter: RateLimiter) -> dict:
+        """GET a provider endpoint with shared pacing and bounded transient retry."""
+        last_error = None
+        for attempt in range(self._request_retries + 1):
+            limiter.wait()
+            try:
+                response = requests.get(
+                    url, headers=self.auth.auth_headers(), params=params, timeout=30
+                )
+                if response.status_code == 429 or response.status_code >= 500:
+                    last_error = UpstoxAPIError(
+                        f"Upstox returned HTTP {response.status_code} for {url}"
+                    )
+                    if attempt >= self._request_retries:
+                        break
+                    delay = self._retry_delay(response, attempt)
+                    limiter.defer(delay)
+                    logger.warning(
+                        "Upstox HTTP %s; retry %s/%s after %.1fs",
+                        response.status_code, attempt + 1, self._request_retries, delay,
+                    )
+                    continue
+                try:
+                    response.raise_for_status()
+                except requests.HTTPError as exc:
+                    # Retry only throttling and server/transient errors. Other
+                    # 4xx responses (bad token, bad key, invalid request) need
+                    # operator action and should fail immediately.
+                    raise UpstoxAPIError(
+                        f"Upstox returned HTTP {response.status_code} for {url}"
+                    ) from exc
+                return response.json()
+            except UpstoxAPIError:
+                raise
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt >= self._request_retries:
+                    break
+                delay = self._retry_delay(None, attempt)
+                limiter.defer(delay)
+                logger.warning(
+                    "Transient Upstox request error; retry %s/%s after %.1fs: %s",
+                    attempt + 1, self._request_retries, delay, exc,
+                )
+        raise UpstoxAPIError(str(last_error or "Upstox request failed")) from last_error
 
     # ─── Instrument Master ──────────────────────────────────────────────────
 
@@ -261,35 +350,73 @@ class UpstoxFetcher:
             f"/{interval}/{to_date}/{from_date}"
         )
         try:
-            resp = requests.get(url, headers=self.auth.auth_headers(), timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-            candles = data.get("data", {}).get("candles", [])
-            if not candles:
-                return pd.DataFrame()
-
-            df = pd.DataFrame(
-                candles,
-                columns=["ts", "open", "high", "low", "close", "volume", "oi"]
-            )
-            df["ts"] = pd.to_datetime(df["ts"])
-            df = df.sort_values("ts").reset_index(drop=True)
-            df[["open", "high", "low", "close", "volume"]] = df[
-                ["open", "high", "low", "close", "volume"]
-            ].astype(float)
-            return df[["ts", "open", "high", "low", "close", "volume"]]
-
-        except requests.HTTPError as e:
-            logger.warning(f"HTTP error fetching candles for {instrument_key}: {e}")
-            return pd.DataFrame()
-        except Exception as e:
-            logger.error(f"Error fetching candles for {instrument_key}: {e}")
+            data = self._get_json(url, {}, self._historical_limiter)
+        except UpstoxAPIError as exc:
+            logger.error("Historical candles unavailable for %s: %s", instrument_key, exc)
+            raise
+        candles = data.get("data", {}).get("candles", [])
+        if not candles:
             return pd.DataFrame()
 
-    def get_daily_candles(self, instrument_key: str, days: int = 250) -> pd.DataFrame:
+        df = pd.DataFrame(
+            candles,
+            columns=["ts", "open", "high", "low", "close", "volume", "oi"]
+        )
+        df["ts"] = pd.to_datetime(df["ts"])
+        df = df.sort_values("ts").reset_index(drop=True)
+        df[["open", "high", "low", "close", "volume"]] = df[
+            ["open", "high", "low", "close", "volume"]
+        ].astype(float)
+        return df[["ts", "open", "high", "low", "close", "volume"]]
+
+    def get_daily_candles(self, instrument_key: str, days: int = 365) -> pd.DataFrame:
         """Convenience: fetch daily OHLCV for last N days."""
         from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         return self.get_historical_candles(instrument_key, "day", from_date)
+
+    def get_full_market_quotes(
+        self, instrument_keys: list[str], batch_size: int = 100, *, allow_missing: bool = False
+    ) -> dict[str, dict]:
+        """Fetch V3 current-day OHLCV snapshots in provider-supported batches.
+
+        Upstox permits up to 500 keys. A default of 100 keeps GET URLs comfortably
+        below common proxy limits while still reducing a 3,207-stock sweep to ~33 calls.
+        By default the method is all-or-error. A scanner may opt into partial
+        results to skip individual instruments without OHLCV while still marking
+        the overall sweep incomplete. HTTP/API batch failures always raise.
+        """
+        if not instrument_keys:
+            return {}
+        if not 1 <= batch_size <= 500:
+            raise ValueError("batch_size must be between 1 and 500")
+        result = {}
+        expected = set(instrument_keys)
+        for offset in range(0, len(instrument_keys), batch_size):
+            batch = instrument_keys[offset:offset + batch_size]
+            url = f"{BASE_URL_V3}/market-quote/quotes"
+            payload = self._get_json(
+                url,
+                {"instrument_key": ",".join(batch)},
+                self._quote_limiter,
+            )
+            data = payload.get("data", {})
+            for quote in data.values():
+                key = quote.get("instrument_token")
+                ohlc = quote.get("ohlc") or {}
+                if key not in expected or not ohlc:
+                    continue
+                required = ("open", "high", "low", "close", "volume", "ts")
+                if any(ohlc.get(field) is None for field in required):
+                    continue
+                result[key] = {
+                    field: float(ohlc[field]) for field in ("open", "high", "low", "close", "volume")
+                }
+                result[key]["ts"] = int(ohlc["ts"])
+                result[key]["last_price"] = float(quote.get("last_price", ohlc["close"]))
+        missing = expected - result.keys()
+        if missing and not allow_missing:
+            raise IncompleteQuoteBatch(set(missing))
+        return result
 
     def get_intraday_candles(
         self, instrument_key: str, interval: str = "30minute"
