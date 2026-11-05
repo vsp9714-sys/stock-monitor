@@ -101,6 +101,16 @@ class OHLCVCache(Base):
     )
 
 
+class DailyCandleRefresh(Base):
+    """Per-symbol checkpoint for post-close confirmation of a daily candle."""
+    __tablename__ = "daily_candle_refresh"
+
+    symbol = Column(String(30), primary_key=True)
+    session_date = Column(Date, nullable=False)
+    status = Column(String(20), nullable=False)  # confirmed, no_bar, failed
+    updated_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
 class Signal(Base):
     """Detected trading signals — deduped per symbol per signal_type per day."""
     __tablename__ = "signals"

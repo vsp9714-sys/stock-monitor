@@ -199,11 +199,15 @@ def test_cache_warmup_resumes_completed_symbols(test_db_session, monkeypatch):
     assert len(fetcher.calls) == 2
 
 
-def test_post_close_refresh_updates_completed_daily_bars_and_is_idempotent(test_db_session, monkeypatch):
+def test_post_close_refresh_verifies_same_day_cached_bar_and_is_idempotent(test_db_session, monkeypatch):
     stock = type("StockRef", (), {"symbol": "AAA", "instrument_key": "NSE_EQ|AAA"})()
     upsert_ohlcv_rows(test_db_session, [{
         "symbol": "AAA", "interval": "1d", "ts": datetime(2026, 11, 4),
         "open": 10, "high": 12, "low": 9, "close": 11, "volume": 100,
+    }, {
+        # A same-date row may have been inserted by an older pre-close warm-up.
+        "symbol": "AAA", "interval": "1d", "ts": datetime(2026, 11, 5),
+        "open": 11, "high": 12, "low": 10, "close": 11.5, "volume": 150,
     }])
 
     class Fetcher:
@@ -249,6 +253,79 @@ def test_post_close_refresh_updates_completed_daily_bars_and_is_idempotent(test_
     rows = test_db_session.query(OHLCVCache).order_by(OHLCVCache.ts).all()
     assert len(rows) == 3
     assert rows[-1].ts.date().isoformat() == "2026-11-06"
+
+
+def test_post_close_refresh_removes_unverified_same_day_row_when_provider_has_no_bar(test_db_session, monkeypatch):
+    stock = type("StockRef", (), {"symbol": "AAA", "instrument_key": "NSE_EQ|AAA"})()
+    upsert_ohlcv_rows(test_db_session, [{
+        "symbol": "AAA", "interval": "1d", "ts": datetime(2026, 11, 5),
+        "open": 10, "high": 12, "low": 9, "close": 11, "volume": 100,
+    }])
+
+    class Fetcher:
+        calls = 0
+
+        def get_historical_candles(self, instrument_key, interval, *, from_date, to_date):
+            self.calls += 1
+            return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
+
+    fetcher = Fetcher()
+    scanner = object.__new__(Scanner)
+    scanner.fetcher = fetcher
+    scanner.get_active_stocks = lambda limit=None: [stock]
+    monkeypatch.setattr("src.scanner.get_session", lambda: test_db_session)
+    after_close = datetime(2026, 11, 5, 16, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+
+    result = scanner.refresh_completed_daily_cache(now=after_close)
+
+    assert result["failed"] == 1
+    assert result["processed"] == 1
+    assert fetcher.calls == 1
+    assert test_db_session.query(OHLCVCache).count() == 0
+
+    # A no-bar result may be retried later in the same session in case Upstox
+    # publishes the finalized candle after this check.
+    replay = scanner.refresh_completed_daily_cache(now=after_close)
+    assert replay["failed"] == 1
+    assert replay["processed"] == 1
+    assert fetcher.calls == 2
+
+
+def test_post_close_refresh_does_not_trust_same_day_row_after_provider_error(test_db_session, monkeypatch):
+    stock = type("StockRef", (), {"symbol": "AAA", "instrument_key": "NSE_EQ|AAA"})()
+    upsert_ohlcv_rows(test_db_session, [{
+        "symbol": "AAA", "interval": "1d", "ts": datetime(2026, 11, 5),
+        "open": 10, "high": 12, "low": 9, "close": 11, "volume": 100,
+    }])
+
+    class Fetcher:
+        calls = 0
+
+        def get_historical_candles(self, instrument_key, interval, *, from_date, to_date):
+            self.calls += 1
+            raise UpstoxAPIError("provider unavailable")
+
+    fetcher = Fetcher()
+    scanner = object.__new__(Scanner)
+    scanner.fetcher = fetcher
+    scanner.get_active_stocks = lambda limit=None: [stock]
+    monkeypatch.setattr("src.scanner.get_session", lambda: test_db_session)
+    after_close = datetime(2026, 11, 5, 16, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+
+    result = scanner.refresh_completed_daily_cache(now=after_close)
+
+    assert result["failed"] == 1
+    assert result["stopped_early"] is True
+    assert result["processed"] == 1
+    assert fetcher.calls == 1
+    assert test_db_session.query(OHLCVCache).count() == 0
+
+    # Failed checkpoints remain retryable; only confirmed/no-bar states skip.
+    retry = scanner.refresh_completed_daily_cache(now=after_close)
+    assert retry["failed"] == 1
+    assert retry["processed"] == 1
+    assert retry["stopped_early"] is True
+    assert fetcher.calls == 2
 
 
 def test_post_close_refresh_does_not_run_before_close(monkeypatch):
