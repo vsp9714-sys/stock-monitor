@@ -58,6 +58,7 @@ class AlertPayload:
     sector_regime: Optional[str] = None
     sector_relative_strength_pct: Optional[float] = None
     derivatives_context: dict = field(default_factory=dict)
+    risk_context: dict = field(default_factory=dict)
 
     # Chart path (optional)
     chart_path: Optional[str] = None

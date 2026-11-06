@@ -60,6 +60,7 @@ from src.universe import UniverseSelectionError, UniverseSelector
 from src.market_calendar import CalendarUnavailable, IST, is_market_open, is_trading_day
 from src.market_context import average_traded_value, regime_for_candles, relative_strength
 from src.derivatives import nearest_expiry, summarize_option_chain
+from src.risk import risk_reference
 
 logger = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
@@ -501,6 +502,7 @@ class Scanner:
         *,
         now: Optional[datetime] = None,
         target_session: Optional[date] = None,
+        allow_weekend: bool = False,
     ) -> dict:
         """Refresh canonical daily candles for a provider-confirmed session.
 
@@ -515,7 +517,7 @@ class Scanner:
         if current.tzinfo is None:
             current = current.replace(tzinfo=IST)
         current = current.astimezone(IST)
-        if current.weekday() >= 5:
+        if current.weekday() >= 5 and not allow_weekend:
             logger.info("Daily candle refresh skipped on weekend.")
             return {"universe_size": 0, "updated": 0, "failed": 0, "skipped": True}
         if target_session is None and current.time() < datetime_time(15, 45):
@@ -768,7 +770,8 @@ class Scanner:
 
         logger.info("Daily refresh readiness confirmed for session %s; starting paced full-universe refresh.", target)
         return self.refresh_completed_daily_cache(
-            now=current, checkpoint_symbols=checkpoint_symbols, target_session=target
+            now=current, checkpoint_symbols=checkpoint_symbols, target_session=target,
+            allow_weekend=manual,
         )
 
     # ─── Single Stock Scan & Confluence Evaluation ────────────────────────
@@ -1322,6 +1325,10 @@ class Scanner:
                         signal_type = res["signal_type"]
                         quote = fresh_quotes[stock.instrument_key]
                         res = {**res, "price": float(quote["last_price"])}
+                        risk_context = risk_reference(
+                            valid_frames[stock.symbol], entry_price=float(quote["last_price"]),
+                            direction=res["direction"], config=self.cfg.get("risk", {}),
+                        )
                         existing = db.query(Signal).filter_by(
                             symbol=stock.symbol, signal_date=today, signal_type=signal_type
                         ).first()
@@ -1363,6 +1370,7 @@ class Scanner:
                                 "checks": res["checks"],
                                 "market_context": market_context,
                                 "derivatives_context": derivatives_context,
+                                "risk_context": risk_context,
                                 "fundamental_provenance": {
                                     key: fund.get(key) for key in (
                                         "source_url", "fetched_at", "cache_age_hours", "freshness",
@@ -1424,6 +1432,7 @@ class Scanner:
                             sector_regime=market_context.get("sector_regime", {}).get("regime"),
                             sector_relative_strength_pct=market_context.get("sector_relative_strength", {}).get("relative_strength_pct"),
                             derivatives_context=derivatives_context,
+                            risk_context=risk_context,
                         )
                         if self._dispatch_alert(payload, db, saved.id):
                             new_signal_count += 1

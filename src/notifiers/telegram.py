@@ -148,6 +148,21 @@ class TelegramNotifier(BaseNotifier):
                 )
             elif oi.get("status") == "unavailable":
                 lines.append(f"📊 Options OI: unavailable ({html.escape(str(oi.get('reason', 'unknown')))}).")
+        risk = payload.risk_context or {}
+        if risk.get("status") == "available":
+            size = (
+                f" · quantity {risk['quantity']} (risk budget ₹{risk.get('risk_budget_inr', 0):,.0f})"
+                if risk.get("position_size_status") == "available" else
+                " · quantity not configured" if risk.get("position_size_status") == "unconfigured" else ""
+            )
+            lines.append(
+                f"⚠️ Model risk references only (not an order): stop {risk['stop_atr_multiple']:.2f}×ATR "
+                f"(₹{risk['stop_reference']:.2f}) · "
+                f"target ₹{risk['target_reference']:.2f} · {risk['reward_risk_ratio']:.1f}R · "
+                f"ATR({risk['atr_period']}) ₹{risk['atr']:.2f}{size}"
+            )
+        elif risk.get("status") == "unavailable":
+            lines.append(f"⚠️ Model risk reference unavailable ({html.escape(str(risk.get('reason', 'unknown')))}).")
         if payload.pe_ratio is not None:
             lines.append(f"📐 P/E Ratio: <b>{payload.pe_ratio:.1f}x</b>")
         if payload.pb_ratio is not None:

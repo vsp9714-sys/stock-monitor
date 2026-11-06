@@ -3,6 +3,7 @@ Config loader — merges config.yaml + secrets.yaml into a single dict.
 Secrets override config values so the main config stays safe to commit.
 """
 import os
+import math
 from pathlib import Path
 from typing import Any
 
@@ -137,6 +138,34 @@ def validate_candidate_context_config(config: dict[str, Any]) -> None:
     lookback = int(context.get("lookback_sessions", 20))
     if min(short_window, long_window, lookback) < 2 or short_window > long_window:
         raise ValueError("market_context windows must be >=2 and short_sma_sessions <= long_sma_sessions")
+
+    risk = config.get("risk", {}) or {}
+    backtest = config.get("backtest", {}) or {}
+    try:
+        atr_period = int(risk.get("atr_period", backtest.get("atr_period", 14)))
+        stop_multiple = float(risk.get("stop_atr_multiple", backtest.get("stop_atr_multiple", 1.5)))
+        target_multiple = float(risk.get("target_r_multiple", backtest.get("target_r_multiple", 2.0)))
+        fee_bps = float(backtest.get("fee_bps_per_side", 5.0))
+        slippage_bps = float(backtest.get("slippage_bps_per_side", 5.0))
+        train_fraction = float(backtest.get("train_fraction", 0.7))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("risk/backtest parameters must be numeric") from exc
+    if (atr_period < 1 or not all(math.isfinite(value) for value in
+            (stop_multiple, target_multiple, fee_bps, slippage_bps, train_fraction))
+            or stop_multiple <= 0 or target_multiple <= 0):
+        raise ValueError("risk/backtest ATR and reward multiples must be positive")
+    if fee_bps < 0 or slippage_bps < 0:
+        raise ValueError("backtest fees and slippage must be non-negative")
+    if not 0.5 <= train_fraction < 1:
+        raise ValueError("backtest.train_fraction must be in [0.5, 1)")
+    capital = risk.get("account_capital_inr")
+    risk_percent = risk.get("risk_percent")
+    if risk_percent is not None and (not math.isfinite(float(risk_percent)) or float(risk_percent) <= 0):
+        raise ValueError("risk.risk_percent must be finite and positive when configured")
+    if capital is not None and (
+        not math.isfinite(float(capital)) or float(capital) <= 0 or risk_percent is None
+    ):
+        raise ValueError("risk sizing requires positive account_capital_inr and risk_percent")
 
 
 def _apply_env_overrides(config: dict) -> None:

@@ -136,6 +136,24 @@ derivatives:
   cache_ttl_minutes: 15
   max_context_symbols_per_scan: 25
 
+# ─── Risk references (no order execution) ─────────────────────────────────────
+risk:
+  enabled: true
+  atr_period: 14
+  stop_atr_multiple: 1.5
+  target_r_multiple: 2.0
+  account_capital_inr: null  # leave unset to omit quantity sizing
+  risk_percent: 0.5
+
+# ─── Offline backtest assumptions ────────────────────────────────────────────
+backtest:
+  atr_period: 14
+  stop_atr_multiple: 1.5
+  target_r_multiple: 2.0
+  fee_bps_per_side: 5.0
+  slippage_bps_per_side: 5.0
+  train_fraction: 0.7
+
 # ─── Fundamental Data ─────────────────────────────────────────────────────────
 fundamentals:
   # Screener.in scraping (respects rate limits)
