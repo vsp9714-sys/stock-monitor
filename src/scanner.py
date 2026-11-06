@@ -1142,11 +1142,15 @@ class Scanner:
 
             # The universe count is the denominator: selected stocks lacking
             # a fresh quote, valid cache, or enough history reduce coverage.
-            tradability_cfg = self.universe_cfg.get("tradability", {}) or {}
+            # No policy block means a legacy caller/config is unchanged. The
+            # shipped config opts into the liquidity screen explicitly.
+            universe_cfg = getattr(self, "universe_cfg", {}) or {}
+            tradability_cfg = universe_cfg.get("tradability", {}) or {}
+            tradability_enabled = bool(tradability_cfg.get("enabled", False))
             liquidity_metrics = {}
             tradable_candidates = []
             liquidity_excluded = {}
-            if tradability_cfg.get("enabled", True):
+            if tradability_enabled:
                 sessions = int(tradability_cfg.get("average_traded_value_sessions", 20))
                 min_observations = int(tradability_cfg.get("minimum_observations", sessions))
                 min_value = float(tradability_cfg.get("minimum_average_traded_value_inr", 10_000_000))
@@ -1187,7 +1191,7 @@ class Scanner:
                 "missing_or_stale_quote_count": unavailable_count,
                 "insufficient_history_count": insufficient_count,
                 "invalid_history_count": len(invalid_history),
-                "tradability_enabled": bool(tradability_cfg.get("enabled", True)),
+                "tradability_enabled": tradability_enabled,
                 "tradability_excluded_count": len(liquidity_excluded),
                 "tradability_exclusion_reasons": {
                     reason: sum(value == reason for value in liquidity_excluded.values())
