@@ -98,11 +98,21 @@ class FundamentalsFetcher:
         try:
             cached = self._get_cached(db, symbol)
             if cached:
-                return self._to_dict(cached)
+                return self._to_dict(cached, status="fresh")
+            stale = db.query(Fundamental).filter_by(symbol=symbol).first()
             fetched = self._fetch_from_screener(symbol, isin)
             if fetched:
                 self._save_to_db(db, symbol, fetched)
-            return fetched
+                saved = db.query(Fundamental).filter_by(symbol=symbol).first()
+                if saved:
+                    result = self._to_dict(saved, status="fresh")
+                    result["quarterly_data_status"] = fetched.get("quarterly_data_status", "unknown")
+                    return result
+                return fetched
+            # A failed refresh must not erase usable history. Return the old
+            # record with explicit stale metadata rather than presenting it as
+            # current or silently dropping all fundamentals from the alert.
+            return self._to_dict(stale, status="stale") if stale else None
         finally:
             db.close()
 
@@ -163,6 +173,7 @@ class FundamentalsFetcher:
                 "revenue_ttm_cr": None,
                 "debt_to_equity": None,
                 "promoter_holding_pct": None,
+                "quarterly_data_status": "unavailable",
             }
 
             # ── Top Ratios (Market Cap, P/E, ROE, etc.) ──────────────────────
@@ -248,6 +259,22 @@ class FundamentalsFetcher:
                     break
 
             if profit_table:
+                table = profit_table.select_one("table")
+                headers = [cell.get_text(" ", strip=True) for cell in table.select("thead th")][1:] if table else []
+                periods = []
+                for label in headers:
+                    parsed_period = None
+                    for fmt in ("%b %Y", "%B %Y"):
+                        try:
+                            parsed_period = datetime.strptime(label, fmt)
+                            break
+                        except ValueError:
+                            pass
+                    if parsed_period is None:
+                        periods = []
+                        break
+                    periods.append(parsed_period)
+                periods_valid = bool(periods) and periods == sorted(set(periods))
                 rows = profit_table.select("table tbody tr")
                 for row in rows:
                     cells = row.find_all("td")
@@ -255,6 +282,9 @@ class FundamentalsFetcher:
                         continue
                     row_label = cells[0].get_text(strip=True).lower()
                     if "net profit" in row_label or "profit after tax" in row_label:
+                        if not periods_valid or len(cells) - 1 != len(periods):
+                            result["quarterly_data_status"] = "invalid_period_order"
+                            break
                         # Get last 4 quarters (rightmost columns = most recent)
                         values = []
                         for cell in cells[-4:]:
@@ -268,6 +298,7 @@ class FundamentalsFetcher:
                         result["profit_ttm_cr"] = sum(
                             v for v in values if v is not None
                         ) or None
+                        result["quarterly_data_status"] = "available" if any(v is not None for v in values) else "unavailable"
                         break
 
             # ── Promoter Holding ─────────────────────────────────────────────
@@ -310,7 +341,11 @@ class FundamentalsFetcher:
         db.commit()
 
     @staticmethod
-    def _to_dict(fund: Fundamental) -> dict:
+    def _to_dict(fund: Fundamental, *, status: str = "unknown") -> dict:
+        fetched_at = fund.fetched_at
+        if fetched_at and fetched_at.tzinfo is None:
+            fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+        age_seconds = max(0.0, (datetime.now(timezone.utc) - fetched_at).total_seconds()) if fetched_at else None
         return {
             "symbol": fund.symbol,
             "mcap_cr": fund.mcap_cr,
@@ -329,4 +364,14 @@ class FundamentalsFetcher:
             "debt_to_equity": fund.debt_to_equity,
             "promoter_holding_pct": fund.promoter_holding_pct,
             "screener_url": fund.screener_url,
+            "source_url": fund.screener_url,
+            "fetched_at": fetched_at.isoformat() if fetched_at else None,
+            "cache_age_seconds": age_seconds,
+            "cache_age_hours": age_seconds / 3600.0 if age_seconds is not None else None,
+            "freshness": status if fetched_at else "unknown",
+            "quarterly_data_status": "unknown",
+            "data_basis": (
+                "consolidated" if fund.screener_url and "/consolidated/" in fund.screener_url
+                else "standalone" if fund.screener_url else "unknown"
+            ),
         }

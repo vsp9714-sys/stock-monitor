@@ -47,6 +47,17 @@ class AlertPayload:
     profit_ttm_cr: Optional[float] = None
     promoter_holding_pct: Optional[float] = None
     screener_url: Optional[str] = None
+    fundamentals_fetched_at: Optional[str] = None
+    fundamentals_cache_age_hours: Optional[float] = None
+    fundamentals_freshness: str = "unavailable"
+    fundamentals_data_basis: str = "unknown"
+
+    # Contextual inputs; these never alter the technical confluence score.
+    market_regime: Optional[str] = None
+    market_relative_strength_pct: Optional[float] = None
+    sector_regime: Optional[str] = None
+    sector_relative_strength_pct: Optional[float] = None
+    derivatives_context: dict = field(default_factory=dict)
 
     # Chart path (optional)
     chart_path: Optional[str] = None

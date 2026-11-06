@@ -36,6 +36,7 @@ from sqlalchemy import func
 from src.config_loader import get_config
 from src.db import (
     DailyCandleRefresh,
+    MarketContextCache,
     OHLCVCache,
     Signal,
     Stock,
@@ -57,6 +58,8 @@ from src.signals.confluence import evaluate_confluence
 from src.signals.volume_breakout import detect_volume_breakout
 from src.universe import UniverseSelectionError, UniverseSelector
 from src.market_calendar import CalendarUnavailable, IST, is_market_open, is_trading_day
+from src.market_context import average_traded_value, regime_for_candles, relative_strength
+from src.derivatives import nearest_expiry, summarize_option_chain
 
 logger = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
@@ -185,6 +188,141 @@ class Scanner:
         validate_signal_config(self.cfg)
         self.universe_selector = UniverseSelector(self.cfg, get_session)
         self._last_universe_metadata = {}
+        self._oi_cache = {}
+        self._oi_fno_symbols = None
+        self._oi_fno_date = None
+        self._oi_fetch_count = 0
+
+    def _get_market_index_frame(self, index_key: str, as_of_date: date) -> pd.DataFrame | None:
+        """Load a fresh persisted index cache, refreshing through Upstox when stale."""
+        context_cfg = self.cfg.get("market_context", {})
+        ttl = timedelta(hours=float(context_cfg.get("cache_ttl_hours", 12)))
+        db = get_session()
+        try:
+            cached = db.query(MarketContextCache).filter_by(context_key=index_key).first()
+            if cached and cached.fetched_at:
+                fetched_at = cached.fetched_at
+                if fetched_at.tzinfo is None:
+                    fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) - fetched_at < ttl:
+                    try:
+                        rows = json.loads(cached.candles_json)
+                        frame = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+                        dates = pd.to_datetime(frame["ts"], errors="coerce").map(
+                            lambda value: _daily_timestamp(value).date() if not pd.isna(value) else None
+                        )
+                        frame = frame.loc[dates.notna() & (dates <= as_of_date)].copy()
+                        if not frame.empty and _valid_ohlcv_frame(frame):
+                            return frame.sort_values("ts").reset_index(drop=True)
+                    except (ValueError, TypeError, json.JSONDecodeError):
+                        logger.warning("Discarding malformed market-context cache for %s", index_key)
+        finally:
+            db.close()
+
+        days = max(120, int(context_cfg.get("long_sma_sessions", 50)) * 3)
+        try:
+            from_date = (as_of_date - timedelta(days=days)).isoformat()
+            frame = self.fetcher.get_historical_candles(
+                index_key, "day", from_date=from_date, to_date=as_of_date.isoformat()
+            )
+            if frame is None or frame.empty:
+                return None
+            frame = frame[["ts", "open", "high", "low", "close", "volume"]].copy()
+            frame["ts"] = pd.to_datetime(frame["ts"], errors="coerce")
+            frame = frame.loc[frame["ts"].notna()].copy()
+            frame = frame.loc[frame["ts"].map(lambda value: _daily_timestamp(value).date()) <= as_of_date]
+            frame = frame.sort_values("ts").drop_duplicates(subset=["ts"], keep="last").reset_index(drop=True)
+            if frame.empty:
+                return None
+            if not _valid_ohlcv_frame(frame):
+                logger.warning("Ignoring invalid market-context candles for %s", index_key)
+                return None
+            rows = []
+            for row in frame.itertuples(index=False, name=None):
+                ts = pd.Timestamp(row[0])
+                rows.append([ts.isoformat(), *[float(value) for value in row[1:]]])
+            db = get_session()
+            try:
+                cached = db.query(MarketContextCache).filter_by(context_key=index_key).first()
+                if cached is None:
+                    cached = MarketContextCache(context_key=index_key, candles_json="[]", fetched_at=datetime.now(timezone.utc))
+                    db.add(cached)
+                cached.candles_json = json.dumps(rows)
+                cached.fetched_at = datetime.now(timezone.utc)
+                db.commit()
+            finally:
+                db.close()
+            return frame.reset_index(drop=True)
+        except Exception as exc:
+            logger.info("Market context unavailable for %s: %s", index_key, exc)
+            return None
+
+    def _market_context_for(self, stock_frame: pd.DataFrame, fund: dict | None) -> dict:
+        cfg = self.cfg.get("market_context", {})
+        if not cfg.get("enabled", True):
+            return {"status": "disabled"}
+        benchmark_key = cfg.get("benchmark_key", "NSE_INDEX|Nifty 50")
+        as_of_date = pd.to_datetime(stock_frame["ts"].iloc[-1]).date() if stock_frame is not None and not stock_frame.empty else date.min
+        benchmark = self._get_market_index_frame(benchmark_key, as_of_date)
+        short = int(cfg.get("short_sma_sessions", 20))
+        long = int(cfg.get("long_sma_sessions", 50))
+        lookback = int(cfg.get("lookback_sessions", 20))
+        benchmark_regime = regime_for_candles(benchmark, short_window=short, long_window=long)
+        benchmark_strength = relative_strength(stock_frame, benchmark, lookback=lookback)
+        sector = (fund or {}).get("sector")
+        sector_key = (cfg.get("sector_index_keys", {}) or {}).get(sector)
+        sector_frame = self._get_market_index_frame(sector_key, as_of_date) if sector_key else None
+        sector_regime = (
+            regime_for_candles(sector_frame, short_window=short, long_window=long)
+            if sector_key else {"status": "unavailable", "reason": "no_configured_sector_index", "sector": sector}
+        )
+        sector_strength = relative_strength(stock_frame, sector_frame, lookback=lookback) if sector_key else {
+            "status": "unavailable", "reason": "no_configured_sector_index"
+        }
+        return {
+            "status": "available" if benchmark_regime.get("status") == "available" else "partial",
+            "mode": cfg.get("mode", "informational"),
+            "benchmark_key": benchmark_key,
+            "benchmark": benchmark_regime,
+            "benchmark_relative_strength": benchmark_strength,
+            "sector": sector,
+            "sector_key": sector_key,
+            "sector_regime": sector_regime,
+            "sector_relative_strength": sector_strength,
+        }
+
+    def _derivatives_context_for(self, stock: Stock, session_date: date) -> dict:
+        cfg = self.cfg.get("derivatives", {}) or {}
+        if not cfg.get("enabled", False):
+            return {"status": "disabled", "source": "Upstox option-chain API"}
+        ttl = timedelta(minutes=float(cfg.get("cache_ttl_minutes", 15)))
+        cached = self._oi_cache.get(stock.symbol)
+        if cached and datetime.now(timezone.utc) - cached[0] < ttl:
+            return cached[1]
+        limit = int(cfg.get("max_context_symbols_per_scan", 25))
+        if self._oi_fetch_count >= limit:
+            return {"status": "unavailable", "reason": "configured_scan_limit"}
+        if self._oi_fno_date != session_date or self._oi_fno_symbols is None:
+            self._oi_fno_symbols, meta = self.universe_selector.get_fno_underlyings(session_date)
+            self._oi_fno_date = session_date
+            if not meta.get("available", True):
+                return {"status": "unavailable", "reason": "fno_eligibility_source_unavailable"}
+        if stock.symbol not in self._oi_fno_symbols:
+            return {"status": "unavailable", "reason": "not_fno_eligible"}
+        try:
+            self._oi_fetch_count += 1
+            contracts = self.fetcher.get_option_contracts(stock.instrument_key)
+            expiry = nearest_expiry(contracts, session_date)
+            if expiry is None:
+                result = {"status": "unavailable", "reason": "no_current_option_expiry"}
+            else:
+                rows = self.fetcher.get_option_chain(stock.instrument_key, expiry)
+                result = summarize_option_chain(rows, expiry_date=expiry)
+        except Exception as exc:
+            logger.info("Optional OI context unavailable for %s: %s", stock.symbol, exc)
+            result = {"status": "unavailable", "reason": "provider_error"}
+        self._oi_cache[stock.symbol] = (datetime.now(timezone.utc), result)
+        return result
 
     # ─── Stock Universe ──────────────────────────────────────────────────
 
@@ -907,6 +1045,7 @@ class Scanner:
     def run_scan(self, limit: Optional[int] = None, *, now: Optional[datetime] = None) -> ScanSummary:
         """Scan cached history plus batched live OHLCV and report coverage gaps."""
         logger.info("Starting market scan with cached history and batched quotes...")
+        self._oi_fetch_count = 0
         try:
             stocks = self.get_active_stocks(limit=limit)
         except UniverseSelectionError as exc:
@@ -1003,8 +1142,35 @@ class Scanner:
 
             # The universe count is the denominator: selected stocks lacking
             # a fresh quote, valid cache, or enough history reduce coverage.
+            tradability_cfg = self.universe_cfg.get("tradability", {}) or {}
+            liquidity_metrics = {}
+            tradable_candidates = []
+            liquidity_excluded = {}
+            if tradability_cfg.get("enabled", True):
+                sessions = int(tradability_cfg.get("average_traded_value_sessions", 20))
+                min_observations = int(tradability_cfg.get("minimum_observations", sessions))
+                min_value = float(tradability_cfg.get("minimum_average_traded_value_inr", 10_000_000))
+                unknown_policy = tradability_cfg.get("unknown_policy", "exclude")
+                for stock in stocks:
+                    metric = average_traded_value(
+                        valid_frames.get(stock.symbol), sessions=sessions,
+                        minimum_observations=min_observations,
+                    )
+                    liquidity_metrics[stock.symbol] = metric
+                    if metric.get("status") != "available":
+                        if unknown_policy == "include":
+                            tradable_candidates.append(stock)
+                        else:
+                            liquidity_excluded[stock.symbol] = metric.get("reason", "liquidity_unavailable")
+                    elif metric["average_inr"] >= min_value:
+                        tradable_candidates.append(stock)
+                    else:
+                        liquidity_excluded[stock.symbol] = "below_average_traded_value_threshold"
+            else:
+                tradable_candidates = list(stocks)
+
             eligible_stocks = [
-                stock for stock in stocks
+                stock for stock in tradable_candidates
                 if stock.instrument_key in fresh_quotes
                 and stock.symbol not in invalid_history
                 and len(valid_frames.get(stock.symbol, ())) >= minimum
@@ -1012,16 +1178,29 @@ class Scanner:
             insufficient_count = sum(
                 stock.instrument_key in fresh_quotes and stock.symbol not in invalid_history
                 and len(valid_frames.get(stock.symbol, ())) < minimum
-                for stock in stocks
+                for stock in tradable_candidates
             )
-            unavailable_count = len(stocks) - len(fresh_quotes)
+            unavailable_count = sum(stock.instrument_key not in fresh_quotes for stock in tradable_candidates)
+            invalid_candidate_history_count = sum(stock.symbol in invalid_history for stock in tradable_candidates)
             universe_metadata.update({
                 "scan_eligible_count": len(eligible_stocks),
                 "missing_or_stale_quote_count": unavailable_count,
                 "insufficient_history_count": insufficient_count,
                 "invalid_history_count": len(invalid_history),
-                "final_tradable_count": len(eligible_stocks),
-                "coverage_denominator": len(stocks),
+                "tradability_enabled": bool(tradability_cfg.get("enabled", True)),
+                "tradability_excluded_count": len(liquidity_excluded),
+                "tradability_exclusion_reasons": {
+                    reason: sum(value == reason for value in liquidity_excluded.values())
+                    for reason in sorted(set(liquidity_excluded.values()))
+                },
+                "tradability_exclusion_samples": [
+                    {"symbol": symbol, "reason": reason}
+                    for symbol, reason in list(sorted(liquidity_excluded.items()))[:25]
+                ],
+                "average_traded_value_sessions": int(tradability_cfg.get("average_traded_value_sessions", 20)),
+                "minimum_average_traded_value_inr": float(tradability_cfg.get("minimum_average_traded_value_inr", 10_000_000)),
+                "final_tradable_count": len(tradable_candidates),
+                "coverage_denominator": len(tradable_candidates),
                 "coverage_threshold": float(self.cfg.get("scan", {}).get("min_coverage", 0.95)),
                 "session_date": session_date.isoformat(),
                 "provisional_intraday_enabled": intraday_active,
@@ -1082,7 +1261,7 @@ class Scanner:
                 )
                 return ScanSummary(
                     len(stocks), len(eligible_stocks) - len(failed),
-                    unavailable_count + insufficient_count + len(invalid_history) + len(failed), 0, False,
+                    unavailable_count + insufficient_count + invalid_candidate_history_count + len(failed), 0, False,
                     universe_metadata,
                 )
 
@@ -1090,7 +1269,7 @@ class Scanner:
             # calendar date (important for manual scans after the market closes).
             today = session_date
             evaluated_count = len(eligible_stocks)
-            coverage = evaluated_count / len(stocks) if stocks else 0.0
+            coverage = evaluated_count / len(tradable_candidates) if tradable_candidates else 0.0
             min_coverage = float(self.cfg.get("scan", {}).get("min_coverage", 0.95))
             if not 0 <= min_coverage <= 1:
                 logger.error("Invalid scan.min_coverage %s; suppressing alerts.", min_coverage)
@@ -1101,7 +1280,7 @@ class Scanner:
                 logger.error("Alert dispatch suppressed: coverage %.2f%% is below %.2f%% threshold.",
                              coverage * 100, min_coverage * 100)
                 return ScanSummary(len(stocks), evaluated_count,
-                                   unavailable_count + insufficient_count + len(invalid_history),
+                                   unavailable_count + insufficient_count + invalid_candidate_history_count,
                                    0, False, universe_metadata)
             new_signal_count = 0
             destinations = [
@@ -1109,10 +1288,33 @@ class Scanner:
             ]
             seed_legacy_deliveries(db, destinations)
 
+            market_context_filtered = 0
             for stock, path_results in evaluations:
                 for res, df, provisional in path_results:
                     try:
                         fund = self.fundamentals.get_fundamentals(stock.symbol, stock.isin or "")
+                        try:
+                            market_context = self._market_context_for(valid_frames[stock.symbol], fund)
+                        except Exception as exc:
+                            logger.info("Optional market context unavailable for %s: %s", stock.symbol, exc)
+                            market_context = {"status": "unavailable", "reason": "context_error",
+                                              "mode": self.cfg.get("market_context", {}).get("mode", "informational")}
+                        try:
+                            derivatives_context = self._derivatives_context_for(stock, today)
+                        except Exception as exc:
+                            logger.info("Optional derivatives context unavailable for %s: %s", stock.symbol, exc)
+                            derivatives_context = {"status": "unavailable", "reason": "context_error"}
+                        if market_context.get("mode") == "filter":
+                            expected_regime = "bullish" if res["direction"] == "BUY" else "bearish"
+                            regimes = [market_context.get("benchmark", {})]
+                            if market_context.get("sector_key"):
+                                regimes.append(market_context.get("sector_regime", {}))
+                            unavailable_required = any(item.get("status") != "available" for item in regimes)
+                            opposing = any(item.get("status") == "available" and item.get("regime") != expected_regime
+                                           for item in regimes)
+                            if opposing or (unavailable_required and self.cfg.get("market_context", {}).get("filter_unknown_policy", "exclude") == "exclude"):
+                                market_context_filtered += 1
+                                continue
                         signal_type = res["signal_type"]
                         quote = fresh_quotes[stock.instrument_key]
                         res = {**res, "price": float(quote["last_price"])}
@@ -1155,6 +1357,15 @@ class Scanner:
                                 ),
                                 "score_version": res.get("score_version", 1),
                                 "checks": res["checks"],
+                                "market_context": market_context,
+                                "derivatives_context": derivatives_context,
+                                "fundamental_provenance": {
+                                    key: fund.get(key) for key in (
+                                        "source_url", "fetched_at", "cache_age_hours", "freshness",
+                                        "data_basis", "quarterly_data_status"
+                                    )
+                                } if fund else {"freshness": "unavailable"},
+                                "average_traded_value": liquidity_metrics.get(stock.symbol),
                             }),
                             chart_path=chart_path,
                         )
@@ -1200,6 +1411,15 @@ class Scanner:
                             profit_ttm_cr=fund.get("profit_ttm_cr") if fund else None,
                             promoter_holding_pct=fund.get("promoter_holding_pct") if fund else None,
                             screener_url=fund.get("screener_url") if fund else None,
+                            fundamentals_fetched_at=fund.get("fetched_at") if fund else None,
+                            fundamentals_cache_age_hours=fund.get("cache_age_hours") if fund else None,
+                            fundamentals_freshness=fund.get("freshness", "unavailable") if fund else "unavailable",
+                            fundamentals_data_basis=fund.get("data_basis", "unknown") if fund else "unknown",
+                            market_regime=market_context.get("benchmark", {}).get("regime"),
+                            market_relative_strength_pct=market_context.get("benchmark_relative_strength", {}).get("relative_strength_pct"),
+                            sector_regime=market_context.get("sector_regime", {}).get("regime"),
+                            sector_relative_strength_pct=market_context.get("sector_relative_strength", {}).get("relative_strength_pct"),
+                            derivatives_context=derivatives_context,
                         )
                         if self._dispatch_alert(payload, db, saved.id):
                             new_signal_count += 1
@@ -1210,17 +1430,19 @@ class Scanner:
                     except Exception as exc:
                         logger.error("Error processing alert for %s: %s", stock.symbol, exc, exc_info=True)
 
+            universe_metadata["market_context_filtered_count"] = market_context_filtered
+
             logger.info(
                 "Scan complete: mode=%s selected=%s source_counts=%s series_excluded=%s eligible=%s; "
-                "%s/%s evaluated; %s alerts dispatched.",
+                "%s/%s tradable candidates evaluated; %s alerts dispatched.",
                 universe_metadata.get("mode"), universe_metadata.get("selected_count"),
                 {key: universe_metadata.get(key) for key in ("constituent_count", "custom_count", "fno_count")},
                 universe_metadata.get("series_exclusion_count"), len(eligible_stocks),
-                len(eligible_stocks), len(stocks), new_signal_count,
+                len(eligible_stocks), len(tradable_candidates), new_signal_count,
             )
             return ScanSummary(
-                len(stocks), evaluated_count, unavailable_count + insufficient_count + len(invalid_history),
-                new_signal_count, evaluated_count == len(stocks),
+                len(stocks), evaluated_count, unavailable_count + insufficient_count + invalid_candidate_history_count,
+                new_signal_count, evaluated_count == len(tradable_candidates),
                 universe_metadata,
             )
         finally:

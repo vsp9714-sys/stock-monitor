@@ -409,6 +409,24 @@ class UpstoxFetcher:
         from_date = (datetime.now(IST).date() - timedelta(days=days)).isoformat()
         return self.get_historical_candles(instrument_key, "day", from_date)
 
+    def get_option_contracts(self, underlying_key: str) -> list[dict]:
+        """Return documented Upstox option contracts for an underlying."""
+        data = self._get_json(
+            f"{BASE_URL}/option/contract", {"instrument_key": underlying_key}, self._quote_limiter
+        )
+        contracts = data.get("data") or []
+        return contracts if isinstance(contracts, list) else []
+
+    def get_option_chain(self, underlying_key: str, expiry_date: str) -> list[dict]:
+        """Return the documented current option-chain snapshot for an expiry."""
+        data = self._get_json(
+            f"{BASE_URL}/option/chain",
+            {"instrument_key": underlying_key, "expiry_date": expiry_date},
+            self._quote_limiter,
+        )
+        rows = data.get("data") or []
+        return rows if isinstance(rows, list) else []
+
     def get_full_market_quotes(
         self, instrument_keys: list[str], batch_size: int = 100, *, allow_missing: bool = False
     ) -> dict[str, dict]:

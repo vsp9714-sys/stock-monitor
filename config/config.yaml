@@ -99,6 +99,42 @@ universe:
   min_mcap_cr: 0
   # Exclude penny stocks below this price (INR)
   min_price: 10
+  # Liquidity screen uses finalized daily candles, not today's partial bar.
+  tradability:
+    enabled: true
+    average_traded_value_sessions: 20
+    minimum_average_traded_value_inr: 10000000  # ₹1 crore
+    minimum_observations: 20
+    unknown_policy: exclude
+
+# ─── Benchmark and Sector Context ────────────────────────────────────────────
+market_context:
+  enabled: true
+  mode: informational  # informational | filter (filter is opt-in)
+  filter_unknown_policy: exclude  # when filter mode is enabled, missing required context suppresses that candidate
+  benchmark_key: "NSE_INDEX|Nifty 50"
+  lookback_sessions: 20
+  short_sma_sessions: 20
+  long_sma_sessions: 50
+  cache_ttl_hours: 12
+  # Explicit Screener sector label -> documented NSE index instrument key.
+  sector_index_keys:
+    "Banks - Private": "NSE_INDEX|Nifty Pvt Bank"
+    "Banks - Public": "NSE_INDEX|Nifty PSU Bank"
+    "Automobiles": "NSE_INDEX|Nifty Auto"
+    "Information Technology": "NSE_INDEX|Nifty IT"
+    "Pharmaceuticals": "NSE_INDEX|Nifty Pharma"
+    "FMCG": "NSE_INDEX|Nifty FMCG"
+    "Metals & Mining": "NSE_INDEX|Nifty Metal"
+    "Oil, Gas & Fuels": "NSE_INDEX|NIFTY OIL AND GAS"
+    "Financial Services": "NSE_INDEX|Nifty Fin Service"
+    "Healthcare": "NSE_INDEX|NIFTY HEALTHCARE"
+
+# ─── Optional Derivatives Context ────────────────────────────────────────────
+derivatives:
+  enabled: false  # opt in after validating eligible-underlying mapping and quotas
+  cache_ttl_minutes: 15
+  max_context_symbols_per_scan: 25
 
 # ─── Fundamental Data ─────────────────────────────────────────────────────────
 fundamentals:
