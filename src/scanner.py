@@ -24,7 +24,7 @@ import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, time as datetime_time, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -303,12 +303,13 @@ class Scanner:
         checkpoint_symbols: int = 20,
         *,
         now: Optional[datetime] = None,
+        target_session: Optional[date] = None,
     ) -> dict:
-        """Refresh canonical daily candles after the exchange session closes.
+        """Refresh canonical daily candles for a provider-confirmed session.
 
         The service's intraday quote sweep deliberately does not mutate this
-        cache. This bounded, paced job fetches provider historical candles once
-        after close. Same-day cache rows are not proof of finalization: an older
+        cache. This bounded, paced job fetches provider historical candles for
+        an explicit or current session. Same-day cache rows are not proof of finalization: an older
         warm-up may have stored them before close. Per-symbol refresh state
         makes verified rows resumable while unverified same-day rows are removed
         before requests so a restart cannot treat them as confirmed data.
@@ -320,9 +321,12 @@ class Scanner:
         if current.weekday() >= 5:
             logger.info("Daily candle refresh skipped on weekend.")
             return {"universe_size": 0, "updated": 0, "failed": 0, "skipped": True}
-        if current.time() < datetime_time(15, 45):
+        if target_session is None and current.time() < datetime_time(15, 45):
             logger.info("Daily candle refresh skipped before post-close finalization window.")
             return {"universe_size": 0, "updated": 0, "failed": 0, "skipped": True}
+        target_day = target_session or current.date()
+        if target_day > current.date():
+            raise ValueError("Daily refresh target session cannot be in the future")
 
         stocks = self.get_active_stocks(limit=limit)
         session = get_session()
@@ -338,15 +342,14 @@ class Scanner:
                 state.symbol: state
                 for state in session.query(DailyCandleRefresh).all()
             }
-            current_day = current.date()
-            current_midnight = datetime.combine(current_day, datetime_time.min)
+            current_midnight = datetime.combine(target_day, datetime_time.min)
             # Existing same-session rows have unknown provenance. Remove them
             # unless this day's post-close fetch already confirmed that symbol.
             unverified_symbols = [
                 stock.symbol for stock in stocks
                 if not (
                     (state := refresh_state.get(stock.symbol))
-                    and state.session_date == current_day
+                    and state.session_date == target_day
                     and state.status == "confirmed"
                 )
             ]
@@ -368,7 +371,7 @@ class Scanner:
             )
             for index, stock in enumerate(stocks, 1):
                 state = refresh_state.get(stock.symbol)
-                if state and state.session_date == current_day and state.status == "confirmed":
+                if state and state.session_date == target_day and state.status == "confirmed":
                     unchanged += 1
                     continue
                 last_cached = latest_by_symbol.get(stock.symbol)
@@ -376,19 +379,19 @@ class Scanner:
                     last_date = pd.Timestamp(last_cached).date()
                     from_date = last_date.isoformat()
                 else:
-                    from_date = (current.date() - timedelta(days=365)).isoformat()
+                    from_date = (target_day - timedelta(days=365)).isoformat()
                 processed += 1
                 try:
                     candles = self.fetcher.get_historical_candles(
                         stock.instrument_key,
                         "day",
                         from_date=from_date,
-                        to_date=current.date().isoformat(),
+                        to_date=target_day.isoformat(),
                     )
                     if candles.empty:
                         failed.append(stock.symbol)
                         refresh_state[stock.symbol] = DailyCandleRefresh(
-                            symbol=stock.symbol, session_date=current_day,
+                            symbol=stock.symbol, session_date=target_day,
                             status="no_bar", updated_at=datetime.now(timezone.utc),
                         )
                         session.merge(refresh_state[stock.symbol])
@@ -407,7 +410,7 @@ class Scanner:
                         # Never persist today's unfinished bar. The refresh runs
                         # after close; if the provider has not published today's
                         # completed candle yet, a later run will fetch it.
-                        if ts.date() > current.date():
+                        if ts.date() > target_day:
                             continue
                         symbol_rows.append({
                             "symbol": stock.symbol,
@@ -419,13 +422,13 @@ class Scanner:
                             "close": float(row.close),
                             "volume": float(row.volume),
                         })
-                    has_current_bar = any(row["ts"].date() == current_day for row in symbol_rows)
+                    has_current_bar = any(row["ts"].date() == target_day for row in symbol_rows)
                     pending_rows.extend(symbol_rows)
                     pending_symbols += 1
                     if has_current_bar:
                         updated += 1
                         refresh_state[stock.symbol] = DailyCandleRefresh(
-                            symbol=stock.symbol, session_date=current_day,
+                            symbol=stock.symbol, session_date=target_day,
                             status="confirmed", updated_at=datetime.now(timezone.utc),
                         )
                     else:
@@ -434,7 +437,7 @@ class Scanner:
                         # row was removed above and must stay absent.
                         failed.append(stock.symbol)
                         refresh_state[stock.symbol] = DailyCandleRefresh(
-                            symbol=stock.symbol, session_date=current_day,
+                            symbol=stock.symbol, session_date=target_day,
                             status="no_bar", updated_at=datetime.now(timezone.utc),
                         )
                     session.merge(refresh_state[stock.symbol])
@@ -455,7 +458,7 @@ class Scanner:
                 except Exception as exc:
                     failed.append(stock.symbol)
                     refresh_state[stock.symbol] = DailyCandleRefresh(
-                        symbol=stock.symbol, session_date=current_day,
+                        symbol=stock.symbol, session_date=target_day,
                         status="failed", updated_at=datetime.now(timezone.utc),
                     )
                     session.merge(refresh_state[stock.symbol])
@@ -477,12 +480,76 @@ class Scanner:
                 # Failed symbols are included in processed because each was
                 # attempted; unchanged symbols are confirmed checkpoints.
                 "remaining": max(0, len(stocks) - processed - unchanged),
-                "session_date": current.date().isoformat(),
+                "session_date": target_day.isoformat(),
             }
             logger.info("Post-close daily candle refresh finished: %s", result)
             return result
         finally:
             session.close()
+
+    def refresh_latest_completed_daily_cache(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        checkpoint_symbols: int = 20,
+    ) -> dict:
+        """Probe Upstox in the 06:00-07:00 IST window, then refresh the latest completed session.
+
+        A small liquid-symbol readiness probe avoids a full-universe pass while
+        the provider is still publishing the prior session. The full pass is
+        started only when all probe symbols expose the same latest candle date.
+        """
+        current = now or datetime.now(IST)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=IST)
+        current = current.astimezone(IST)
+        if current.weekday() >= 5 or not (datetime_time(6, 0) <= current.time() < datetime_time(7, 0)):
+            logger.info("Morning daily-candle readiness check skipped outside 06:00-07:00 IST weekday window.")
+            return {"universe_size": 0, "updated": 0, "failed": 0, "skipped": True}
+
+        stocks = {stock.symbol: stock for stock in self.get_active_stocks()}
+        probe_symbols = ("RELIANCE", "TCS", "360ONE")
+        missing = [symbol for symbol in probe_symbols if symbol not in stocks]
+        if missing:
+            logger.warning("Daily refresh readiness probe missing active symbols: %s", missing)
+            return {"universe_size": len(stocks), "updated": 0, "failed": 0, "skipped": True,
+                    "reason": "probe_symbols_missing"}
+
+        probe_dates = []
+        probe_from = (current.date() - timedelta(days=7)).isoformat()
+        for symbol in probe_symbols:
+            stock = stocks[symbol]
+            candles = self.fetcher.get_historical_candles(
+                stock.instrument_key, "day", from_date=probe_from, to_date=current.date().isoformat()
+            )
+            if candles.empty:
+                logger.info("Daily refresh not ready: provider returned no recent candles for %s", symbol)
+                return {"universe_size": len(stocks), "updated": 0, "failed": 0, "skipped": True,
+                        "reason": "provider_not_ready", "probe_symbol": symbol}
+            latest = max(_daily_timestamp(row.ts).date() for row in candles.itertuples(index=False))
+            probe_dates.append(latest)
+
+        if len(set(probe_dates)) != 1:
+            logger.info("Daily refresh not ready: probe symbols disagree on latest session dates: %s", probe_dates)
+            return {"universe_size": len(stocks), "updated": 0, "failed": 0, "skipped": True,
+                    "reason": "probe_dates_disagree", "probe_dates": [d.isoformat() for d in probe_dates]}
+
+        target = probe_dates[0]
+        session = get_session()
+        try:
+            cached_latest = session.query(func.max(OHLCVCache.ts)).filter(OHLCVCache.interval == "1d").scalar()
+            if cached_latest is not None and target < pd.Timestamp(cached_latest).date():
+                logger.warning("Daily refresh probe date %s is behind cache date %s; refusing regression.",
+                               target, pd.Timestamp(cached_latest).date())
+                return {"universe_size": len(stocks), "updated": 0, "failed": 0, "skipped": True,
+                        "reason": "provider_behind_cache", "session_date": target.isoformat()}
+        finally:
+            session.close()
+
+        logger.info("Daily refresh readiness confirmed for session %s; starting paced full-universe refresh.", target)
+        return self.refresh_completed_daily_cache(
+            now=current, checkpoint_symbols=checkpoint_symbols, target_session=target
+        )
 
     # ─── Single Stock Scan & Confluence Evaluation ────────────────────────
 
