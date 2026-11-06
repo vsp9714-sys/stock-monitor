@@ -61,7 +61,44 @@ tail -f logs/stock_monitor.log
 journalctl -u stock-monitor -f
 ```
 
-The service is scheduled by the Python `schedule` loop inside the systemd-managed process, so an empty `crontab -l` is expected. Check for systemd timers separately with `systemctl list-timers --all | grep -i stock-monitor`; this project does not use a systemd timer. The verified stock universe is refreshed on startup and daily at 08:30 using the server's local timezone (the scan market-hours gate itself uses Asia/Kolkata). Startup fails closed if the official source masters cannot be validated, preventing scans against a stale universe that may contain bonds.
+The service is scheduled by the Python `schedule` loop inside the systemd-managed process, so an empty `crontab -l` is expected. Check for systemd timers separately with `systemctl list-timers --all | grep -i stock-monitor`; this project does not use a systemd timer. The verified NSE instrument master is refreshed on startup and daily at 08:15 IST; configured membership is resolved and snapshotted at 08:30 IST, before market scans. Startup fails closed if the official source masters cannot be validated, preventing scans against a stale universe that may contain bonds.
+
+## Configurable stock universes (WP17)
+
+The scanner supports `all_nse` (default and backward-compatible), `nifty500`, `custom`, and `composed`. Universe membership is independent of liquidity/tradability: WP10's liquidity rules are not applied here.
+
+```yaml
+universe:
+  mode: nifty500
+  nifty500_min_count: 450
+  nifty500_max_count: 550
+  custom_symbols: []
+  include_fno: false
+```
+
+Nifty 500 plus a custom watchlist:
+
+```yaml
+universe:
+  mode: composed
+  custom_symbols: [ABCAPITAL, ZOMATO]
+  include_fno: false
+```
+
+Nifty 500 plus F&O underlyings plus a custom watchlist:
+
+```yaml
+universe:
+  mode: composed
+  custom_symbols: [ABCAPITAL, ZOMATO]
+  include_fno: true
+```
+
+For a custom-only watchlist use `mode: custom` and populate `custom_symbols`. In composed mode, the selector unions the official Nifty Indices Nifty 500 CSV, optionally NSE's current F&O market-lot underlyings, and the configured custom symbols, then normalizes and deduplicates them. Each symbol must also exist in the verified NSE instrument master. Unsupported legacy examples such as `all_bse` and `nifty50` have been removed rather than left as misleading options.
+
+Nifty 500 membership is refreshed at most once on each configured weekday, before market scans (08:30 IST), using `https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv`. The source must have the `Symbol` column, unique normalized symbols, and a count within the configured bounds. Valid source snapshots and the selected daily universe are stored in SQLite with source/retrieval metadata. If refresh fails, a validated last-known-good snapshot is used and marked stale with age/error. If none exists, the selected universe fails closed; it never silently broadens to `all_nse`. Optional F&O source failure is explicitly reported and does not widen the selection.
+
+For `nifty500`, `custom`, and `composed`, the default allowed series is regular `EQ`; set `allowed_series` explicitly to opt into another verified NSE share series. For compatibility, an unset filter in `all_nse` retains its existing share-series coverage. Series eligibility is not liquidity validation. Scan summaries expose mode, source/retrieval timestamps and staleness, member-source counts, unique selected count, series exclusions, quote/history eligibility, and a dated symbol snapshot. `final_tradable_count` currently means scan-eligible before WP10's liquidity filter; the summary states that liquidity filtering has not yet been applied.
 
 ## Upstox pacing and daily candle cache
 

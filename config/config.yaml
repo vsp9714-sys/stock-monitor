@@ -68,10 +68,19 @@ confluence:
 
 # ─── Stock Universe ──────────────────────────────────────────────────────────
 universe:
-  # Options: "all_nse", "all_bse", "nifty50", "nifty500", "custom"
+  # Modes: all_nse (legacy/default), nifty500, custom, composed
+  # composed = Nifty 500 + optional current F&O underlyings + custom symbols
   mode: "all_nse"
-  # Custom list (only used when mode = "custom")
+  # Required for custom/composed; symbols are validated against the local NSE instrument master.
   custom_symbols: []
+  # Used only by composed. Unavailable F&O data is explicitly reported and never widens to all_nse.
+  include_fno: false
+  # Nifty 500 source guardrails; unusual source sizes fail validation and use last-known-good data.
+  nifty500_min_count: 450
+  nifty500_max_count: 550
+  # For nifty500/custom/composed, default is EQ only. Set explicitly to opt into other NSE share series.
+  # Leave unset for all_nse to preserve its legacy series coverage.
+  # allowed_series: [EQ]
   # Minimum market cap filter (in Crores). 0 = no filter.
   min_mcap_cr: 0
   # Exclude penny stocks below this price (INR)

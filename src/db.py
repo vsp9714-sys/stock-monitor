@@ -111,6 +111,47 @@ class DailyCandleRefresh(Base):
     updated_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
+class UniverseDataSnapshot(Base):
+    """Last-known-good symbol data downloaded from an authoritative universe source."""
+    __tablename__ = "universe_data_snapshots"
+
+    id = Column(Integer, primary_key=True)
+    source_key = Column(String(40), nullable=False, index=True)
+    snapshot_date = Column(Date, nullable=False)
+    source = Column(String(300), nullable=False)
+    retrieved_at = Column(DateTime, nullable=False)
+    symbols_json = Column(Text, nullable=False)
+    item_count = Column(Integer, nullable=False)
+
+    __table_args__ = (UniqueConstraint("source_key", "snapshot_date", name="uq_universe_source_snapshot_day"),)
+
+
+class UniverseRefreshAttempt(Base):
+    """One source refresh attempt per configured trading date, including failures."""
+    __tablename__ = "universe_refresh_attempts"
+
+    id = Column(Integer, primary_key=True)
+    source_key = Column(String(40), nullable=False)
+    attempt_date = Column(Date, nullable=False)
+    attempted_at = Column(DateTime, nullable=False)
+    status = Column(String(20), nullable=False)
+    source_error = Column(Text)
+
+    __table_args__ = (UniqueConstraint("source_key", "attempt_date", name="uq_universe_attempt_day"),)
+
+
+class UniverseScanSnapshot(Base):
+    """Dated selected-symbol set and provenance for reproducible scans/backtests."""
+    __tablename__ = "universe_scan_snapshots"
+
+    id = Column(Integer, primary_key=True)
+    snapshot_date = Column(Date, nullable=False)
+    mode = Column(String(40), nullable=False)
+    created_at = Column(DateTime, nullable=False)
+    metadata_json = Column(Text, nullable=False)
+    symbols_json = Column(Text, nullable=False)
+
+
 class Signal(Base):
     """Detected trading signals — deduped per symbol per signal_type per day."""
     __tablename__ = "signals"

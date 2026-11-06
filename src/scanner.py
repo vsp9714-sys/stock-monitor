@@ -23,7 +23,7 @@ Flow per scan cycle:
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -52,6 +52,7 @@ from src.signals.ema_cross import detect_ema_crossover
 from src.signals.macd import detect_macd_signal
 from src.signals.rsi import detect_rsi_signal
 from src.signals.volume_breakout import detect_volume_breakout
+from src.universe import UniverseSelectionError, UniverseSelector
 
 logger = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
@@ -64,6 +65,7 @@ class ScanSummary:
     failed_count: int
     alerts_dispatched: int
     complete: bool
+    universe_metadata: dict = field(default_factory=dict)
 
 
 def _daily_timestamp(value) -> datetime:
@@ -119,6 +121,8 @@ class Scanner:
         self.signal_cfg = self.cfg.get("signals", {})
         self.universe_cfg = self.cfg.get("universe", {})
         self.confluence_cfg = self.cfg.get("confluence", {})
+        self.universe_selector = UniverseSelector(self.cfg, get_session)
+        self._last_universe_metadata = {}
 
     # ─── Stock Universe ──────────────────────────────────────────────────
 
@@ -173,24 +177,17 @@ class Scanner:
             session.close()
 
     def get_active_stocks(self, limit: Optional[int] = None) -> list[Stock]:
-        """Get all active stocks from the DB."""
+        """Resolve the configured universe against the verified instrument master."""
         session = get_session()
         try:
-            mode = self.universe_cfg.get("mode", "all_nse")
-            custom_symbols = self.universe_cfg.get("custom_symbols", [])
-
-            query = session.query(Stock).filter_by(is_active=True)
-            if mode == "custom" and custom_symbols:
-                query = query.filter(Stock.symbol.in_(custom_symbols))
-
-            if limit:
-                query = query.limit(limit)
-
-            stocks = query.all()
+            candidates = session.query(Stock).filter_by(is_active=True, exchange="NSE").order_by(Stock.symbol).all()
             session.expunge_all()
-            return stocks
         finally:
             session.close()
+        result = self.universe_selector.resolve(candidates, now=datetime.now(IST))
+        self._last_universe_metadata = result.metadata
+        stocks = result.symbols
+        return stocks[:limit] if limit else stocks
 
     def required_daily_candles(self) -> int:
         pairs = self.signal_cfg.get("ema_crossover", {}).get("pairs", [[9, 21], [21, 50], [50, 200]])
@@ -799,10 +796,17 @@ class Scanner:
     def run_scan(self, limit: Optional[int] = None) -> ScanSummary:
         """Scan cached history plus batched live OHLCV and report coverage gaps."""
         logger.info("Starting market scan with cached history and batched quotes...")
-        stocks = self.get_active_stocks(limit=limit)
+        try:
+            stocks = self.get_active_stocks(limit=limit)
+        except UniverseSelectionError as exc:
+            metadata = {"mode": self.universe_cfg.get("mode", "all_nse"),
+                        "selection_complete": False, "selection_error": str(exc)}
+            logger.error("Scan incomplete: configured universe could not be selected: %s", exc)
+            return ScanSummary(0, 0, 0, 0, False, metadata)
+        universe_metadata = dict(getattr(self, "_last_universe_metadata", {}))
         if not stocks:
-            logger.warning("No stocks in database. Run refresh_instrument_master() first.")
-            return ScanSummary(0, 0, 0, 0, True)
+            logger.error("Scan incomplete: configured universe resolved to no stocks.")
+            return ScanSummary(0, 0, 0, 0, False, universe_metadata)
 
         db = get_session()
         try:
@@ -816,7 +820,7 @@ class Scanner:
                 )
             except Exception as exc:
                 logger.error("Scan incomplete: batched quote sweep failed; no alerts sent: %s", exc)
-                return ScanSummary(len(stocks), 0, len(stocks), 0, False)
+                return ScanSummary(len(stocks), 0, len(stocks), 0, False, universe_metadata)
 
             quote_dates = set()
             missing_quote_stocks = []
@@ -848,10 +852,10 @@ class Scanner:
                 )
             if not quote_dates:
                 logger.error("Scan incomplete: quote response contained no usable OHLCV; no alerts sent.")
-                return ScanSummary(len(stocks), 0, len(stocks), 0, False)
+                return ScanSummary(len(stocks), 0, len(stocks), 0, False, universe_metadata)
             if len(quote_dates) != 1:
                 logger.error("Scan incomplete: quote batches returned mixed trading dates; no alerts sent.")
-                return ScanSummary(len(stocks), 0, len(stocks), 0, False)
+                return ScanSummary(len(stocks), 0, len(stocks), 0, False, universe_metadata)
             # Quote OHLC is a live session snapshot: never append it to canonical
             # daily candles or use it as a finalized input to swing indicators.
             eligible_stocks = [
@@ -863,6 +867,12 @@ class Scanner:
                 for stock in stocks
             )
             unavailable_count = len(missing_quote_stocks)
+            universe_metadata.update({
+                "scan_eligible_count": len(eligible_stocks),
+                "missing_or_stale_quote_count": unavailable_count,
+                "insufficient_history_count": insufficient_count,
+                "final_tradable_count": len(eligible_stocks),
+            })
             if insufficient_count:
                 logger.warning(
                     "Scan has insufficient history for %s/%s stocks (<%s daily bars); "
@@ -895,6 +905,7 @@ class Scanner:
                 return ScanSummary(
                     len(stocks), len(eligible_stocks) - len(failed),
                     unavailable_count + insufficient_count + len(failed), 0, False,
+                    universe_metadata,
                 )
 
             # Alert deduplication follows the market-data session, not the host
@@ -991,12 +1002,17 @@ class Scanner:
                     logger.error("Error processing alert for %s: %s", stock.symbol, exc, exc_info=True)
 
             logger.info(
-                "Scan complete: evaluated %s/%s symbols; %s alerts dispatched.",
+                "Scan complete: mode=%s selected=%s source_counts=%s series_excluded=%s eligible=%s; "
+                "%s/%s evaluated; %s alerts dispatched.",
+                universe_metadata.get("mode"), universe_metadata.get("selected_count"),
+                {key: universe_metadata.get(key) for key in ("constituent_count", "custom_count", "fno_count")},
+                universe_metadata.get("series_exclusion_count"), len(eligible_stocks),
                 len(eligible_stocks), len(stocks), new_signal_count,
             )
             return ScanSummary(
                 len(stocks), len(eligible_stocks), unavailable_count + insufficient_count,
                 new_signal_count, unavailable_count == 0 and insufficient_count == 0,
+                universe_metadata,
             )
         finally:
             db.close()
