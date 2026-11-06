@@ -17,6 +17,7 @@ import logging
 import logging.handlers
 import signal
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -94,6 +95,7 @@ def next_scan_time() -> str:
 
 scanner: Scanner = None
 _shutdown = False
+_daily_refresh_lock = threading.Lock()
 
 
 def run_scan_job() -> None:
@@ -130,13 +132,30 @@ def refresh_instruments_job() -> None:
 
 
 def refresh_daily_cache_job() -> None:
-    """Refresh finalized daily candles after NSE's session close."""
-    logger.info("Refreshing completed daily candle cache (post-close job)...")
+    """Probe provider readiness and refresh the latest completed session before market open."""
+    if not _daily_refresh_lock.acquire(blocking=False):
+        logger.info("Morning daily cache refresh already running; duplicate trigger skipped.")
+        return
+
+    def run_refresh() -> None:
+        try:
+            logger.info("Checking readiness for latest completed daily candles (morning job)...")
+            result = scanner.refresh_latest_completed_daily_cache()
+            logger.info("Morning daily cache refresh result: %s", result)
+        except Exception as e:
+            logger.error(f"Morning daily cache refresh failed: {e}", exc_info=True)
+        finally:
+            _daily_refresh_lock.release()
+
     try:
-        result = scanner.refresh_completed_daily_cache()
-        logger.info("Post-close daily cache refresh result: %s", result)
-    except Exception as e:
-        logger.error(f"Post-close daily cache refresh failed: {e}", exc_info=True)
+        threading.Thread(
+            target=run_refresh,
+            name="daily-candle-refresh",
+            daemon=True,
+        ).start()
+    except Exception:
+        _daily_refresh_lock.release()
+        raise
 
 
 def graceful_shutdown(signum, frame) -> None:
@@ -182,10 +201,9 @@ def main() -> None:
     # Schedule: refresh instruments daily at 08:30 server-local time.
     schedule.every().day.at("08:30").do(refresh_instruments_job)
 
-    # Refresh canonical daily bars after the NSE close, in exchange-local time.
-    # Historical calls are paced and checkpointed; scans continue to use the
-    # prior confirmed cache until each provider candle is persisted.
-    schedule.every().day.at("15:45", "Asia/Kolkata").do(refresh_daily_cache_job)
+    # At 06:00 IST on weekdays, probe Upstox's latest completed session and
+    # refresh it if ready. Otherwise retain the existing confirmed cache.
+    schedule.every().day.at("06:00", "Asia/Kolkata").do(refresh_daily_cache_job)
 
     logger.info(f"Scheduler started. Scan interval: every {scan_interval} minutes.")
     logger.info("Market hours: 09:15 – 15:30 IST, Mon–Fri")
