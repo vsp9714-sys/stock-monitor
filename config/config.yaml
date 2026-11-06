@@ -70,7 +70,7 @@ confluence:
 universe:
   # Modes: all_nse (legacy/default), nifty500, custom, composed
   # composed = Nifty 500 + optional current F&O underlyings + custom symbols
-  mode: "all_nse"
+  mode: "nifty500"
   # Required for custom/composed; symbols are validated against the local NSE instrument master.
   custom_symbols: []
   # Used only by composed. Unavailable F&O data is explicitly reported and never widens to all_nse.

@@ -28,6 +28,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import event
 
 from src.config_loader import get_config
 
@@ -205,10 +206,54 @@ def get_engine():
         db_path = Path(cfg["database"]["path"])
         db_path.parent.mkdir(parents=True, exist_ok=True)
         db_url = f"sqlite:///{db_path.absolute()}"
-        _engine = create_engine(db_url, connect_args={"check_same_thread": False})
+        _engine = create_sqlite_engine(db_url)
         Base.metadata.create_all(_engine)
         logger.info(f"Database initialized at {db_path.absolute()}")
     return _engine
+
+
+def create_sqlite_engine(db_url: str):
+    """Create a SQLite engine configured for concurrent scanner/cache access."""
+    engine = create_engine(
+        db_url,
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_busy_timeout(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+
+    # WAL lets scanner readers proceed while a cache writer commits. SQLite
+    # still serializes writers; the busy timeout lets short commits queue.
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        connection.exec_driver_sql("PRAGMA synchronous=NORMAL")
+    return engine
+
+
+def prune_market_data_to_symbols(session: Session, symbols: set[str]) -> dict[str, int]:
+    """Drop OHLCV, refresh checkpoints, and fundamentals outside a selected universe.
+
+    Signal and delivery history plus the full instrument master are intentionally
+    retained for auditability and for future constituent resolution.
+    """
+    normalized = {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
+    if not normalized:
+        raise ValueError("Refusing to prune market data to an empty universe")
+
+    counts = {}
+    for name, model in (
+        ("ohlcv_cache", OHLCVCache),
+        ("daily_candle_refresh", DailyCandleRefresh),
+        ("fundamentals", Fundamental),
+    ):
+        counts[name] = session.query(model).filter(~model.symbol.in_(normalized)).delete(
+            synchronize_session=False
+        )
+    session.commit()
+    return counts
 
 
 def get_session() -> Session:

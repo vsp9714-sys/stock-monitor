@@ -13,7 +13,8 @@ from src.scanner import Scanner
 from src.db import (
     Base, Stock, Signal, SignalDelivery, get_delivery_score,
     mark_delivery_sent, refresh_signal_notified_state, upsert_signal,
-    seed_legacy_deliveries,
+    seed_legacy_deliveries, create_sqlite_engine, OHLCVCache,
+    DailyCandleRefresh, Fundamental, prune_market_data_to_symbols,
 )
 
 
@@ -210,6 +211,57 @@ def test_instrument_refresh_deactivates_non_equity_and_stale_rows(test_db_sessio
     assert test_db_session.query(Stock).filter_by(symbol="OLDCO").one().is_active is False
 
 
+def test_instrument_refresh_replaces_stale_upstox_key(test_db_session, monkeypatch):
+    test_db_session.add(Stock(
+        symbol="KMEW", isin="INE0CJD01037", company_name="KMEW Limited",
+        exchange="NSE", instrument_key="NSE_EQ|INE0CJD01029", series="EQ", is_active=True,
+    ))
+    test_db_session.commit()
+
+    class Fetcher:
+        def get_all_eq_symbols(self, exchange):
+            assert exchange == "NSE"
+            return [{
+                "symbol": "KMEW", "isin": "INE0CJD01037", "company_name": "KMEW Limited",
+                "exchange": "NSE", "instrument_key": "NSE_EQ|INE0CJD01037", "series": "EQ",
+            }]
+
+    monkeypatch.setattr("src.scanner.get_session", lambda: test_db_session)
+    scanner = object.__new__(Scanner)
+    scanner.fetcher = Fetcher()
+    assert scanner.refresh_instrument_master() == 1
+    assert test_db_session.query(Stock).filter_by(symbol="KMEW").one().instrument_key == "NSE_EQ|INE0CJD01037"
+
+
+def test_sqlite_engine_uses_wal_and_busy_timeout(tmp_path):
+    engine = create_sqlite_engine(f"sqlite:///{tmp_path / 'concurrency.db'}")
+    try:
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql("PRAGMA journal_mode").scalar().lower() == "wal"
+            assert connection.exec_driver_sql("PRAGMA busy_timeout").scalar() == 30000
+    finally:
+        engine.dispose()
+
+
+def test_prune_market_data_preserves_signal_and_selected_symbol(test_db_session):
+    test_db_session.add_all([
+        OHLCVCache(symbol="KEEP", interval="1d", ts=datetime(2026, 11, 5), close=10),
+        OHLCVCache(symbol="DROP", interval="1d", ts=datetime(2026, 11, 5), close=20),
+        DailyCandleRefresh(symbol="KEEP", session_date=date(2026, 11, 5), status="confirmed"),
+        DailyCandleRefresh(symbol="DROP", session_date=date(2026, 11, 5), status="no_bar"),
+        Fundamental(symbol="KEEP", fetched_at=datetime.now(timezone.utc)),
+        Fundamental(symbol="DROP", fetched_at=datetime.now(timezone.utc)),
+        Signal(symbol="DROP", signal_date=date(2026, 11, 5), signal_type="test", direction="BUY"),
+    ])
+    test_db_session.commit()
+    with pytest.raises(ValueError, match="empty universe"):
+        prune_market_data_to_symbols(test_db_session, set())
+    deleted = prune_market_data_to_symbols(test_db_session, {"KEEP"})
+    assert deleted == {"ohlcv_cache": 1, "daily_candle_refresh": 1, "fundamentals": 1}
+    assert [row.symbol for row in test_db_session.query(OHLCVCache).all()] == ["KEEP"]
+    assert [row.symbol for row in test_db_session.query(Signal).all()] == ["DROP"]
+
+
 def test_config_loader():
     cfg = load_config()
     assert "upstox" in cfg
@@ -223,3 +275,4 @@ def test_config_loader():
     assert cfg["market"]["open_time"] == "09:15"
     assert cfg["market"]["close_time"] == "15:30"
     assert cfg["market"]["timezone"] == "Asia/Kolkata"
+    assert cfg["universe"]["mode"] == "nifty500"
