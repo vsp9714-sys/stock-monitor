@@ -34,6 +34,11 @@ TOKEN_CACHE = Path("data/upstox_token.json")
 class UpstoxAPIError(RuntimeError):
     """Provider request failed after bounded retries."""
 
+    def __init__(self, message: str, *, status_code: Optional[int] = None, error_code: Optional[str] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
+
 
 class IncompleteQuoteBatch(UpstoxAPIError):
     """Quote API response did not contain every requested instrument."""
@@ -182,7 +187,8 @@ class UpstoxFetcher:
                 )
                 if response.status_code == 429 or response.status_code >= 500:
                     last_error = UpstoxAPIError(
-                        f"Upstox returned HTTP {response.status_code} for {url}"
+                        f"Upstox returned HTTP {response.status_code} for {url}",
+                        status_code=response.status_code,
                     )
                     if attempt >= self._request_retries:
                         break
@@ -199,8 +205,19 @@ class UpstoxFetcher:
                     # Retry only throttling and server/transient errors. Other
                     # 4xx responses (bad token, bad key, invalid request) need
                     # operator action and should fail immediately.
+                    try:
+                        payload = response.json()
+                    except ValueError:
+                        payload = {}
+                    errors = payload.get("errors") if isinstance(payload, dict) else None
+                    first_error = errors[0] if errors and isinstance(errors[0], dict) else {}
+                    error_code = first_error.get("errorCode") or first_error.get("error_code")
+                    detail = first_error.get("message")
+                    message = f"Upstox returned HTTP {response.status_code} for {url}"
+                    if error_code or detail:
+                        message += f" ({error_code or 'provider_error'}: {detail or 'no detail'})"
                     raise UpstoxAPIError(
-                        f"Upstox returned HTTP {response.status_code} for {url}"
+                        message, status_code=response.status_code, error_code=error_code
                     ) from exc
                 return response.json()
             except UpstoxAPIError:

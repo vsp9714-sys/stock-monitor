@@ -463,7 +463,21 @@ class Scanner:
                     )
                     session.merge(refresh_state[stock.symbol])
                     logger.warning("Daily refresh failed for %s: %s", stock.symbol, exc)
+                    if isinstance(exc, UpstoxAPIError) and exc.error_code == "UDAPI100011":
+                        # A bad instrument mapping is isolated to this symbol;
+                        # preserve its failed checkpoint but continue refreshing
+                        # the rest of the active universe.
+                        pending_symbols += 1
+                        if pending_symbols >= checkpoint_symbols:
+                            if pending_rows:
+                                upsert_ohlcv_rows(session, pending_rows, commit=False)
+                                pending_rows.clear()
+                            session.commit()
+                            pending_symbols = 0
+                        continue
                     if isinstance(exc, UpstoxAPIError):
+                        # Provider-wide/transient failures fail closed so the
+                        # run can resume after service/provider recovery.
                         stopped_early = True
                         break
             if pending_rows:
