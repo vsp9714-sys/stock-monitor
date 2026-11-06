@@ -22,12 +22,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import pytz
 import schedule
 
 from src.config_loader import get_config
 from src.db import get_engine
 from src.fetcher.upstox import UpstoxFetcher
+from src.market_calendar import CalendarUnavailable, IST, is_market_open
 from src.scanner import Scanner
 
 # ─── Logging setup ────────────────────────────────────────────────────────────
@@ -74,16 +74,14 @@ logger = logging.getLogger(__name__)
 
 # ─── Market time helpers ──────────────────────────────────────────────────────
 
-IST = pytz.timezone("Asia/Kolkata")
-
-
-def is_market_hours() -> bool:
-    now = datetime.now(IST)
-    if now.weekday() >= 5:
+def is_market_hours(now: datetime | None = None) -> bool:
+    """Market-hours gate in exchange local time, fail-closed without a calendar."""
+    cfg = get_config()
+    try:
+        return is_market_open(now, cfg.get("market", {}))
+    except CalendarUnavailable as exc:
+        logger.error("Market scan suppressed: %s", exc)
         return False
-    market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    return market_open <= now <= market_close
 
 
 def next_scan_time() -> str:

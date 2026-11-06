@@ -22,6 +22,7 @@ Flow per scan cycle:
 """
 import json
 import logging
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
@@ -29,6 +30,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import numpy as np
 from sqlalchemy import func
 
 from src.config_loader import get_config
@@ -53,6 +55,7 @@ from src.signals.macd import detect_macd_signal
 from src.signals.rsi import detect_rsi_signal
 from src.signals.volume_breakout import detect_volume_breakout
 from src.universe import UniverseSelectionError, UniverseSelector
+from src.market_calendar import CalendarUnavailable, IST, is_market_open, is_trading_day
 
 logger = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
@@ -66,6 +69,62 @@ class ScanSummary:
     alerts_dispatched: int
     complete: bool
     universe_metadata: dict = field(default_factory=dict)
+
+
+def _validate_quote(quote: dict, now: datetime, max_age: int) -> tuple[datetime, str | None]:
+    """Validate quote price/OHLC consistency and freshness; return trade time or reason."""
+    try:
+        values = {name: float(quote[name]) for name in (
+            "open", "high", "low", "close", "volume", "last_price", "prev_close_price"
+        )}
+        if not all(math.isfinite(value) for value in values.values()):
+            return now, "non_finite_quote_value"
+        if any(values[name] <= 0 for name in ("open", "high", "low", "close", "last_price", "prev_close_price")):
+            return now, "non_positive_quote_price"
+        if values["volume"] < 0:
+            return now, "negative_quote_volume"
+        low, high = values["low"], values["high"]
+        if not (low <= values["open"] <= high and low <= values["close"] <= high):
+            return now, "inconsistent_quote_ohlc"
+        if not low - 1e-6 <= values["last_price"] <= high + 1e-6:
+            return now, "ltp_outside_session_range"
+
+        raw_trade_time = int(quote["last_trade_time"])
+        trade_time = datetime.fromtimestamp(raw_trade_time / 1000, timezone.utc)
+        age = (now - trade_time).total_seconds()
+        if age < -30 or age > max_age:
+            return trade_time, "stale_or_future_ltp"
+
+        raw_ohlc_time = int(quote["ts"])
+        ohlc_epoch = raw_ohlc_time / 1000 if raw_ohlc_time > 100_000_000_000 else raw_ohlc_time
+        ohlc_time = datetime.fromtimestamp(ohlc_epoch, timezone.utc)
+        if abs((trade_time - ohlc_time).total_seconds()) > 24 * 60 * 60:
+            return trade_time, "invalid_session_ohlc_timestamp"
+        return trade_time, None
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return now, "missing_or_invalid_quote_fields"
+
+
+def _valid_ohlcv_frame(frame: pd.DataFrame) -> bool:
+    """Check cached daily rows before they reach a signal detector."""
+    required = {"ts", "open", "high", "low", "close", "volume"}
+    if frame is None or frame.empty or not required.issubset(frame.columns):
+        return False
+    try:
+        values = frame[["open", "high", "low", "close", "volume"]].astype(float)
+        if not np.isfinite(values.to_numpy(dtype=float)).all():
+            return False
+        if (values[["open", "high", "low", "close"]] <= 0).any().any() or (values["volume"] < 0).any():
+            return False
+        if (values["low"] > values["high"]).any():
+            return False
+        if ((values["open"] < values["low"]) | (values["open"] > values["high"])
+                | (values["close"] < values["low"]) | (values["close"] > values["high"])).any():
+            return False
+        timestamps = pd.to_datetime(frame["ts"], errors="coerce")
+        return not timestamps.isna().any() and not timestamps.duplicated().any()
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
 
 
 def _daily_timestamp(value) -> datetime:
@@ -515,7 +574,13 @@ class Scanner:
         if current.tzinfo is None:
             current = current.replace(tzinfo=IST)
         current = current.astimezone(IST)
-        if current.weekday() >= 5 or (
+        try:
+            trading_day = is_trading_day(current.date(), getattr(self, "cfg", {}).get("market", {}))
+        except CalendarUnavailable as exc:
+            logger.error("Morning refresh skipped: %s", exc)
+            return {"universe_size": 0, "updated": 0, "failed": 0, "skipped": True,
+                    "reason": "calendar_unavailable"}
+        if (not manual and not trading_day) or (
             not manual and not (datetime_time(6, 0) <= current.time() < datetime_time(7, 0))
         ):
             logger.info("Morning daily-candle readiness check skipped outside its weekday schedule window.")
@@ -567,7 +632,9 @@ class Scanner:
 
     # ─── Single Stock Scan & Confluence Evaluation ────────────────────────
 
-    def _scan_stock(self, stock: Stock, df: pd.DataFrame) -> tuple[Optional[dict], pd.DataFrame]:
+    def _scan_stock(
+        self, stock: Stock, df: pd.DataFrame, provisional: bool = False
+    ) -> tuple[Optional[dict], pd.DataFrame]:
         """
         Scan a single stock across all indicator checks and evaluate confluence.
         Returns (confluence_dict or None, df of daily candles).
@@ -681,7 +748,17 @@ class Scanner:
                         })
 
             # ── 4. Volume Breakout Check ────────────────────────────────
-            if self.signal_cfg.get("volume_breakout", {}).get("enabled", True):
+            if provisional:
+                checks.append({
+                    "name": "Volume Breakout",
+                    "signal_type": "volume_breakout",
+                    "met": False,
+                    "direction": None,
+                    "value_text": "Unavailable",
+                    "description": "Intraday volume baseline deferred to Batch B",
+                    "availability": "unavailable",
+                })
+            elif self.signal_cfg.get("volume_breakout", {}).get("enabled", True):
                 vol_cfg = self.signal_cfg["volume_breakout"]
                 vol_result = detect_volume_breakout(
                     stock.symbol, df,
@@ -763,7 +840,11 @@ class Scanner:
                 "total_signals": len(checks),
                 "price": current_price,
                 "checks": checks,
-                "signal_type": f"confluence_{consensus_dir.lower()}",
+                "signal_type": (
+                    f"provisional_intraday_confluence_{consensus_dir.lower()}"
+                    if provisional else f"confluence_{consensus_dir.lower()}"
+                ),
+                "signal_horizon": "provisional_intraday" if provisional else "confirmed_daily",
             }
             return result, df
 
@@ -796,7 +877,7 @@ class Scanner:
             for symbol, rows in grouped.items()
         }
 
-    def run_scan(self, limit: Optional[int] = None) -> ScanSummary:
+    def run_scan(self, limit: Optional[int] = None, *, now: Optional[datetime] = None) -> ScanSummary:
         """Scan cached history plus batched live OHLCV and report coverage gaps."""
         logger.info("Starting market scan with cached history and batched quotes...")
         try:
@@ -810,6 +891,19 @@ class Scanner:
         if not stocks:
             logger.error("Scan incomplete: configured universe resolved to no stocks.")
             return ScanSummary(0, 0, 0, 0, False, universe_metadata)
+
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        current = current.astimezone(timezone.utc)
+        current_ist = current.astimezone(IST)
+        market_cfg = self.cfg.get("market", {})
+        try:
+            intraday_active = is_market_open(current_ist, market_cfg)
+        except CalendarUnavailable as exc:
+            universe_metadata.update({"calendar_available": False, "calendar_error": str(exc)})
+            logger.error("Scan suppressed because exchange calendar is unavailable: %s", exc)
+            return ScanSummary(len(stocks), 0, len(stocks), 0, False, universe_metadata)
 
         db = get_session()
         try:
@@ -826,32 +920,28 @@ class Scanner:
                 return ScanSummary(len(stocks), 0, len(stocks), 0, False, universe_metadata)
 
             quote_dates = set()
-            missing_quote_stocks = []
+            skipped_reasons: dict[str, int] = {}
+            quote_invalid: dict[str, str] = {}
             fresh_quotes = {}
-            now = datetime.now(timezone.utc)
             max_age = int(self.cfg.get("upstox", {}).get("max_quote_age_seconds", 300))
             for stock in stocks:
                 quote = quotes.get(stock.instrument_key)
                 if quote is None:
-                    missing_quote_stocks.append(stock)
+                    skipped_reasons["missing_quote"] = skipped_reasons.get("missing_quote", 0) + 1
                     continue
-                try:
-                    trade_time = datetime.fromtimestamp(quote["last_trade_time"] / 1000, timezone.utc)
-                    ltp = float(quote["last_price"])
-                    age = (now - trade_time).total_seconds()
-                    if ltp <= 0 or age < -30 or age > max_age:
-                        raise ValueError("stale or invalid LTP")
-                except (KeyError, TypeError, ValueError, OverflowError, OSError):
-                    logger.warning("Skipping %s: missing, invalid, or stale Upstox last trade", stock.symbol)
-                    missing_quote_stocks.append(stock)
+                trade_time, reason = _validate_quote(quote, current, max_age)
+                if reason:
+                    quote_invalid[stock.symbol] = reason
+                    skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+                    logger.warning("Skipping %s: invalid quote (%s)", stock.symbol, reason)
                     continue
                 quote_dates.add(trade_time.astimezone(IST).date())
                 fresh_quotes[stock.instrument_key] = quote
-            if missing_quote_stocks:
+            if skipped_reasons:
                 logger.warning(
-                    "Quote response omitted %s/%s symbols; skipping only those symbols: %s",
-                    len(missing_quote_stocks), len(stocks),
-                    ", ".join(stock.symbol for stock in missing_quote_stocks[:25]),
+                    "Quote validation skipped %s/%s symbols; reason counts=%s; examples=%s",
+                    len(stocks) - len(fresh_quotes), len(stocks), skipped_reasons,
+                    ", ".join(f"{symbol}:{reason}" for symbol, reason in list(quote_invalid.items())[:15]),
                 )
             if not quote_dates:
                 logger.error("Scan incomplete: quote response contained no usable OHLCV; no alerts sent.")
@@ -859,22 +949,55 @@ class Scanner:
             if len(quote_dates) != 1:
                 logger.error("Scan incomplete: quote batches returned mixed trading dates; no alerts sent.")
                 return ScanSummary(len(stocks), 0, len(stocks), 0, False, universe_metadata)
-            # Quote OHLC is a live session snapshot: never append it to canonical
-            # daily candles or use it as a finalized input to swing indicators.
+            session_date = next(iter(quote_dates))
+            if intraday_active and session_date != current_ist.date():
+                logger.error("Scan suppressed: live quote session %s does not match exchange date %s.",
+                             session_date, current_ist.date())
+                return ScanSummary(len(stocks), 0, len(stocks), 0, False, universe_metadata)
+
+            # Keep canonical daily history separate from today's unfinished
+            # session even if a stale/unverified same-date row exists in cache.
+            valid_frames = {}
+            invalid_history = set()
+            for stock in stocks:
+                frame = frames.get(stock.symbol)
+                if frame is None or frame.empty:
+                    valid_frames[stock.symbol] = pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
+                    continue
+                if not _valid_ohlcv_frame(frame):
+                    invalid_history.add(stock.symbol)
+                    skipped_reasons["invalid_cached_ohlcv"] = skipped_reasons.get("invalid_cached_ohlcv", 0) + 1
+                    continue
+                frame = frame.copy()
+                dates = pd.to_datetime(frame["ts"], errors="coerce").map(
+                    lambda value: _daily_timestamp(value).date() if not pd.isna(value) else None
+                )
+                valid_frames[stock.symbol] = frame.loc[dates < session_date].reset_index(drop=True)
+
+            # The universe count is the denominator: selected stocks lacking
+            # a fresh quote, valid cache, or enough history reduce coverage.
             eligible_stocks = [
                 stock for stock in stocks
-                if stock.instrument_key in fresh_quotes and len(frames[stock.symbol]) >= minimum
+                if stock.instrument_key in fresh_quotes
+                and stock.symbol not in invalid_history
+                and len(valid_frames.get(stock.symbol, ())) >= minimum
             ]
             insufficient_count = sum(
-                stock.instrument_key in fresh_quotes and len(frames[stock.symbol]) < minimum
+                stock.instrument_key in fresh_quotes and stock.symbol not in invalid_history
+                and len(valid_frames.get(stock.symbol, ())) < minimum
                 for stock in stocks
             )
-            unavailable_count = len(missing_quote_stocks)
+            unavailable_count = len(stocks) - len(fresh_quotes)
             universe_metadata.update({
                 "scan_eligible_count": len(eligible_stocks),
                 "missing_or_stale_quote_count": unavailable_count,
                 "insufficient_history_count": insufficient_count,
+                "invalid_history_count": len(invalid_history),
                 "final_tradable_count": len(eligible_stocks),
+                "coverage_denominator": len(stocks),
+                "coverage_threshold": float(self.cfg.get("scan", {}).get("min_coverage", 0.95)),
+                "session_date": session_date.isoformat(),
+                "provisional_intraday_enabled": intraday_active,
             })
             if insufficient_count:
                 logger.warning(
@@ -887,16 +1010,41 @@ class Scanner:
             # A detector exception therefore cannot produce a misleading partial sweep.
             evaluations = []
             failed = []
+            def evaluate_paths(stock):
+                completed = valid_frames[stock.symbol]
+                daily_result, _ = self._scan_stock(stock, completed)
+                results = []
+                if daily_result:
+                    results.append((daily_result, completed, False))
+                if intraday_active:
+                    quote = fresh_quotes[stock.instrument_key]
+                    quote_bar = {
+                        "ts": pd.Timestamp(session_date),
+                        **{field: float(quote[field]) for field in ("open", "high", "low", "close", "volume")},
+                    }
+                    intraday = pd.concat([completed, pd.DataFrame([quote_bar])], ignore_index=True)
+                    provisional_result, _ = self._scan_stock(stock, intraday, True)
+                    if provisional_result:
+                        provisional_result = {
+                            **provisional_result,
+                            "session_date": session_date.isoformat(),
+                            "quote_timestamp": datetime.fromtimestamp(
+                                int(quote["last_trade_time"]) / 1000, timezone.utc
+                            ).isoformat(),
+                            "bar_status": "provisional",
+                        }
+                        results.append((provisional_result, intraday, True))
+                return results
+
             with ThreadPoolExecutor(max_workers=10) as executor:
                 futures = {
-                    executor.submit(self._scan_stock, stock, frames[stock.symbol]): stock
-                    for stock in eligible_stocks
+                    executor.submit(evaluate_paths, stock): stock
+                for stock in eligible_stocks
                 }
                 for future in as_completed(futures):
                     stock = futures[future]
                     try:
-                        result, frame = future.result()
-                        evaluations.append((stock, result, frame))
+                        evaluations.append((stock, future.result()))
                     except Exception as exc:
                         logger.error("Signal evaluation failed for %s: %s", stock.symbol, exc)
                         failed.append(stock.symbol)
@@ -907,102 +1055,122 @@ class Scanner:
                 )
                 return ScanSummary(
                     len(stocks), len(eligible_stocks) - len(failed),
-                    unavailable_count + insufficient_count + len(failed), 0, False,
+                    unavailable_count + insufficient_count + len(invalid_history) + len(failed), 0, False,
                     universe_metadata,
                 )
 
             # Alert deduplication follows the market-data session, not the host
             # calendar date (important for manual scans after the market closes).
-            today = next(iter(quote_dates))
+            today = session_date
+            evaluated_count = len(eligible_stocks)
+            coverage = evaluated_count / len(stocks) if stocks else 0.0
+            min_coverage = float(self.cfg.get("scan", {}).get("min_coverage", 0.95))
+            if not 0 <= min_coverage <= 1:
+                logger.error("Invalid scan.min_coverage %s; suppressing alerts.", min_coverage)
+                return ScanSummary(len(stocks), evaluated_count, unavailable_count + insufficient_count,
+                                   0, False, {**universe_metadata, "coverage_error": "threshold_out_of_range"})
+            universe_metadata.update({"coverage_ratio": coverage, "coverage_percent": round(coverage * 100, 2)})
+            if coverage < min_coverage:
+                logger.error("Alert dispatch suppressed: coverage %.2f%% is below %.2f%% threshold.",
+                             coverage * 100, min_coverage * 100)
+                return ScanSummary(len(stocks), evaluated_count,
+                                   unavailable_count + insufficient_count + len(invalid_history),
+                                   0, False, universe_metadata)
             new_signal_count = 0
             destinations = [
                 target for notifier in self.notifiers for target in notifier.delivery_targets()
             ]
             seed_legacy_deliveries(db, destinations)
 
-            for stock, res, df in evaluations:
-                if not res:
-                    continue
-                try:
-                    fund = self.fundamentals.get_fundamentals(stock.symbol, stock.isin or "")
-                    signal_type = res["signal_type"]
-                    quote = fresh_quotes[stock.instrument_key]
-                    res = {**res, "price": float(quote["last_price"])}
-                    existing = db.query(Signal).filter_by(
-                        symbol=stock.symbol, signal_date=today, signal_type=signal_type
-                    ).first()
-                    old_score = int(existing.indicator_value or 0) if existing else 0
-                    if existing and res["confluence_score"] <= old_score:
-                        chart_path = existing.chart_path
-                    else:
-                        from charts.chart_generator import generate_signal_chart
-                        chart_path = generate_signal_chart(
+            for stock, path_results in evaluations:
+                for res, df, provisional in path_results:
+                    try:
+                        fund = self.fundamentals.get_fundamentals(stock.symbol, stock.isin or "")
+                        signal_type = res["signal_type"]
+                        quote = fresh_quotes[stock.instrument_key]
+                        res = {**res, "price": float(quote["last_price"])}
+                        existing = db.query(Signal).filter_by(
+                            symbol=stock.symbol, signal_date=today, signal_type=signal_type
+                        ).first()
+                        old_score = int(existing.indicator_value or 0) if existing else 0
+                        if existing and res["confluence_score"] <= old_score:
+                            chart_path = existing.chart_path
+                        else:
+                            from charts.chart_generator import generate_signal_chart
+                            chart_path = generate_signal_chart(
+                                symbol=stock.symbol,
+                                company_name=stock.company_name or stock.symbol,
+                                df=df,
+                                signal_type=signal_type,
+                                direction=res["direction"],
+                                indicator_value=float(res["confluence_score"]),
+                            )
+
+                        saved = upsert_signal(
+                            session=db,
                             symbol=stock.symbol,
-                            company_name=stock.company_name or stock.symbol,
-                            df=df,
+                            signal_date=today,
                             signal_type=signal_type,
                             direction=res["direction"],
+                            price=res["price"],
                             indicator_value=float(res["confluence_score"]),
+                            indicator_detail=json.dumps({
+                                "signal_horizon": "provisional_intraday" if provisional else "confirmed_daily",
+                                "bar_status": "provisional" if provisional else "confirmed_daily_cache",
+                                "session_date": today.isoformat(),
+                                "quote_timestamp": res.get("quote_timestamp"),
+                                "confluence_score": res["confluence_score"],
+                                "total_signals": res["total_signals"],
+                                "checks": res["checks"],
+                            }),
+                            chart_path=chart_path,
                         )
-
-                    saved = upsert_signal(
-                        session=db,
-                        symbol=stock.symbol,
-                        signal_date=today,
-                        signal_type=signal_type,
-                        direction=res["direction"],
-                        price=res["price"],
-                        indicator_value=float(res["confluence_score"]),
-                        indicator_detail=json.dumps({
-                            "confluence_score": res["confluence_score"],
-                            "total_signals": res["total_signals"],
-                            "checks": res["checks"],
-                        }),
-                        chart_path=chart_path,
-                    )
-                    saved_detail = json.loads(saved.indicator_detail or "{}")
-                    saved_score = int(saved.indicator_value or 0)
-                    saved_checks = saved_detail.get("checks", res["checks"])
-                    saved_total = int(saved_detail.get("total_signals", res["total_signals"]))
-                    payload = AlertPayload(
-                        symbol=stock.symbol,
-                        company_name=stock.company_name or stock.symbol,
-                        signal_type=signal_type,
-                        direction=res["direction"],
-                        price=res["price"],
-                        price_source="Upstox last_price",
-                        quote_timestamp=datetime.fromtimestamp(
-                            quote["last_trade_time"] / 1000, timezone.utc
-                        ).isoformat(),
-                        indicator_value=float(saved_score),
-                        indicator_detail={"confluence_score": saved_score, "checks": saved_checks},
-                        confluence_score=saved_score,
-                        total_signals=saved_total,
-                        checks=saved_checks,
-                        chart_path=saved.chart_path,
-                        mcap_cr=fund.get("mcap_cr") if fund else None,
-                        cap_category=fund.get("cap_category") if fund else None,
-                        sector=fund.get("sector") if fund else None,
-                        industry=fund.get("industry") if fund else None,
-                        pe_ratio=fund.get("pe_ratio") if fund else None,
-                        pb_ratio=fund.get("pb_ratio") if fund else None,
-                        roe=fund.get("roe") if fund else None,
-                        profit_q1_cr=fund.get("profit_q1_cr") if fund else None,
-                        profit_q2_cr=fund.get("profit_q2_cr") if fund else None,
-                        profit_q3_cr=fund.get("profit_q3_cr") if fund else None,
-                        profit_q4_cr=fund.get("profit_q4_cr") if fund else None,
-                        profit_ttm_cr=fund.get("profit_ttm_cr") if fund else None,
-                        promoter_holding_pct=fund.get("promoter_holding_pct") if fund else None,
-                        screener_url=fund.get("screener_url") if fund else None,
-                    )
-                    if self._dispatch_alert(payload, db, saved.id):
-                        new_signal_count += 1
-                        logger.info(
-                            "Confluence alert/update dispatched for %s: %s (%s/%s checks)",
-                            stock.symbol, res["direction"], saved_score, saved_total,
+                        saved_detail = json.loads(saved.indicator_detail or "{}")
+                        saved_score = int(saved.indicator_value or 0)
+                        saved_checks = saved_detail.get("checks", res["checks"])
+                        saved_total = int(saved_detail.get("total_signals", res["total_signals"]))
+                        payload = AlertPayload(
+                            symbol=stock.symbol,
+                            company_name=stock.company_name or stock.symbol,
+                            signal_type=signal_type,
+                            direction=res["direction"],
+                            price=res["price"],
+                            price_source="Upstox last_price",
+                            quote_timestamp=datetime.fromtimestamp(
+                                quote["last_trade_time"] / 1000, timezone.utc
+                            ).isoformat(),
+                            indicator_value=float(saved_score),
+                            indicator_detail={"confluence_score": saved_score, "checks": saved_checks},
+                            provisional=provisional,
+                            signal_session_date=today.isoformat(),
+                            bar_status="provisional" if provisional else "confirmed_daily_cache",
+                            confluence_score=saved_score,
+                            total_signals=saved_total,
+                            checks=saved_checks,
+                            chart_path=saved.chart_path,
+                            mcap_cr=fund.get("mcap_cr") if fund else None,
+                            cap_category=fund.get("cap_category") if fund else None,
+                            sector=fund.get("sector") if fund else None,
+                            industry=fund.get("industry") if fund else None,
+                            pe_ratio=fund.get("pe_ratio") if fund else None,
+                            pb_ratio=fund.get("pb_ratio") if fund else None,
+                            roe=fund.get("roe") if fund else None,
+                            profit_q1_cr=fund.get("profit_q1_cr") if fund else None,
+                            profit_q2_cr=fund.get("profit_q2_cr") if fund else None,
+                            profit_q3_cr=fund.get("profit_q3_cr") if fund else None,
+                            profit_q4_cr=fund.get("profit_q4_cr") if fund else None,
+                            profit_ttm_cr=fund.get("profit_ttm_cr") if fund else None,
+                            promoter_holding_pct=fund.get("promoter_holding_pct") if fund else None,
+                            screener_url=fund.get("screener_url") if fund else None,
                         )
-                except Exception as exc:
-                    logger.error("Error processing alert for %s: %s", stock.symbol, exc, exc_info=True)
+                        if self._dispatch_alert(payload, db, saved.id):
+                            new_signal_count += 1
+                            logger.info(
+                                "Confluence alert/update dispatched for %s: %s (%s/%s checks)",
+                                stock.symbol, res["direction"], saved_score, saved_total,
+                            )
+                    except Exception as exc:
+                        logger.error("Error processing alert for %s: %s", stock.symbol, exc, exc_info=True)
 
             logger.info(
                 "Scan complete: mode=%s selected=%s source_counts=%s series_excluded=%s eligible=%s; "
@@ -1013,8 +1181,8 @@ class Scanner:
                 len(eligible_stocks), len(stocks), new_signal_count,
             )
             return ScanSummary(
-                len(stocks), len(eligible_stocks), unavailable_count + insufficient_count,
-                new_signal_count, unavailable_count == 0 and insufficient_count == 0,
+                len(stocks), evaluated_count, unavailable_count + insufficient_count + len(invalid_history),
+                new_signal_count, evaluated_count == len(stocks),
                 universe_metadata,
             )
         finally:

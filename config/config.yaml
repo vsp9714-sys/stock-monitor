@@ -27,6 +27,10 @@ market:
   # Days of the week to scan (0=Mon, 6=Sun)
   trading_days: [0, 1, 2, 3, 4]
 
+# Coverage is measured against the configured selected stock universe.
+scan:
+  min_coverage: 0.95
+
 # ─── Signal Configuration ─────────────────────────────────────────────────────
 signals:
   rsi:

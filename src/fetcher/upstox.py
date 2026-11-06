@@ -10,6 +10,7 @@ Upstox API v2 docs: https://upstox.com/developer/api-documentation/
 import json
 import io
 import logging
+import math
 import random
 import time
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,7 @@ from urllib.parse import urlencode
 
 import pandas as pd
 import requests
+from zoneinfo import ZoneInfo
 
 from src.config_loader import get_config
 from src.rate_limiter import RateLimiter
@@ -29,6 +31,7 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://api.upstox.com/v2"
 BASE_URL_V3 = "https://api.upstox.com/v3"
 TOKEN_CACHE = Path("data/upstox_token.json")
+IST = ZoneInfo("Asia/Kolkata")
 
 
 class UpstoxAPIError(RuntimeError):
@@ -355,12 +358,13 @@ class UpstoxFetcher:
         interval: 1minute, 30minute, day, week, month
         Returns DataFrame with columns: ts, open, high, low, close, volume.
         """
+        now_ist = datetime.now(IST)
         if to_date is None:
-            to_date = datetime.now().strftime("%Y-%m-%d")
+            to_date = now_ist.date().isoformat()
         if from_date is None:
             # Default: last 200 candles worth of data
             days = 200 if interval == "day" else 30
-            from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+            from_date = (now_ist.date() - timedelta(days=days)).isoformat()
 
         url = (
             f"{BASE_URL}/historical-candle/{instrument_key}"
@@ -384,11 +388,25 @@ class UpstoxFetcher:
         df[["open", "high", "low", "close", "volume"]] = df[
             ["open", "high", "low", "close", "volume"]
         ].astype(float)
+        values = df[["open", "high", "low", "close", "volume"]].to_numpy().ravel()
+        if df["ts"].isna().any() or not all(math.isfinite(float(value)) for value in values):
+            raise UpstoxAPIError("Upstox returned non-finite candle data")
+        invalid = (
+            (df[["open", "high", "low", "close"]] <= 0).any(axis=1)
+            | (df["volume"] < 0)
+            | (df["low"] > df["high"])
+            | (df["open"] < df["low"])
+            | (df["open"] > df["high"])
+            | (df["close"] < df["low"])
+            | (df["close"] > df["high"])
+        )
+        if invalid.any() or df["ts"].duplicated().any():
+            raise UpstoxAPIError("Upstox returned inconsistent OHLCV candles")
         return df[["ts", "open", "high", "low", "close", "volume"]]
 
     def get_daily_candles(self, instrument_key: str, days: int = 365) -> pd.DataFrame:
         """Convenience: fetch daily OHLCV for last N days."""
-        from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        from_date = (datetime.now(IST).date() - timedelta(days=days)).isoformat()
         return self.get_historical_candles(instrument_key, "day", from_date)
 
     def get_full_market_quotes(
@@ -430,19 +448,25 @@ class UpstoxFetcher:
                 required = ("open", "high", "low", "close", "volume", "ts")
                 if any(ohlc.get(field) is None for field in required):
                     continue
-                result[key] = {
-                    field: float(ohlc[field]) for field in ("open", "high", "low", "close", "volume")
-                }
-                result[key]["ts"] = int(ohlc["ts"])
-                # Required separately: never silently substitute an OHLC field for LTP.
-                if any(quote.get(field) is None for field in (
-                    "last_price", "prev_close_price", "last_trade_time"
-                )):
-                    result.pop(key, None)
+                try:
+                    mapped = {
+                        field: float(ohlc[field])
+                        for field in ("open", "high", "low", "close", "volume")
+                    }
+                    mapped["ts"] = int(ohlc["ts"])
+                    # Required separately: never substitute an OHLC field for LTP.
+                    if any(quote.get(field) is None for field in (
+                        "last_price", "prev_close_price", "last_trade_time"
+                    )):
+                        continue
+                    mapped["last_price"] = float(quote["last_price"])
+                    mapped["prev_close_price"] = float(quote["prev_close_price"])
+                    mapped["last_trade_time"] = int(quote["last_trade_time"])
+                except (TypeError, ValueError, OverflowError):
+                    # Treat a malformed instrument record like an omitted symbol;
+                    # the scanner reports it and applies the global coverage gate.
                     continue
-                result[key]["last_price"] = float(quote["last_price"])
-                result[key]["prev_close_price"] = float(quote["prev_close_price"])
-                result[key]["last_trade_time"] = int(quote["last_trade_time"])
+                result[key] = mapped
         missing = expected - result.keys()
         if missing and not allow_missing:
             raise IncompleteQuoteBatch(set(missing))
@@ -452,7 +476,7 @@ class UpstoxFetcher:
         self, instrument_key: str, interval: str = "30minute"
     ) -> pd.DataFrame:
         """Convenience: fetch intraday candles for today."""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now(IST).date().isoformat()
         return self.get_historical_candles(instrument_key, interval, today, today)
 
     # ─── Market Quote (LTP) ─────────────────────────────────────────────────
