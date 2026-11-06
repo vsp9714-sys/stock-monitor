@@ -74,6 +74,7 @@ def load_config() -> dict[str, Any]:
     # Allow environment variable overrides for critical secrets
     _apply_env_overrides(config)
     validate_signal_config(config)
+    validate_candidate_context_config(config)
     return config
 
 
@@ -109,6 +110,33 @@ def validate_signal_config(config: dict[str, Any]) -> None:
         raise ValueError("signals.rsi.oversold_threshold must be below overbought_threshold")
     if bearish >= bullish:
         raise ValueError("signals.rsi.bearish_threshold must be below bullish_threshold")
+
+
+def validate_candidate_context_config(config: dict[str, Any]) -> None:
+    """Validate deterministic filters and optional contextual data policies."""
+    universe = config.get("universe", {}) or {}
+    tradability = universe.get("tradability", {}) or {}
+    try:
+        sessions = int(tradability.get("average_traded_value_sessions", 20))
+        observations = int(tradability.get("minimum_observations", sessions))
+        minimum_value = float(tradability.get("minimum_average_traded_value_inr", 10_000_000))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("universe.tradability thresholds must be numeric") from exc
+    if sessions < 1 or observations < 1 or observations > sessions or minimum_value < 0:
+        raise ValueError("universe.tradability requires positive sessions, 1..sessions observations, and non-negative INR threshold")
+    if tradability.get("unknown_policy", "exclude") not in {"exclude", "include"}:
+        raise ValueError("universe.tradability.unknown_policy must be 'exclude' or 'include'")
+
+    context = config.get("market_context", {}) or {}
+    if context.get("mode", "informational") not in {"informational", "filter"}:
+        raise ValueError("market_context.mode must be 'informational' or 'filter'")
+    if context.get("filter_unknown_policy", "exclude") not in {"exclude", "include"}:
+        raise ValueError("market_context.filter_unknown_policy must be 'exclude' or 'include'")
+    short_window = int(context.get("short_sma_sessions", 20))
+    long_window = int(context.get("long_sma_sessions", 50))
+    lookback = int(context.get("lookback_sessions", 20))
+    if min(short_window, long_window, lookback) < 2 or short_window > long_window:
+        raise ValueError("market_context windows must be >=2 and short_sma_sessions <= long_sma_sessions")
 
 
 def _apply_env_overrides(config: dict) -> None:

@@ -98,6 +98,16 @@ class UniverseSelector:
         self.get_source = get_source or self._get_source
         self.settings = cfg.get("universe", {})
 
+    def get_fno_underlyings(self, today: date) -> tuple[set[str], dict]:
+        """Load authoritative daily NSE stock F&O eligibility for optional OI context."""
+        try:
+            symbols, metadata = self._load_source(
+                "fno_eligible", today, NSE_FNO_URL, parse_fno_lots_csv, allow_refresh=True
+            )
+            return set(symbols), metadata
+        except UniverseSelectionError as exc:
+            return set(), {"available": False, "source": NSE_FNO_URL, "source_error": str(exc)}
+
     @staticmethod
     def _get_source(url: str) -> bytes:
         response = requests.get(

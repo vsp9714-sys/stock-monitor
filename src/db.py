@@ -84,6 +84,15 @@ class Fundamental(Base):
     __table_args__ = (UniqueConstraint("symbol", name="uq_fundamentals_symbol"),)
 
 
+class MarketContextCache(Base):
+    """Small persistent cache for benchmark and sector index daily candles."""
+    __tablename__ = "market_context_cache"
+
+    context_key = Column(String(120), primary_key=True)
+    candles_json = Column(Text, nullable=False)
+    fetched_at = Column(DateTime, nullable=False)
+
+
 class OHLCVCache(Base):
     """Rolling OHLCV candle cache — keeps last N candles per symbol per interval."""
     __tablename__ = "ohlcv_cache"

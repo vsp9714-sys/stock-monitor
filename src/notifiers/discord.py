@@ -57,6 +57,24 @@ class DiscordNotifier(BaseNotifier):
         if payload.sector:
             fields.append({"name": "Sector", "value": payload.sector, "inline": True})
 
+        if payload.fundamentals_fetched_at or payload.fundamentals_freshness != "unavailable":
+            age = f"{payload.fundamentals_cache_age_hours:.1f}h" if payload.fundamentals_cache_age_hours is not None else "unknown age"
+            fields.append({"name": "Fundamentals data", "value": f"{payload.fundamentals_freshness} · {payload.fundamentals_data_basis} · {age} · fetched {payload.fundamentals_fetched_at or 'unknown'}", "inline": False})
+        if payload.market_regime or payload.market_relative_strength_pct is not None:
+            rel = f"{payload.market_relative_strength_pct:+.2f}% vs Nifty 50" if payload.market_relative_strength_pct is not None else "unavailable"
+            fields.append({"name": "Market context", "value": f"{payload.market_regime or 'unavailable'} · relative strength {rel}", "inline": True})
+        if payload.sector_regime or payload.sector_relative_strength_pct is not None:
+            rel = f"{payload.sector_relative_strength_pct:+.2f}%" if payload.sector_relative_strength_pct is not None else "unavailable"
+            fields.append({"name": "Sector context", "value": f"{payload.sector_regime or 'unavailable'} · relative strength {rel}", "inline": True})
+        if payload.derivatives_context:
+            oi = payload.derivatives_context
+            if oi.get("status") == "available":
+                oi_change = f"{oi['total_oi_change_pct']:+.1f}%" if oi.get("total_oi_change_pct") is not None else "unavailable"
+                value = f"Expiry {oi.get('expiry')}; PCR {oi.get('put_call_oi_ratio'):.2f}; OI change {oi_change}; retrieved {oi.get('retrieved_at')}"
+            else:
+                value = f"Unavailable ({oi.get('reason', 'unknown')})"
+            fields.append({"name": "Options OI", "value": value, "inline": False})
+
         if payload.pe_ratio is not None:
             fields.append({"name": "P/E", "value": f"{payload.pe_ratio:.1f}x", "inline": True})
         if payload.roe is not None:

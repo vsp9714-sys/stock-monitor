@@ -115,6 +115,39 @@ class TelegramNotifier(BaseNotifier):
             if payload.industry and payload.industry != payload.sector:
                 sec_text += f" ({payload.industry})"
             lines.append(f"🏭 Sector: {sec_text}")
+        if payload.fundamentals_fetched_at or payload.fundamentals_freshness != "unavailable":
+            age = f"{payload.fundamentals_cache_age_hours:.1f}h" if payload.fundamentals_cache_age_hours is not None else "unknown age"
+            lines.append(
+                f"🧾 Fundamentals: {html.escape(payload.fundamentals_freshness)} · "
+                f"{html.escape(payload.fundamentals_data_basis)} · {age} · "
+                f"fetched {html.escape(payload.fundamentals_fetched_at or 'unknown')}"
+            )
+        if payload.market_regime or payload.market_relative_strength_pct is not None:
+            strength = (
+                f" · relative strength {payload.market_relative_strength_pct:+.2f}% vs Nifty 50"
+                if payload.market_relative_strength_pct is not None else ""
+            )
+            lines.append(f"🌐 Market regime: {html.escape(payload.market_regime or 'unavailable')}{strength}")
+        if payload.sector_regime or payload.sector_relative_strength_pct is not None:
+            strength = (
+                f" · relative strength {payload.sector_relative_strength_pct:+.2f}% vs sector index"
+                if payload.sector_relative_strength_pct is not None else ""
+            )
+            lines.append(f"🏭 Sector regime: {html.escape(payload.sector_regime or 'unavailable')}{strength}")
+        if payload.derivatives_context:
+            oi = payload.derivatives_context
+            if oi.get("status") == "available":
+                lines.append(
+                    f"📊 Options OI ({html.escape(str(oi.get('expiry')))}): "
+                    f"PCR {float(oi['put_call_oi_ratio']):.2f} · "
+                    f"total OI change {float(oi['total_oi_change_pct']):+.1f}% · "
+                    f"retrieved {html.escape(str(oi.get('retrieved_at', 'unknown')))}"
+                    if oi.get("total_oi_change_pct") is not None else
+                    f"📊 Options OI ({html.escape(str(oi.get('expiry')))}): PCR {float(oi['put_call_oi_ratio']):.2f} · "
+                    f"retrieved {html.escape(str(oi.get('retrieved_at', 'unknown')))}"
+                )
+            elif oi.get("status") == "unavailable":
+                lines.append(f"📊 Options OI: unavailable ({html.escape(str(oi.get('reason', 'unknown')))}).")
         if payload.pe_ratio is not None:
             lines.append(f"📐 P/E Ratio: <b>{payload.pe_ratio:.1f}x</b>")
         if payload.pb_ratio is not None:
