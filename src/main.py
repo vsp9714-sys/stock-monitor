@@ -106,6 +106,7 @@ def run_scan_job() -> None:
     logger.info(f"[{next_scan_time()}] Running scheduled scan...")
     try:
         summary = scanner.run_scan()
+        logger.info("Scan universe provenance: %s", summary.universe_metadata)
         if summary.complete:
             logger.info(
                 "Scan complete: %s/%s evaluated; %s alerts dispatched.",
@@ -129,6 +130,22 @@ def refresh_instruments_job() -> None:
         logger.info(f"Instrument master refreshed: {count} stocks.")
     except Exception as e:
         logger.error(f"Instrument refresh failed: {e}", exc_info=True)
+
+
+def refresh_universe_job() -> None:
+    """Resolve and persist today's configured membership before the scan window."""
+    try:
+        stocks = scanner.get_active_stocks()
+        logger.info(
+            "Configured universe prepared before scans: mode=%s counts=%s selected=%s metadata=%s",
+            scanner._last_universe_metadata.get("mode"),
+            {key: scanner._last_universe_metadata.get(key)
+             for key in ("constituent_count", "custom_count", "fno_count")},
+            len(stocks), scanner._last_universe_metadata,
+        )
+    except Exception as e:
+        logger.error("Configured universe refresh failed; scan will fail closed if unresolved: %s",
+                     e, exc_info=True)
 
 
 def refresh_daily_cache_job() -> None:
@@ -198,8 +215,9 @@ def main() -> None:
     # Schedule: scan every N minutes
     schedule.every(scan_interval).minutes.do(run_scan_job)
 
-    # Schedule: refresh instruments daily at 08:30 server-local time.
-    schedule.every().day.at("08:30").do(refresh_instruments_job)
+    # Prepare instruments and configured membership before the market opens.
+    schedule.every().day.at("08:15", "Asia/Kolkata").do(refresh_instruments_job)
+    schedule.every().day.at("08:30", "Asia/Kolkata").do(refresh_universe_job)
 
     # At 06:00 IST on weekdays, probe Upstox's latest completed session and
     # refresh it if ready. Otherwise retain the existing confirmed cache.
