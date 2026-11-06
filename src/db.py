@@ -8,6 +8,7 @@ Manages:
   - signal_log     : full historical signal log
 """
 import logging
+import json
 from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Optional
@@ -275,13 +276,42 @@ def upsert_signal(session: Session, symbol: str, signal_date: date, signal_type:
         .first()
     )
     if existing:
+        old_detail = _parse_indicator_detail(existing.indicator_detail)
+        new_detail = _parse_indicator_detail(indicator_detail)
         old_score = int(existing.indicator_value or 0)
+        old_version = int(old_detail.get("score_version", 1) or 1)
+        new_version = int(new_detail.get("score_version", 1) or 1)
+        migrated = None
+        if old_version < 2 <= new_version:
+            migrated = _derive_legacy_group_snapshot(old_detail, existing.direction)
+            if migrated is not None:
+                old_score = migrated["score"]
+                # Delivery scores used to be raw indicator counts. Normalize
+                # them with the exact same legacy snapshot before comparing
+                # new group-score escalations.
+                for delivery in session.query(SignalDelivery).filter_by(signal_id=existing.id):
+                    delivery.last_sent_score = migrated["score"]
         new_score = int(indicator_value or 0)
-        if new_score >= old_score:
+        if new_score >= old_score or old_version < new_version:
             existing.direction = direction
             existing.price = price
-            existing.indicator_value = indicator_value
-            existing.indicator_detail = indicator_detail
+            if new_score >= old_score:
+                existing.indicator_value = indicator_value
+                existing.indicator_detail = indicator_detail
+            else:
+                # Store the legacy snapshot on the new group-score scale; this
+                # avoids treating a lower group score as a regression from a
+                # larger raw-check count on the next scan.
+                old_detail.update({
+                    "score_version": new_version,
+                    "confluence_score": old_score,
+                    "total_signals": migrated["total_groups"] if migrated else old_detail.get("total_signals", 0),
+                    "group_votes": migrated["group_votes"] if migrated else {},
+                    "confluence_mode": "legacy-score-migrated",
+                    "legacy_score_migrated": True,
+                })
+                existing.indicator_value = float(old_score)
+                existing.indicator_detail = json.dumps(old_detail, separators=(",", ":"))
             existing.chart_path = chart_path
             if new_score > old_score:
                 existing.notified = False
@@ -303,6 +333,52 @@ def upsert_signal(session: Session, symbol: str, signal_date: date, signal_type:
     session.add(sig)
     session.commit()
     return sig
+
+
+def _parse_indicator_detail(value: Optional[str]) -> dict:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _derive_legacy_group_snapshot(detail: dict, direction: Optional[str]) -> Optional[dict]:
+    """Convert a pre-v2 raw-check snapshot to the new independent-group scale."""
+    checks = detail.get("checks")
+    if not isinstance(checks, list):
+        return None
+    groups: dict[str, set[str]] = {}
+    for check in checks:
+        if not isinstance(check, dict) or not check.get("met"):
+            continue
+        check_direction = check.get("direction")
+        if check_direction not in {"BUY", "SELL"}:
+            continue
+        signal_type = str(check.get("signal_type", ""))
+        if signal_type.startswith("ema_"):
+            group = "trend"
+        elif signal_type in {"rsi", "macd"}:
+            group = "momentum"
+        elif signal_type == "volume_breakout":
+            group = "participation"
+        else:
+            continue
+        groups.setdefault(group, set()).add(check_direction)
+    if not groups:
+        return None
+    votes = {
+        group: next(iter(directions))
+        for group, directions in groups.items()
+        if len(directions) == 1
+    }
+    return {
+        "score": sum(1 for vote in votes.values() if vote == direction),
+        "total_groups": len(groups),
+        "group_votes": votes,
+    }
 
 
 def mark_signal_notified(session: Session, signal_id: int) -> None:
@@ -349,7 +425,9 @@ def seed_legacy_deliveries(session: Session, destinations: list[str]) -> None:
     # chat. A newly enabled group has never received these historical alerts.
     legacy_destinations = [target for target in destinations if target != "telegram:group"]
     for sig in legacy_signals:
-        score = int(sig.indicator_value or 0)
+        detail = _parse_indicator_detail(sig.indicator_detail)
+        migrated = _derive_legacy_group_snapshot(detail, sig.direction)
+        score = migrated["score"] if migrated is not None else int(sig.indicator_value or 0)
         for destination in legacy_destinations:
             if get_delivery_score(session, sig.id, destination) is None:
                 mark_delivery_sent(session, sig.id, destination, score)

@@ -68,7 +68,7 @@ class TelegramNotifier(BaseNotifier):
             payload.cap_category or "", "📊"
         )
 
-        confluence_tag = f" ({payload.confluence_score}/{payload.total_signals} Confluence)" if payload.total_signals > 1 else ""
+        confluence_tag = f" ({payload.confluence_score}/{payload.total_signals} groups)" if payload.total_signals > 1 else ""
 
         lines = [
             f"{direction_emoji} <b>{payload.symbol}</b> — {payload.direction} Signal{confluence_tag}",
@@ -83,7 +83,10 @@ class TelegramNotifier(BaseNotifier):
         # Multi-signal check list
         if payload.checks:
             lines.append("")
-            lines.append(f"🎯 <b>Signal Confluence ({payload.confluence_score}/{payload.total_signals} Met)</b>")
+            lines.append(
+                f"🎯 <b>Independent Groups ({payload.confluence_score}/{payload.total_signals}; "
+                f"{html.escape(payload.confluence_mode)} mode)</b>"
+            )
             for chk in payload.checks:
                 name_esc = html.escape(str(chk.get('name', '')))
                 desc_esc = html.escape(str(chk.get('description', '')))
@@ -230,7 +233,7 @@ class TelegramNotifier(BaseNotifier):
         text_sent = self._send_message(detail_msg, chat_id)
         photo_sent = False
         if send_chart and self.send_chart_cfg and payload.chart_path and Path(payload.chart_path).exists():
-            confluence_tag = f" ({payload.confluence_score}/{payload.total_signals} Confluence)" if payload.total_signals > 1 else ""
+            confluence_tag = f" ({payload.confluence_score}/{payload.total_signals} groups)" if payload.total_signals > 1 else ""
             caption = (
                 f"{('🟢' if payload.direction == 'BUY' else '🔴')} "
                 f"<b>{payload.symbol}</b> — {payload.direction} Signal{confluence_tag}\n"

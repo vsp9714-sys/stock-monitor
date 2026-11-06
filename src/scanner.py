@@ -53,6 +53,7 @@ from src.notifiers.base import AlertPayload, BaseNotifier
 from src.signals.ema_cross import detect_ema_crossover
 from src.signals.macd import detect_macd_signal
 from src.signals.rsi import detect_rsi_signal
+from src.signals.confluence import evaluate_confluence
 from src.signals.volume_breakout import detect_volume_breakout
 from src.universe import UniverseSelectionError, UniverseSelector
 from src.market_calendar import CalendarUnavailable, IST, is_market_open, is_trading_day
@@ -180,6 +181,8 @@ class Scanner:
         self.signal_cfg = self.cfg.get("signals", {})
         self.universe_cfg = self.cfg.get("universe", {})
         self.confluence_cfg = self.cfg.get("confluence", {})
+        from src.config_loader import validate_signal_config
+        validate_signal_config(self.cfg)
         self.universe_selector = UniverseSelector(self.cfg, get_session)
         self._last_universe_metadata = {}
 
@@ -660,26 +663,25 @@ class Scanner:
                     period=rsi_cfg.get("period", 14),
                     oversold=oversold,
                     overbought=overbought,
+                    mode=rsi_cfg.get("mode", "mean_reversion"),
+                    confirmation=rsi_cfg.get("confirmation", "level"),
+                    bullish_threshold=rsi_cfg.get("bullish_threshold", 55),
+                    bearish_threshold=rsi_cfg.get("bearish_threshold", 45),
                 )
                 rsi_val = rsi_result.rsi_value
-                if rsi_result.triggered:
-                    checks.append({
-                        "name": "RSI (14)",
-                        "signal_type": "rsi",
-                        "met": True,
-                        "direction": rsi_result.direction,
-                        "value_text": f"RSI {rsi_val:.1f}",
-                        "description": f"Oversold (≤ {oversold})" if rsi_result.direction == "BUY" else f"Overbought (≥ {overbought})",
-                    })
-                else:
-                    checks.append({
-                        "name": "RSI (14)",
-                        "signal_type": "rsi",
-                        "met": False,
-                        "direction": None,
-                        "value_text": f"RSI {rsi_val:.1f}",
-                        "description": "Neutral (30–70)",
-                    })
+                checks.append({
+                    "name": f"RSI ({rsi_cfg.get('period', 14)})",
+                    "signal_type": "rsi",
+                    "event_met": rsi_result.event_triggered,
+                    "event_direction": rsi_result.event_direction,
+                    "state_met": rsi_result.trend_direction is not None,
+                    "state_direction": rsi_result.trend_direction,
+                    "met": rsi_result.triggered,
+                    "direction": rsi_result.direction,
+                    "value_text": f"RSI {rsi_val:.1f}",
+                    "description": rsi_result.trigger_reason or "No selected RSI trigger",
+                    "rsi_mode": rsi_result.mode,
+                })
 
             # ── 2. MACD Check ───────────────────────────────────────────
             if self.signal_cfg.get("macd", {}).get("enabled", True):
@@ -694,6 +696,16 @@ class Scanner:
                     checks.append({
                         "name": "MACD (12,26,9)",
                         "signal_type": "macd",
+                        "event_met": macd_result.triggered,
+                        "event_direction": macd_result.direction,
+                        "state_met": pd.notna(macd_result.macd_value) and pd.notna(macd_result.signal_value)
+                                    and macd_result.macd_value != macd_result.signal_value,
+                        "state_direction": (
+                            "BUY" if pd.notna(macd_result.macd_value) and pd.notna(macd_result.signal_value)
+                            and macd_result.macd_value > macd_result.signal_value else
+                            "SELL" if pd.notna(macd_result.macd_value) and pd.notna(macd_result.signal_value)
+                            and macd_result.macd_value < macd_result.signal_value else None
+                        ),
                         "met": True,
                         "direction": macd_result.direction,
                         "value_text": f"MACD {macd_result.macd_value:.2f}",
@@ -703,6 +715,16 @@ class Scanner:
                     checks.append({
                         "name": "MACD (12,26,9)",
                         "signal_type": "macd",
+                        "event_met": False,
+                        "event_direction": None,
+                        "state_met": pd.notna(macd_result.macd_value) and pd.notna(macd_result.signal_value)
+                                    and macd_result.macd_value != macd_result.signal_value,
+                        "state_direction": (
+                            "BUY" if pd.notna(macd_result.macd_value) and pd.notna(macd_result.signal_value)
+                            and macd_result.macd_value > macd_result.signal_value else
+                            "SELL" if pd.notna(macd_result.macd_value) and pd.notna(macd_result.signal_value)
+                            and macd_result.macd_value < macd_result.signal_value else None
+                        ),
                         "met": False,
                         "direction": None,
                         "value_text": f"Hist {macd_result.histogram:+.2f}",
@@ -720,6 +742,10 @@ class Scanner:
                         checks.append({
                             "name": chk_name,
                             "signal_type": f"ema_{fast_p}x{slow_p}",
+                            "event_met": False,
+                            "event_direction": None,
+                            "state_met": False,
+                            "state_direction": None,
                             "met": False,
                             "direction": None,
                             "value_text": "N/A",
@@ -732,6 +758,10 @@ class Scanner:
                         checks.append({
                             "name": chk_name,
                             "signal_type": f"ema_{fast_p}x{slow_p}",
+                            "event_met": True,
+                            "event_direction": ema_res.direction,
+                            "state_met": ema_res.fast_ema_value != ema_res.slow_ema_value,
+                            "state_direction": "BUY" if ema_res.fast_ema_value > ema_res.slow_ema_value else "SELL",
                             "met": True,
                             "direction": ema_res.direction,
                             "value_text": f"₹{ema_res.fast_ema_value:.1f} vs ₹{ema_res.slow_ema_value:.1f}",
@@ -741,6 +771,10 @@ class Scanner:
                         checks.append({
                             "name": chk_name,
                             "signal_type": f"ema_{fast_p}x{slow_p}",
+                            "event_met": False,
+                            "event_direction": None,
+                            "state_met": ema_res.fast_ema_value != ema_res.slow_ema_value,
+                            "state_direction": "BUY" if ema_res.fast_ema_value > ema_res.slow_ema_value else "SELL",
                             "met": False,
                             "direction": None,
                             "value_text": f"₹{ema_res.fast_ema_value:.1f} ({rel})",
@@ -748,17 +782,7 @@ class Scanner:
                         })
 
             # ── 4. Volume Breakout Check ────────────────────────────────
-            if provisional:
-                checks.append({
-                    "name": "Volume Breakout",
-                    "signal_type": "volume_breakout",
-                    "met": False,
-                    "direction": None,
-                    "value_text": "Unavailable",
-                    "description": "Intraday volume baseline deferred to Batch B",
-                    "availability": "unavailable",
-                })
-            elif self.signal_cfg.get("volume_breakout", {}).get("enabled", True):
+            if self.signal_cfg.get("volume_breakout", {}).get("enabled", True):
                 vol_cfg = self.signal_cfg["volume_breakout"]
                 vol_result = detect_volume_breakout(
                     stock.symbol, df,
@@ -771,64 +795,63 @@ class Scanner:
                         checks.append({
                             "name": "Volume Breakout",
                             "signal_type": "volume_breakout",
+                            "event_met": True,
+                            "event_direction": vol_result.direction,
+                            "state_met": True,
+                            "state_direction": vol_result.direction,
                             "met": True,
                             "direction": vol_result.direction,
                             "value_text": f"{vol_ratio:.1f}× Avg Vol",
-                            "description": "Bullish Breakout" if vol_result.direction == "BUY" else "Bearish Breakdown",
+                            "description": (
+                                ("Bullish Breakout" if vol_result.direction == "BUY" else "Bearish Breakdown")
+                                + (" (partial-session volume vs full-day history)" if provisional else "")
+                            ),
                         })
                     else:
                         checks.append({
                             "name": "Volume Breakout",
                             "signal_type": "volume_breakout",
+                            "event_met": False,
+                            "event_direction": None,
+                            "state_met": False,
+                            "state_direction": None,
                             "met": False,
                             "direction": None,
                             "value_text": f"{vol_ratio:.1f}× Avg Vol",
-                            "description": "Spike (No Price Breakout)",
+                            "description": (
+                                "Spike (No Price Breakout)"
+                                + (" (partial-session volume vs full-day history)" if provisional else "")
+                            ),
                         })
                 else:
                     checks.append({
                         "name": "Volume Breakout",
                         "signal_type": "volume_breakout",
+                        "event_met": False,
+                        "event_direction": None,
+                        "state_met": False,
+                        "state_direction": None,
                         "met": False,
                         "direction": None,
                         "value_text": f"{vol_ratio:.1f}× Avg Vol",
-                        "description": "Normal Volume",
+                        "description": (
+                            "Normal Volume (partial-session volume vs full-day history)"
+                            if provisional else "Normal Volume"
+                        ),
                     })
 
             # ── Evaluate Confluence ─────────────────────────────────────
-            buy_met = [c for c in checks if c["met"] and c["direction"] == "BUY"]
-            sell_met = [c for c in checks if c["met"] and c["direction"] == "SELL"]
-
-            min_signals = self.confluence_cfg.get("min_signals_to_alert", 2)
-            direction_consensus = self.confluence_cfg.get("direction_consensus", True)
-
-            if len(buy_met) > len(sell_met):
-                consensus_dir = "BUY"
-                met_count = len(buy_met)
-                conflicting_count = len(sell_met)
-            elif len(sell_met) > len(buy_met):
-                consensus_dir = "SELL"
-                met_count = len(sell_met)
-                conflicting_count = len(buy_met)
-            else:
-                consensus_dir = None
-                met_count = 0
-                conflicting_count = 0
-
-            # Discard if no consensus direction
+            confluence = evaluate_confluence(
+                checks,
+                mode=self.confluence_cfg.get("mode", "crossover"),
+                minimum_groups=self.confluence_cfg.get(
+                    "min_groups_to_alert", self.confluence_cfg.get("min_signals_to_alert", 2)
+                ),
+                direction_consensus=self.confluence_cfg.get("direction_consensus", True),
+            )
+            consensus_dir = confluence["direction"]
+            met_count = confluence["score"]
             if consensus_dir is None:
-                return None, df
-
-            # Discard if there are conflicting BUY vs SELL signals
-            if direction_consensus and conflicting_count > 0:
-                logger.debug(
-                    f"{stock.symbol}: Skipping due to conflicting signals "
-                    f"({len(buy_met)} BUY vs {len(sell_met)} SELL)"
-                )
-                return None, df
-
-            # Check if confluence threshold is reached
-            if met_count < min_signals:
                 return None, df
 
             # Confluence criteria satisfied!
@@ -837,9 +860,13 @@ class Scanner:
                 "company_name": stock.company_name or stock.symbol,
                 "direction": consensus_dir,
                 "confluence_score": met_count,
-                "total_signals": len(checks),
+                "total_signals": confluence["total_groups"],
+                "group_votes": confluence["group_votes"],
+                "conflicting_groups": confluence["conflicting_groups"],
+                "confluence_mode": self.confluence_cfg.get("mode", "crossover"),
+                "score_version": 2,
                 "price": current_price,
-                "checks": checks,
+                "checks": confluence["checks"],
                 "signal_type": (
                     f"provisional_intraday_confluence_{consensus_dir.lower()}"
                     if provisional else f"confluence_{consensus_dir.lower()}"
@@ -1121,6 +1148,12 @@ class Scanner:
                                 "quote_timestamp": res.get("quote_timestamp"),
                                 "confluence_score": res["confluence_score"],
                                 "total_signals": res["total_signals"],
+                                "group_votes": res.get("group_votes", {}),
+                                "conflicting_groups": res.get("conflicting_groups", []),
+                                "confluence_mode": res.get(
+                                    "confluence_mode", getattr(self, "confluence_cfg", {}).get("mode", "crossover")
+                                ),
+                                "score_version": res.get("score_version", 1),
                                 "checks": res["checks"],
                             }),
                             chart_path=chart_path,
@@ -1146,6 +1179,11 @@ class Scanner:
                             bar_status="provisional" if provisional else "confirmed_daily_cache",
                             confluence_score=saved_score,
                             total_signals=saved_total,
+                            confluence_mode=saved_detail.get(
+                                "confluence_mode", res.get(
+                                    "confluence_mode", getattr(self, "confluence_cfg", {}).get("mode", "crossover")
+                                )
+                            ),
                             checks=saved_checks,
                             chart_path=saved.chart_path,
                             mcap_cr=fund.get("mcap_cr") if fund else None,
@@ -1166,7 +1204,7 @@ class Scanner:
                         if self._dispatch_alert(payload, db, saved.id):
                             new_signal_count += 1
                             logger.info(
-                                "Confluence alert/update dispatched for %s: %s (%s/%s checks)",
+                                "Confluence alert/update dispatched for %s: %s (%s/%s groups)",
                                 stock.symbol, res["direction"], saved_score, saved_total,
                             )
                     except Exception as exc:

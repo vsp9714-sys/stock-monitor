@@ -36,8 +36,16 @@ signals:
   rsi:
     enabled: true
     period: 14
+    # mean_reversion keeps the former <=30 / >=70 rule. trend_momentum uses
+    # the configured 55 / 45 RSI state thresholds and can be selected explicitly.
+    mode: "mean_reversion"
+    # level preserves the former behavior; cross_back waits for re-entry from
+    # an extreme. Crossover confluence independently requires a fresh event.
+    confirmation: "level"
     oversold_threshold: 30       # RSI below this → BUY signal
     overbought_threshold: 70     # RSI above this → SELL signal
+    bullish_threshold: 55
+    bearish_threshold: 45
 
   macd:
     enabled: true
@@ -62,12 +70,14 @@ signals:
 
 # ─── Signal Confluence ────────────────────────────────────────────────────────
 confluence:
-  # Minimum number of signals that must agree to trigger an alert
-  # Set to 2 or 3 depending on desired signal selectivity
-  min_signals_to_alert: 2
+  # Minimum independent groups: trend (EMA family), momentum (RSI/MACD),
+  # participation (volume). Same-group checks contribute at most one vote.
+  min_groups_to_alert: 2
   # Require unanimous direction consensus (discards stocks with conflicting BUY vs SELL signals)
   direction_consensus: true
-  # Mode: "crossover" (checks only crossover/breakout triggers) or "trend" (allows trend continuation)
+  # crossover uses fresh events; trend allows continuation from aligned EMA/MACD
+  # states and RSI's configured bullish/bearish state thresholds. Volume breakout
+  # remains event-based.
   mode: "crossover"
 
 # ─── Stock Universe ──────────────────────────────────────────────────────────

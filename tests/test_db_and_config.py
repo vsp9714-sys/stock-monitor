@@ -103,6 +103,28 @@ def test_confluence_signal_updates_to_highest_score_without_regression(test_db_s
     assert stale.price == 103.0
 
 
+def test_confluence_score_upgrade_migrates_legacy_raw_and_delivery_scores(test_db_session):
+    today = date(2026, 10, 20)
+    legacy_detail = '{"confluence_score":3,"total_signals":5,"checks":[' \
+        '{"signal_type":"ema_9x21","met":true,"direction":"BUY"},' \
+        '{"signal_type":"ema_21x50","met":true,"direction":"BUY"},' \
+        '{"signal_type":"ema_50x200","met":true,"direction":"BUY"},' \
+        '{"signal_type":"volume_breakout","met":false,"direction":null}]}'
+    signal = upsert_signal(test_db_session, "RELIANCE", today, "confluence_buy", "BUY",
+                           100.0, 3.0, legacy_detail)
+    mark_delivery_sent(test_db_session, signal.id, "telegram:individual", 3)
+
+    upgraded = upsert_signal(
+        test_db_session, "RELIANCE", today, "confluence_buy", "BUY", 101.0, 2.0,
+        '{"score_version":2,"confluence_score":2,"total_signals":3,"checks":[]}',
+    )
+    detail = __import__("json").loads(upgraded.indicator_detail)
+    assert upgraded.id == signal.id
+    assert upgraded.indicator_value == 2.0
+    assert detail["score_version"] == 2
+    assert get_delivery_score(test_db_session, signal.id, "telegram:individual") == 1
+
+
 def test_delivery_escalation_is_per_destination_and_score(test_db_session):
     sig = upsert_signal(test_db_session, "INFY", date(2026, 10, 20), "confluence_buy", "BUY",
                         100.0, 2.0, "{}")

@@ -125,7 +125,7 @@ To intentionally send one manual alert sweep of the configured universe (uses th
 
 The command prints a JSON summary and exits nonzero if the scan is incomplete. Batch/API failures, mixed quote sessions, malformed OHLCV, or coverage below `scan.min_coverage` fail closed and dispatch no alerts. Individual missing-quote symbols and shares with less than the required daily history are skipped; alerts are eligible only if the configured minimum coverage is still met.
 
-Confirmed confluence signals use completed daily candles from SQLite. During an open NSE session, the scanner may also evaluate a **separate provisional intraday confluence** by appending the quote's current-session OHLC to an in-memory copy of completed history. Provisional alerts have a distinct signal type/deduplication key and are explicitly labelled with the session date and quote time; they are not finalized daily bars and are never written into `ohlcv_cache`. Intraday cumulative volume is excluded from provisional scoring until a time-of-day comparable baseline is implemented (Batch B item 3). The scanner validates quote freshness, price/volume ranges, OHLC consistency, cached candle integrity, and exchange-session dates before evaluation. `scan.min_coverage` defaults to `0.95` (95% of the configured universe must be evaluable); below that threshold the sweep sends no alerts.
+Confirmed confluence signals use completed daily candles from SQLite. During an open NSE session, the scanner may also evaluate a **separate provisional intraday confluence** by appending the quote's current-session OHLC to an in-memory copy of completed history. Provisional alerts have a distinct signal type/deduplication key and are explicitly labelled with the session date and quote time; they are not finalized daily bars and are never written into `ohlcv_cache`. Provisional cumulative volume is compared with the existing average of complete prior-day volumes; this is a coarse comparison, not a time-of-day-adjusted baseline. The scanner validates quote freshness, price/volume ranges, OHLC consistency, cached candle integrity, and exchange-session dates before evaluation. `scan.min_coverage` defaults to `0.95` (95% of the configured universe must be evaluable); below that threshold the sweep sends no alerts.
 
 Market hours and session dates use `Asia/Kolkata` and the checked-in NSE Capital Market calendar in `config/nse_trading_calendar.yaml`. The file is versioned by year and cites the official circular at its header. Unknown years fail closed until their official calendar is added. Special sessions remain closed unless explicit hours are configured.
 
@@ -173,10 +173,25 @@ stock-monitor/
 
 ## Signals Reference
 
+RSI can run in `mean_reversion` mode (the legacy oversold/overbought levels) or
+`trend_momentum` mode (configured bullish/bearish RSI thresholds). In
+`mean_reversion`, `confirmation: level` preserves the prior behavior, while
+`cross_back` waits for RSI to re-enter the range. The checked-in config
+explicitly selects the legacy mean-reversion policy.
+
+Confluence scores count independent groups, not individual checks: EMA pairs
+form the **trend** group, RSI and MACD form **momentum**, and volume breakout
+forms **participation**. Several EMA crosses can explain the trend vote but
+cannot create multiple votes. `min_groups_to_alert` defaults to 2. In
+`crossover` mode only fresh events count; in `trend` mode aligned EMA/MACD/RSI
+states can count as continuation, while volume remains event-based. Opposing
+group votes are rejected when `direction_consensus` is enabled. Alerts show
+the group score and raw checks so the result remains auditable.
+
 | Signal | Type | Trigger |
 |--------|------|---------|
-| RSI Oversold | BUY | RSI < 30 |
-| RSI Overbought | SELL | RSI > 70 |
+| RSI Oversold | BUY | Mean reversion: RSI at/below configured threshold (or crosses back above it if selected) |
+| RSI Overbought | SELL | Mean reversion: RSI at/above configured threshold (or crosses back below it if selected) |
 | MACD Bullish Cross | BUY | MACD crosses above signal line |
 | MACD Bearish Cross | SELL | MACD crosses below signal line |
 | EMA 9×21 Bullish | BUY | 9 EMA crosses above 21 EMA |

@@ -79,6 +79,47 @@ def test_rsi_overbought_signal():
     assert result.rsi_value > 70.0
 
 
+def test_rsi_trend_momentum_uses_directional_threshold_and_fresh_event():
+    df = _generate_synthetic_ohlcv(60, trend="flat")
+    df.loc[df.index[-5:], "close"] = [df["close"].iloc[-6] + i * 2 for i in range(1, 6)]
+    result = detect_rsi_signal("INFY", df, mode="trend_momentum")
+    assert result.mode == "trend_momentum"
+    assert result.trend_direction == "BUY"
+    assert result.triggered is True
+    assert result.signal_type == "rsi_trend_momentum"
+
+
+def test_rsi_cross_back_waits_for_reentry_after_extreme():
+    import src.signals.rsi as rsi_module
+
+    controlled_rsi = pd.Series([50.0] * 58 + [25.0, 31.0])
+    original_compute = rsi_module.compute_rsi
+    rsi_module.compute_rsi = lambda closes, period: controlled_rsi
+    try:
+        df = _generate_synthetic_ohlcv(60)
+        result = detect_rsi_signal("ABC", df, confirmation="cross_back")
+    finally:
+        rsi_module.compute_rsi = original_compute
+    assert result.triggered is True
+    assert result.direction == "BUY"
+    assert result.event_triggered is True
+
+
+def test_rsi_threshold_equality_is_inclusive_but_persistent_level_is_not_fresh(monkeypatch):
+    import src.signals.rsi as rsi_module
+
+    controlled_rsi = pd.Series([50.0] * 58 + [30.0, 30.0])
+    monkeypatch.setattr(rsi_module, "compute_rsi", lambda closes, period: controlled_rsi)
+    df = _generate_synthetic_ohlcv(60)
+
+    result = detect_rsi_signal("ABC", df, mode="mean_reversion", confirmation="level")
+
+    assert result.triggered is True
+    assert result.direction == "BUY"
+    assert result.rsi_value == 30.0
+    assert result.event_triggered is False
+
+
 def test_macd_bullish_cross():
     # Construct series with clear MACD bullish crossover on last candle
     df = _generate_synthetic_ohlcv(70, trend="down")

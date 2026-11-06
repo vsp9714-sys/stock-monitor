@@ -104,7 +104,7 @@ def test_telegram_message_formatting_confluence():
     )
     msg = notifier._format_message(payload)
     assert "RELIANCE" in msg
-    assert "BUY Signal (3/5 Confluence)" in msg
+    assert "BUY Signal (3/5 groups)" in msg
     assert "✅ <b>RSI (14)</b>: Oversold (≤ 30) (RSI 28.4)" in msg
     assert "✅ <b>MACD (12,26,9)</b>: Bullish Crossover" in msg
     assert "❌ EMA 21×50: No Cross" in msg
