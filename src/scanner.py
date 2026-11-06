@@ -493,7 +493,7 @@ class Scanner:
         now: Optional[datetime] = None,
         checkpoint_symbols: int = 20,
     ) -> dict:
-        """Probe Upstox in the 06:00-07:00 IST window, then refresh the latest completed session.
+        """Probe Upstox at the scheduled 06:00 IST run, then refresh the latest completed session.
 
         A small liquid-symbol readiness probe avoids a full-universe pass while
         the provider is still publishing the prior session. The full pass is

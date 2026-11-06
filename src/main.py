@@ -201,11 +201,9 @@ def main() -> None:
     # Schedule: refresh instruments daily at 08:30 server-local time.
     schedule.every().day.at("08:30").do(refresh_instruments_job)
 
-    # Probe Upstox's latest completed session twice in the requested 06:00-07:00
-    # IST window. The paced full pass starts only when the provider is ready;
-    # otherwise the existing confirmed cache remains available.
-    schedule.every().day.at("06:30", "Asia/Kolkata").do(refresh_daily_cache_job)
-    schedule.every().day.at("06:55", "Asia/Kolkata").do(refresh_daily_cache_job)
+    # At 06:00 IST on weekdays, probe Upstox's latest completed session and
+    # refresh it if ready. Otherwise retain the existing confirmed cache.
+    schedule.every().day.at("06:00", "Asia/Kolkata").do(refresh_daily_cache_job)
 
     logger.info(f"Scheduler started. Scan interval: every {scan_interval} minutes.")
     logger.info("Market hours: 09:15 – 15:30 IST, Mon–Fri")
