@@ -29,6 +29,7 @@ class AlertPayload:
     # Confluence metadata
     confluence_score: int = 1
     total_signals: int = 1
+    confluence_mode: str = "crossover"
     checks: list[dict] = field(default_factory=list)
 
     # Fundamental data (may be None if not available)
@@ -52,9 +53,9 @@ class AlertPayload:
 
     def format_signal_label(self) -> str:
         if self.provisional and self.signal_type.startswith("provisional_intraday_confluence"):
-            return f"PROVISIONAL · Intraday Confluence {self.direction} ({self.confluence_score}/{self.total_signals} checks)"
+            return f"PROVISIONAL · Intraday Confluence {self.direction} ({self.confluence_score}/{self.total_signals} groups; {self.confluence_mode})"
         if self.signal_type.startswith("confluence"):
-            return f"Confluence {self.direction} ({self.confluence_score}/{self.total_signals} Signals Met)"
+            return f"Confluence {self.direction} ({self.confluence_score}/{self.total_signals} groups; {self.confluence_mode})"
         labels = {
             "rsi_oversold": "RSI Oversold",
             "rsi_overbought": "RSI Overbought",

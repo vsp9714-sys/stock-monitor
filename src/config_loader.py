@@ -73,7 +73,42 @@ def load_config() -> dict[str, Any]:
 
     # Allow environment variable overrides for critical secrets
     _apply_env_overrides(config)
+    validate_signal_config(config)
     return config
+
+
+def validate_signal_config(config: dict[str, Any]) -> None:
+    """Fail early for unsupported signal policies or impossible thresholds."""
+    confluence = config.get("confluence", {}) or {}
+    mode = confluence.get("mode", "crossover")
+    if mode not in {"crossover", "trend"}:
+        raise ValueError("confluence.mode must be 'crossover' or 'trend'")
+    minimum = confluence.get(
+        "min_groups_to_alert", confluence.get("min_signals_to_alert", 2)
+    )
+    if isinstance(minimum, bool) or not isinstance(minimum, int) or not 1 <= minimum <= 3:
+        raise ValueError("confluence.min_groups_to_alert must be an integer from 1 to 3")
+
+    rsi = (config.get("signals", {}) or {}).get("rsi", {}) or {}
+    rsi_mode = rsi.get("mode", "mean_reversion")
+    if rsi_mode not in {"mean_reversion", "trend_momentum"}:
+        raise ValueError("signals.rsi.mode must be 'mean_reversion' or 'trend_momentum'")
+    confirmation = rsi.get("confirmation", "level")
+    if confirmation not in {"level", "cross_back"}:
+        raise ValueError("signals.rsi.confirmation must be 'level' or 'cross_back'")
+    try:
+        oversold = float(rsi.get("oversold_threshold", 30))
+        overbought = float(rsi.get("overbought_threshold", 70))
+        bullish = float(rsi.get("bullish_threshold", 55))
+        bearish = float(rsi.get("bearish_threshold", 45))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("RSI thresholds must be numeric values between 0 and 100") from exc
+    if not all(0 <= value <= 100 for value in (oversold, overbought, bullish, bearish)):
+        raise ValueError("RSI thresholds must be between 0 and 100")
+    if oversold >= overbought:
+        raise ValueError("signals.rsi.oversold_threshold must be below overbought_threshold")
+    if bearish >= bullish:
+        raise ValueError("signals.rsi.bearish_threshold must be below bullish_threshold")
 
 
 def _apply_env_overrides(config: dict) -> None:
