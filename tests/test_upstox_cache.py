@@ -293,7 +293,7 @@ def test_manual_morning_readiness_check_can_run_outside_schedule_window(test_db_
     scanner = object.__new__(Scanner)
     scanner.fetcher = Fetcher()
     scanner.get_active_stocks = lambda: stocks
-    now = datetime(2026, 11, 6, 16, 5, tzinfo=ZoneInfo("Asia/Kolkata"))
+    now = datetime(2026, 11, 7, 6, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
     monkeypatch.setattr("src.scanner.get_session", lambda: test_db_session)
     captured = {}
 
@@ -306,6 +306,7 @@ def test_manual_morning_readiness_check_can_run_outside_schedule_window(test_db_
     assert result["skipped"] is False
     assert captured["target_session"].isoformat() == "2026-11-05"
     assert captured["now"] == now
+    assert captured["allow_weekend"] is True
 
 
 def test_scheduled_readiness_check_still_obeys_time_window():
@@ -315,6 +316,24 @@ def test_scheduled_readiness_check_still_obeys_time_window():
         now=datetime(2026, 11, 6, 16, 5, tzinfo=ZoneInfo("Asia/Kolkata"))
     )
     assert result["skipped"] is True
+
+
+def test_completed_daily_refresh_weekend_override_is_explicit(test_db_session, monkeypatch):
+    scanner = object.__new__(Scanner)
+    scanner.get_active_stocks = lambda limit=None: []
+    saturday = datetime(2026, 11, 7, 6, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+    monkeypatch.setattr("src.scanner.get_session", lambda: test_db_session)
+
+    skipped = scanner.refresh_completed_daily_cache(
+        now=saturday, target_session=datetime(2026, 11, 6).date()
+    )
+    assert skipped["skipped"] is True
+
+    result = scanner.refresh_completed_daily_cache(
+        now=saturday, target_session=datetime(2026, 11, 6).date(), allow_weekend=True
+    )
+    assert result["universe_size"] == 0
+    assert result["session_date"] == "2026-11-06"
 
 
 def test_post_close_refresh_removes_unverified_same_day_row_when_provider_has_no_bar(test_db_session, monkeypatch):

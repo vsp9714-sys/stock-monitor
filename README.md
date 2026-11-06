@@ -230,3 +230,16 @@ Upstox access tokens expire **daily**. A cron job can automate re-auth if you ha
 
 ## Coming Next (Docker)
 Once stable on systemd, wrap in a Docker container for portability and easier updates.
+## Offline backtest and model risk references
+
+Run the historical replay from the repository root with the project virtualenv:
+
+```bash
+./.venv/bin/python -m src.backtest.cli --from-date 2025-01-01 --to-date 2025-12-31
+```
+
+The command reads only the local SQLite daily-candle cache and writes reproducible JSON, CSV, and text reports under `reports/backtests/` by default. Signals use data through the completed session close and enter at the next available session open; configured stop/target, fee, and slippage assumptions are included in the report. It sends no alerts. Point-in-time universe snapshots are applied when available; otherwise current-universe survivorship bias is disclosed. Market/sector context remains informational in the replay; filter mode is rejected because historical sector mappings are not stored point-in-time.
+
+Live alerts can include ATR-based stop/target references derived from completed daily bars. These are model estimates, not orders. Position quantity is omitted unless both `risk.account_capital_inr` and `risk.risk_percent` are explicitly configured.
+
+For an explicitly scheduled one-off readiness-gated cache refresh (including a weekend), use `./.venv/bin/python -m src.refresh_daily_cache_once`. This runs no signal scan or notifier. If provider probe dates do not agree, it safely skips rather than marking the universe missing.

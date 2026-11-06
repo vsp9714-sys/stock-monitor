@@ -75,6 +75,23 @@ class DiscordNotifier(BaseNotifier):
                 value = f"Unavailable ({oi.get('reason', 'unknown')})"
             fields.append({"name": "Options OI", "value": value, "inline": False})
 
+        risk = payload.risk_context or {}
+        if risk.get("status") == "available":
+            size = (
+                f"; quantity {risk['quantity']} (risk budget INR {risk.get('risk_budget_inr', 0):,.0f})"
+                if risk.get("position_size_status") == "available" else
+                "; quantity not configured" if risk.get("position_size_status") == "unconfigured" else ""
+            )
+            fields.append({
+                "name": "Model risk reference (not an order)",
+                "value": (f"ATR({risk['atr_period']}) {risk['atr']:.2f}; stop {risk['stop_atr_multiple']:.2f}×ATR "
+                          f"at {risk['stop_reference']:.2f}; "
+                          f"target {risk['target_reference']:.2f}; {risk['reward_risk_ratio']:.1f}R{size}"),
+                "inline": False,
+            })
+        elif risk.get("status") == "unavailable":
+            fields.append({"name": "Model risk reference", "value": f"Unavailable ({risk.get('reason', 'unknown')})", "inline": False})
+
         if payload.pe_ratio is not None:
             fields.append({"name": "P/E", "value": f"{payload.pe_ratio:.1f}x", "inline": True})
         if payload.roe is not None:

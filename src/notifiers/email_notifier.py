@@ -13,6 +13,7 @@ Setup (Gmail):
 """
 import logging
 import smtplib
+from html import escape
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -42,6 +43,27 @@ class EmailNotifier(BaseNotifier):
         color = "#3fb950" if payload.direction == "BUY" else "#f85149"
         direction_emoji = "🟢" if payload.direction == "BUY" else "🔴"
         profit_trend = payload.format_profit_trend()
+        risk = payload.risk_context or {}
+        if risk.get("status") == "available":
+            size = (
+                ' · quantity ' + str(risk['quantity']) + f" (risk budget INR {risk.get('risk_budget_inr', 0):,.0f})"
+                if risk.get('position_size_status') == 'available' else
+                ' · quantity not configured' if risk.get('position_size_status') == 'unconfigured' else ''
+            )
+            risk_row = (
+                '<tr><td style="padding: 6px 0; color: #8b949e;">Model risk reference (not an order)</td><td>'
+                + f"ATR({risk['atr_period']}) {risk['atr']:.2f} · stop {risk['stop_atr_multiple']:.2f}×ATR "
+                  f"({risk['stop_reference']:.2f}) · "
+                  f"target {risk['target_reference']:.2f} · {risk['reward_risk_ratio']:.1f}R"
+                + size + '</td></tr>'
+            )
+        elif risk.get("status") == "unavailable":
+            risk_row = (
+                '<tr><td style="padding: 6px 0; color: #8b949e;">Model risk reference (not an order)</td><td>'
+                + 'Unavailable (' + escape(str(risk.get('reason', 'unknown'))) + ')</td></tr>'
+            )
+        else:
+            risk_row = ''
 
         return f"""
         <html><body style="font-family: Arial, sans-serif; background: #0d1117; color: #e6edf3; padding: 20px;">
@@ -60,6 +82,7 @@ class EmailNotifier(BaseNotifier):
               {'<tr><td style="padding: 6px 0; color: #8b949e;">Market context</td><td>' + str(payload.market_regime or 'unavailable') + ' · relative strength vs Nifty 50: ' + (f"{payload.market_relative_strength_pct:+.2f}%" if payload.market_relative_strength_pct is not None else 'unavailable') + '</td></tr>' if payload.market_regime or payload.market_relative_strength_pct is not None else ''}
               {'<tr><td style="padding: 6px 0; color: #8b949e;">Sector context</td><td>' + str(payload.sector_regime or 'unavailable') + ' · relative strength: ' + (f"{payload.sector_relative_strength_pct:+.2f}%" if payload.sector_relative_strength_pct is not None else 'unavailable') + '</td></tr>' if payload.sector_regime or payload.sector_relative_strength_pct is not None else ''}
               {'<tr><td style="padding: 6px 0; color: #8b949e;">Options OI</td><td>Expiry ' + str(payload.derivatives_context.get('expiry')) + ' · PCR ' + f"{payload.derivatives_context.get('put_call_oi_ratio'):.2f}" + ' · OI change ' + (f"{payload.derivatives_context.get('total_oi_change_pct'):+.1f}%" if payload.derivatives_context.get('total_oi_change_pct') is not None else 'unavailable') + ' · retrieved ' + str(payload.derivatives_context.get('retrieved_at')) + '</td></tr>' if payload.derivatives_context.get('status') == 'available' else ''}
+              {risk_row}
               {'<tr><td style="padding: 6px 0; color: #8b949e;">P/E Ratio</td><td>' + f"{payload.pe_ratio:.1f}x" + '</td></tr>' if payload.pe_ratio else ''}
               {'<tr><td style="padding: 6px 0; color: #8b949e;">ROE</td><td>' + f"{payload.roe:.1f}%" + '</td></tr>' if payload.roe else ''}
               {'<tr><td style="padding: 6px 0; color: #8b949e;">Promoter Holding</td><td>' + f"{payload.promoter_holding_pct:.1f}%" + '</td></tr>' if payload.promoter_holding_pct else ''}
