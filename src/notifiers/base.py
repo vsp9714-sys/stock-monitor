@@ -22,6 +22,9 @@ class AlertPayload:
     indicator_detail: dict              # Full indicator snapshot
     price_source: str = "Upstox last_price"
     quote_timestamp: Optional[str] = None
+    provisional: bool = False
+    signal_session_date: Optional[str] = None
+    bar_status: Optional[str] = None
 
     # Confluence metadata
     confluence_score: int = 1
@@ -48,6 +51,8 @@ class AlertPayload:
     chart_path: Optional[str] = None
 
     def format_signal_label(self) -> str:
+        if self.provisional and self.signal_type.startswith("provisional_intraday_confluence"):
+            return f"PROVISIONAL · Intraday Confluence {self.direction} ({self.confluence_score}/{self.total_signals} checks)"
         if self.signal_type.startswith("confluence"):
             return f"Confluence {self.direction} ({self.confluence_score}/{self.total_signals} Signals Met)"
         labels = {
@@ -66,6 +71,21 @@ class AlertPayload:
             "volume_spike": "Volume Spike",
         }
         return labels.get(self.signal_type, self.signal_type.replace("_", " ").title())
+
+    def format_signal_provenance(self) -> str:
+        if self.provisional:
+            return (
+                f"PROVISIONAL session {self.signal_session_date or 'unknown'}; "
+                f"bar not finalized; quote time {self.quote_timestamp or 'unknown'}"
+            )
+        return f"Confirmed daily-cache bar; quote time {self.quote_timestamp or 'unknown'}"
+
+    @staticmethod
+    def check_status_icon(check: dict) -> str:
+        """Keep unavailable inputs distinct from checks that evaluated false."""
+        if check.get("availability") == "unavailable":
+            return "➖"
+        return "✅" if check.get("met") else "❌"
 
     def format_profit_trend(self) -> str:
         """Format last 4 quarters profit as trend string."""

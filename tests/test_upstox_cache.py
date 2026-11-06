@@ -432,7 +432,7 @@ def test_stale_ltp_cannot_reach_signal_evaluation(monkeypatch, caplog):
     assert result.complete is False
     assert result.evaluated_count == 0
     assert result.alerts_dispatched == 0
-    assert "Skipping AAA: missing, invalid, or stale Upstox last trade" in caplog.text
+    assert "Skipping AAA: invalid quote (stale_or_future_ltp)" in caplog.text
 
 
 def test_scan_stops_before_alerts_when_quote_batch_request_fails(monkeypatch):
@@ -512,7 +512,7 @@ def test_scan_skips_missing_symbol_but_dispatches_for_quoted_symbols(monkeypatch
             return {}
 
     scanner = object.__new__(Scanner)
-    scanner.cfg = {"upstox": {"quote_batch_size": 100}}
+    scanner.cfg = {"upstox": {"quote_batch_size": 100}, "scan": {"min_coverage": 0.5}}
     scanner.fetcher = Fetcher()
     scanner.notifiers = [type("Notifier", (), {"delivery_targets": lambda self: []})()]
     scanner.fundamentals = Fundamentals()

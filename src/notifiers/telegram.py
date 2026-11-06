@@ -74,6 +74,7 @@ class TelegramNotifier(BaseNotifier):
             f"{direction_emoji} <b>{payload.symbol}</b> — {payload.direction} Signal{confluence_tag}",
             f"📌 <b>{payload.format_signal_label()}</b>",
             "",
+            f"{'⚠️' if payload.provisional else 'ℹ️'} <i>{html.escape(payload.format_signal_provenance())}</i>",
             f"🏢 <b>{payload.company_name}</b>",
             f"💰 Price: <b>₹{payload.price:,.2f}</b> ({html.escape(payload.price_source)})",
             f"🕒 Quote time: {html.escape(payload.quote_timestamp or 'unknown')}",
@@ -87,11 +88,14 @@ class TelegramNotifier(BaseNotifier):
                 name_esc = html.escape(str(chk.get('name', '')))
                 desc_esc = html.escape(str(chk.get('description', '')))
                 val_esc = html.escape(str(chk.get('value_text', '')))
-                if chk.get("met"):
-                    icon = "✅"
+                if chk.get("availability") == "unavailable":
+                    icon = payload.check_status_icon(chk)
+                    lines.append(f"{icon} <b>{name_esc}</b>: {desc_esc} ({val_esc})")
+                elif chk.get("met"):
+                    icon = payload.check_status_icon(chk)
                     lines.append(f"{icon} <b>{name_esc}</b>: {desc_esc} ({val_esc})")
                 else:
-                    icon = "❌"
+                    icon = payload.check_status_icon(chk)
                     lines.append(f"{icon} {name_esc}: {desc_esc} ({val_esc})")
         elif payload.indicator_value is not None:
             ind_label = self._indicator_label(payload.signal_type)

@@ -39,6 +39,7 @@ class DiscordNotifier(BaseNotifier):
 
         fields = [
             {"name": "Signal", "value": payload.format_signal_label(), "inline": True},
+            {"name": "Data status", "value": payload.format_signal_provenance(), "inline": False},
             {"name": "Direction", "value": f"{direction_emoji} {payload.direction}", "inline": True},
             {"name": "Price", "value": f"₹{payload.price:,.2f} ({payload.price_source})\n{payload.quote_timestamp or 'unknown'}", "inline": True},
         ]
