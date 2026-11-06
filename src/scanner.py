@@ -503,6 +503,7 @@ class Scanner:
         *,
         now: Optional[datetime] = None,
         checkpoint_symbols: int = 20,
+        manual: bool = False,
     ) -> dict:
         """Probe Upstox at the scheduled 06:00 IST run, then refresh the latest completed session.
 
@@ -514,8 +515,10 @@ class Scanner:
         if current.tzinfo is None:
             current = current.replace(tzinfo=IST)
         current = current.astimezone(IST)
-        if current.weekday() >= 5 or not (datetime_time(6, 0) <= current.time() < datetime_time(7, 0)):
-            logger.info("Morning daily-candle readiness check skipped outside 06:00-07:00 IST weekday window.")
+        if current.weekday() >= 5 or (
+            not manual and not (datetime_time(6, 0) <= current.time() < datetime_time(7, 0))
+        ):
+            logger.info("Morning daily-candle readiness check skipped outside its weekday schedule window.")
             return {"universe_size": 0, "updated": 0, "failed": 0, "skipped": True}
 
         stocks = {stock.symbol: stock for stock in self.get_active_stocks()}

@@ -207,7 +207,7 @@ class UpstoxFetcher:
                     # operator action and should fail immediately.
                     try:
                         payload = response.json()
-                    except ValueError:
+                    except (ValueError, AttributeError, TypeError, requests.RequestException):
                         payload = {}
                     errors = payload.get("errors") if isinstance(payload, dict) else None
                     first_error = errors[0] if errors and isinstance(errors[0], dict) else {}

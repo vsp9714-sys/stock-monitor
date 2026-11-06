@@ -158,6 +158,27 @@ def test_upstox_does_not_retry_permanent_4xx(monkeypatch):
     assert len(calls) == 1
 
 
+def test_upstox_permanent_4xx_without_json_method_is_normalized(monkeypatch):
+    class Response:
+        status_code = 401
+        headers = {}
+
+        def raise_for_status(self):
+            import requests
+            raise requests.HTTPError("unauthorized")
+
+    fetcher = object.__new__(UpstoxFetcher)
+    fetcher.auth = type("Auth", (), {"auth_headers": lambda self: {}})()
+    fetcher._request_retries = 3
+    calls = []
+    monkeypatch.setattr("src.fetcher.upstox.requests.get", lambda *a, **k: calls.append(1) or Response())
+
+    with pytest.raises(UpstoxAPIError) as error:
+        fetcher._get_json("https://example.test", {}, type("Limiter", (), {"wait": lambda self: None})())
+    assert error.value.status_code == 401
+    assert len(calls) == 1
+
+
 def test_ohlcv_upsert_is_idempotent_and_updates_latest(test_db_session):
     row = {"symbol": "ABC", "interval": "1d", "ts": datetime(2026, 1, 1),
            "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10}
@@ -253,6 +274,47 @@ def test_post_close_refresh_verifies_same_day_cached_bar_and_is_idempotent(test_
     rows = test_db_session.query(OHLCVCache).order_by(OHLCVCache.ts).all()
     assert len(rows) == 3
     assert rows[-1].ts.date().isoformat() == "2026-11-06"
+
+
+def test_manual_morning_readiness_check_can_run_outside_schedule_window(test_db_session, monkeypatch):
+    stocks = [
+        type("StockRef", (), {"symbol": symbol, "instrument_key": f"NSE_EQ|{symbol}"})()
+        for symbol in ("RELIANCE", "TCS", "360ONE")
+    ]
+
+    class Fetcher:
+        def get_historical_candles(self, instrument_key, interval, *, from_date, to_date):
+            assert interval == "day"
+            return pd.DataFrame([{
+                "ts": pd.Timestamp("2026-11-05"),
+                "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10,
+            }])
+
+    scanner = object.__new__(Scanner)
+    scanner.fetcher = Fetcher()
+    scanner.get_active_stocks = lambda: stocks
+    now = datetime(2026, 11, 6, 16, 5, tzinfo=ZoneInfo("Asia/Kolkata"))
+    monkeypatch.setattr("src.scanner.get_session", lambda: test_db_session)
+    captured = {}
+
+    def refresh(**kwargs):
+        captured.update(kwargs)
+        return {"universe_size": 500, "updated": 500, "failed": 0, "skipped": False}
+
+    scanner.refresh_completed_daily_cache = refresh
+    result = scanner.refresh_latest_completed_daily_cache(now=now, manual=True)
+    assert result["skipped"] is False
+    assert captured["target_session"].isoformat() == "2026-11-05"
+    assert captured["now"] == now
+
+
+def test_scheduled_readiness_check_still_obeys_time_window():
+    scanner = object.__new__(Scanner)
+    scanner.get_active_stocks = lambda: pytest.fail("out-of-window check must not probe")
+    result = scanner.refresh_latest_completed_daily_cache(
+        now=datetime(2026, 11, 6, 16, 5, tzinfo=ZoneInfo("Asia/Kolkata"))
+    )
+    assert result["skipped"] is True
 
 
 def test_post_close_refresh_removes_unverified_same_day_row_when_provider_has_no_bar(test_db_session, monkeypatch):

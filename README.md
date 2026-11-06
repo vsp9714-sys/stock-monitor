@@ -65,7 +65,7 @@ The service is scheduled by the Python `schedule` loop inside the systemd-manage
 
 ## Configurable stock universes (WP17)
 
-The scanner supports `all_nse` (default and backward-compatible), `nifty500`, `custom`, and `composed`. Universe membership is independent of liquidity/tradability: WP10's liquidity rules are not applied here.
+The scanner supports `all_nse` (backward-compatible fallback), `nifty500`, `custom`, and `composed`. The checked-in runtime config selects `nifty500`, restricting scans and incremental refreshes to verified Nifty 500 constituents. Universe membership is independent of liquidity/tradability: WP10's liquidity rules are not applied here.
 
 ```yaml
 universe:
@@ -111,11 +111,13 @@ cd /home/ubuntu/repos/stock-monitor
 ./.venv/bin/python -m src.cache_warmup
 ```
 
-The warm-up is resumable: it commits every 20 completed symbols, and reruns skip symbols that already have the required history. The required history follows the slowest configured indicator (currently 210 daily bars). Historical requests are paced at 1 second each; a first full backfill of ~3,200 shares therefore takes at least 54 minutes and may take longer if Upstox asks for retries. Do not start a second warm-up concurrently. A nonzero exit status means there are stocks that still need cache repair; use the printed failed-symbol list and rerun after addressing the cause.
+The warm-up is resumable: it commits every 20 completed symbols, and reruns skip symbols that already have the required history. The required history follows the slowest configured indicator (currently 210 daily bars). Historical requests are paced at 1 second each; with the checked-in Nifty 500 mode, the initial pass takes at least about 8 minutes, and longer if Upstox asks for retries. An `all_nse` pass over ~3,200 shares takes at least 54 minutes. Do not start a second warm-up concurrently. A nonzero exit status means there are stocks that still need cache repair; use the printed failed-symbol list and rerun after addressing the cause.
 
-During normal operation, the service checks for the latest completed daily session at 06:00 Asia/Kolkata on weekdays, using Upstox's historical-candle endpoint (not live quote OHLC). It first probes `RELIANCE`, `TCS`, and `360ONE`; a full-universe refresh starts only when all three report the same latest candle date. If the provider has not published a consistent recent session yet, the check skips without marking every symbol `no_bar` or deleting cached data. The paced full pass targets that observed session date and runs in a background thread so it does not stall the scan scheduler; one in-process lock prevents duplicate runs. Per-symbol checkpoints make confirmed symbols resumable after interruption/restart. Missing bars and symbol-specific invalid instrument keys are checkpointed per symbol; broader provider failures stop the pass so it can safely resume after recovery.
+During normal operation, the service checks for the latest completed daily session at 06:00 Asia/Kolkata on weekdays, using Upstox's historical-candle endpoint (not live quote OHLC). It first probes `RELIANCE`, `TCS`, and `360ONE`; a refresh of the configured universe starts only when all three report the same latest candle date. If the provider has not published a consistent recent session yet, the check skips without marking every symbol `no_bar` or deleting cached data. The paced pass targets that observed session date and runs in a background thread so it does not stall the scan scheduler; one in-process lock prevents duplicate runs. Per-symbol checkpoints make confirmed symbols resumable after interruption/restart. Missing bars and symbol-specific invalid instrument keys are checkpointed per symbol; broader provider failures stop the pass so it can safely resume after recovery.
 
-To intentionally send one manual full-universe alert sweep (uses the configured routes and normal per-destination escalation deduplication), run:
+To manually run the same readiness-gated refresh outside 06:00–07:00 IST, use `./.venv/bin/python -m src.refresh_daily_cache --manual --universe nifty500`. It refreshes OHLCV only; it never runs scans or sends alerts. To remove OHLCV, refresh checkpoints, and fundamentals outside the configured universe after a verified backup, first use `./.venv/bin/python -m src.prune_market_cache` for a dry run, then add `--execute`. The instrument master and historical signals/delivery audit rows are retained.
+
+To intentionally send one manual alert sweep of the configured universe (uses the configured routes and normal per-destination escalation deduplication), run:
 
 ```bash
 ./.venv/bin/python -m src.scan_once
