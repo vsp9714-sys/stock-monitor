@@ -77,7 +77,7 @@ class TelegramNotifier(BaseNotifier):
             f"{'⚠️' if payload.provisional else 'ℹ️'} <i>{html.escape(payload.format_signal_provenance())}</i>",
             f"🏢 <b>{payload.company_name}</b>",
             f"💰 Price: <b>₹{payload.price:,.2f}</b> ({html.escape(payload.price_source)})",
-            f"🕒 Quote time: {html.escape(payload.quote_timestamp or 'unknown')}",
+            f"🕒 Quote time: {html.escape(str(payload.quote_timestamp) if payload.quote_timestamp else 'unknown')}",
         ]
 
         # Multi-signal check list

@@ -320,7 +320,7 @@ def upsert_signal(session: Session, symbol: str, signal_date: date, signal_type:
                     "legacy_score_migrated": True,
                 })
                 existing.indicator_value = float(old_score)
-                existing.indicator_detail = json.dumps(old_detail, separators=(",", ":"))
+                existing.indicator_detail = json.dumps(old_detail, separators=(",", ":"), default=str)
             existing.chart_path = chart_path
             if new_score > old_score:
                 existing.notified = False

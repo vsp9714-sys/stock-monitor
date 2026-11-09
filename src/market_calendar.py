@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -16,6 +17,7 @@ class CalendarUnavailable(ValueError):
     """No validated exchange calendar is available for the requested year."""
 
 
+@lru_cache(maxsize=1)
 def _load_calendar() -> dict:
     with CALENDAR_FILE.open(encoding="utf-8") as handle:
         return yaml.safe_load(handle) or {}

@@ -151,7 +151,17 @@ def _json_default(value):
         return value.isoformat()
     if isinstance(value, set):
         return sorted(value, key=str)
-    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return str(value)
 
 
 def _daily_timestamp(value) -> datetime:

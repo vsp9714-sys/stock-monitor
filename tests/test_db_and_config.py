@@ -298,3 +298,52 @@ def test_config_loader():
     assert cfg["market"]["close_time"] == "15:30"
     assert cfg["market"]["timezone"] == "Asia/Kolkata"
     assert cfg["universe"]["mode"] == "nifty500"
+
+
+def test_signal_detail_serializes_numpy_and_pandas_types(test_db_session):
+    """Issue #25 regression test: NumPy booleans and scalars must persist cleanly."""
+    import json
+    import numpy as np
+    import pandas as pd
+    from src.scanner import _json_default
+
+    detail = {
+        "signal_horizon": "provisional_intraday",
+        "confluence_score": np.int64(3),
+        "total_signals": 5,
+        "checks": [
+            {
+                "name": "EMA 9×21",
+                "state_met": np.bool_(True),
+                "event_met": np.bool_(False),
+                "value": np.float64(1420.5),
+            },
+            {
+                "name": "RSI (14)",
+                "state_met": True,
+                "event_met": False,
+                "value": 28.5,
+            },
+        ],
+        "session_date": pd.Timestamp("2026-11-09").date(),
+        "tags": {"swing", "momentum"},
+    }
+
+    serialized = json.dumps(detail, default=_json_default)
+    assert serialized is not None
+
+    sig = upsert_signal(
+        session=test_db_session,
+        symbol="ASTRAL",
+        signal_date=date(2026, 11, 9),
+        signal_type="confluence_buy",
+        direction="BUY",
+        price=1350.0,
+        indicator_value=3.0,
+        indicator_detail=serialized,
+    )
+    assert sig.id is not None
+    loaded = json.loads(sig.indicator_detail)
+    assert loaded["checks"][0]["state_met"] is True
+    assert loaded["checks"][0]["value"] == 1420.5
+    assert loaded["session_date"] == "2026-11-09"
