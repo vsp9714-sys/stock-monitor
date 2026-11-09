@@ -1,245 +1,74 @@
 # Stock Monitor
 
-Swing trading signal detector for NSE-listed ordinary shares. Runs on an OCI instance and sends alerts via Telegram (+ Discord/Email) when signals are detected.
+An NSE-focused swing-trading **signal research and alerting framework**. It reads Upstox market data, evaluates completed daily candles (and a separately labelled provisional intraday path during an open session), applies configured universe/confluence rules, persists results in SQLite, and optionally sends alerts. It does not place orders.
 
-## Features
-- **Signals**: RSI oversold/overbought, MACD crossover, EMA crossovers (9×21, 21×50, 50×200 Golden/Death Cross), Volume breakout
-- **Universe**: NSE mainboard and SME ordinary shares verified against NSE's official equity masters by ISIN (including EQ/BE/BZ and SM/ST/SZ series; bonds and other non-share instruments are excluded)
-- **Data**: Real-time via Upstox API (free tier)
-- **Fundamentals**: Market cap, cap category, P/E, ROE, promoter holding, last 4Q profit
-- **Charts**: Candlestick + EMA overlays + RSI + MACD (dark theme)
-- **Notifications**: Telegram (+ Discord, Email, WhatsApp — pluggable)
-- **Schedule**: Internal Python scheduler scans every 15 min; market-hours gate is 9:15 AM – 3:30 PM IST, Mon–Fri
-- **Persistent**: systemd service with auto-restart
+## What it does
 
-## Quick Start
+- Selects a verified NSE equity universe (`nifty500` is the checked-in default; other supported modes are `all_nse`, `custom`, and `composed`).
+- Maintains daily OHLCV and selected-universe snapshots/checkpoints in SQLite.
+- Scans at the configured interval during NSE market hours using validated, batched Upstox quotes and cached completed daily candles.
+- Evaluates RSI, MACD, EMA crossover/trend-state, and volume breakout checks. Related checks vote as independent groups: trend, momentum, and participation.
+- Optionally adds completed-session liquidity screening, market/sector regime context, fundamental freshness, open-interest context, and ATR-based risk references.
+- Sends configured notifications through Telegram, Discord, and email. WhatsApp settings are present but not currently wired into the notifier factory.
+- Provides cache maintenance, one-shot scans/refreshes, and offline historical backtests.
 
-### 1. One-time setup
-```bash
-cd /home/ubuntu/repos/stock-monitor
-bash setup.sh
+## Architecture
+
+```mermaid
+flowchart LR
+  S[Python scheduler / CLI] --> SC[Scanner & universe selector]
+  SC --> Q[Upstox: quotes, candles, instruments]
+  SC --> F[Screener fundamentals]
+  SC --> MC[Market / sector index context]
+  SC --> OI[Optional F&O option-chain context]
+  Q --> DB[(SQLite: candles, universe snapshots, signals, delivery audit)]
+  F --> DB
+  MC --> DB
+  SC --> SIG[Signal checks and grouped confluence]
+  SIG --> R[ATR risk references]
+  R --> N[Telegram / Discord / Email notifiers]
+  BT[Offline backtest CLI] --> DB
+  BT --> REP[JSON / CSV / text reports]
 ```
 
-### 2. Configure API keys
+- `src/main.py` starts the in-process scheduler, initializes SQLite and the verified instrument master, schedules market scans and daily cache/universe refreshes, and handles shutdown.
+- `src/scanner.py` coordinates data validation, universe eligibility, indicators, grouped voting, context, alert persistence, and delivery deduplication.
+- `src/universe.py`, `src/market_calendar.py`, and `src/market_context.py` implement constituent selection, NSE session rules, and benchmark/sector/liquidity calculations.
+- `src/fetcher/` contains the Upstox client/OAuth flow and Screener fundamentals cache.
+- `src/signals/` contains RSI, MACD, EMA, volume and confluence logic. `src/risk.py` computes informational ATR references.
+- `src/notifiers/` contains delivery adapters. `src/backtest/` replays the configured strategy against local daily candles without network calls or notifications.
+- `config/config.yaml` is the safe-to-commit settings file; ignored `config/secrets.yaml`, `.env`, and supported environment variables override secret values.
+- `data/stocks.db` is local SQLite state. It, tokens, logs, charts, reports, and secrets are intentionally excluded from Git.
+
+## Getting started
+
+- [SETUP.md](SETUP.md): clone and install on Linux or Windows, configure credentials, perform OAuth, warm the cache, and run the service.
+- [USAGE.md](USAGE.md): commands, scheduling, alerts, all checked-in config settings and their effects, universe modes, and operational safety notes.
+- [Upstox quote contract notes](docs/upstox_quote_contract.md).
+
+Quick Linux development setup:
+
 ```bash
-nano config/secrets.yaml
-```
-Required:
-- `upstox.api_key` + `upstox.api_secret` (from [Upstox Developer](https://developer.upstox.com/))
-- `notifications.telegram.bot_token` + the enabled Telegram destination(s)
-
-Telegram recipient routing is controlled in `config/config.yaml`:
-
-```yaml
-notifications:
-  telegram:
-    individual_alert: "Y"   # send to chat_id
-    chat_id: "YOUR_TELEGRAM_CHAT_ID"
-    group_alert: "N"        # change to Y to send to group_chat_id
-    group_chat_id: ""       # Telegram group chat ID, commonly starts with -100
-```
-
-`individual_alert` and `group_alert` accept Y/N (or YAML boolean values). At least one must be enabled, and its corresponding chat ID must be populated. Keep `bot_token` in the ignored `config/secrets.yaml`; the config loader merges secrets over `config.yaml`. The bot must be added to the group and allowed to post. Enabling both switches sends independently to both destinations.
-
-### 3. Upstox OAuth2 (required daily — Upstox tokens expire every 24h)
-```bash
+git clone https://github.com/vsp9714-sys/stock-monitor.git
+cd stock-monitor
+python3.11 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+cp config/secrets.yaml.example config/secrets.yaml
+# Edit config/secrets.yaml, then complete OAuth:
 python -m src.fetcher.upstox_auth_setup
 ```
 
-### 4. Start
-```bash
-sudo systemctl start stock-monitor
-sudo systemctl enable stock-monitor   # Auto-start on reboot
-```
+## Defaults and important behavior
 
-### 5. Monitor
-```bash
-systemctl status stock-monitor
-systemctl show stock-monitor -p ActiveState -p SubState -p MainPID -p ActiveEnterTimestamp
-tail -f logs/stock_monitor.log
-journalctl -u stock-monitor -f
-```
+- The checked-in universe is Nifty 500 with an enabled 20-session average traded-value threshold of ₹1 crore and 20 observations. Actual selected/evaluable counts vary with verified constituents, data coverage, and provider availability.
+- NSE timezone is `Asia/Kolkata`; regular session window is 09:15–15:30 IST, weekdays, using the versioned calendar in `config/nse_trading_calendar.yaml`. Unknown calendar years fail closed.
+- Confluence defaults to at least two agreeing independent groups, fresh-event `crossover` mode, and rejection of conflicting directions. RSI defaults to mean-reversion and level confirmation.
+- Confirmed alerts use completed daily candles. Provisional intraday alerts are separately labelled/deduplicated, use current-session OHLC only in memory, and do not write partial bars to the canonical daily cache. Provisional volume uses the accepted comparison with full prior-day volumes, not a time-of-day-adjusted baseline.
+- Market/sector context is informational by default. Derivatives/OI context is disabled by default. ATR risk levels are estimates, never orders; position size is omitted unless account capital and risk percent are configured.
+- The daily 06:00 IST readiness job refreshes cache only when the configured provider probes agree on the latest completed session. It does not scan or alert. The every-15-minute scheduler is separate.
 
-The service is scheduled by the Python `schedule` loop inside the systemd-managed process, so an empty `crontab -l` is expected. Check for systemd timers separately with `systemctl list-timers --all | grep -i stock-monitor`; this project does not use a systemd timer. The verified NSE instrument master is refreshed on startup and daily at 08:15 IST; configured membership is resolved and snapshotted at 08:30 IST, before market scans. Startup fails closed if the official source masters cannot be validated, preventing scans against a stale universe that may contain bonds.
+## License and intended use
 
-## Configurable stock universes (WP17)
-
-The scanner supports `all_nse` (backward-compatible fallback), `nifty500`, `custom`, and `composed`. The checked-in runtime config selects `nifty500`, restricting scans and incremental refreshes to verified Nifty 500 constituents. Universe membership is independent of liquidity/tradability: WP10's liquidity rules are not applied here.
-
-```yaml
-universe:
-  mode: nifty500
-  nifty500_min_count: 450
-  nifty500_max_count: 550
-  custom_symbols: []
-  include_fno: false
-```
-
-Nifty 500 plus a custom watchlist:
-
-```yaml
-universe:
-  mode: composed
-  custom_symbols: [ABCAPITAL, ZOMATO]
-  include_fno: false
-```
-
-Nifty 500 plus F&O underlyings plus a custom watchlist:
-
-```yaml
-universe:
-  mode: composed
-  custom_symbols: [ABCAPITAL, ZOMATO]
-  include_fno: true
-```
-
-For a custom-only watchlist use `mode: custom` and populate `custom_symbols`. In composed mode, the selector unions the official Nifty Indices Nifty 500 CSV, optionally NSE's current F&O market-lot underlyings, and the configured custom symbols, then normalizes and deduplicates them. Each symbol must also exist in the verified NSE instrument master. Unsupported legacy examples such as `all_bse` and `nifty50` have been removed rather than left as misleading options.
-
-Nifty 500 membership is refreshed at most once on each configured weekday, before market scans (08:30 IST), using `https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv`. The source must have the `Symbol` column, unique normalized symbols, and a count within the configured bounds. Valid source snapshots and the selected daily universe are stored in SQLite with source/retrieval metadata. If refresh fails, a validated last-known-good snapshot is used and marked stale with age/error. If none exists, the selected universe fails closed; it never silently broadens to `all_nse`. Optional F&O source failure is explicitly reported and does not widen the selection.
-
-For `nifty500`, `custom`, and `composed`, the default allowed series is regular `EQ`; set `allowed_series` explicitly to opt into another verified NSE share series. For compatibility, an unset filter in `all_nse` retains its existing share-series coverage. Series eligibility is separate from tradability. Scan summaries expose mode, source/retrieval timestamps and staleness, member-source counts, unique selected count, series exclusions, quote/history eligibility, liquidity exclusions, and a dated symbol snapshot.
-
-## Candidate context and tradability (Batch D)
-
-The completed-bar liquidity screen is configured under `universe.tradability`. The default uses a 20-session average traded value (daily close × volume) of at least ₹1 crore, with 20 valid observations required. Stocks with unavailable liquidity history are excluded by default and counted with an explicit reason; set `unknown_policy: include` only if you explicitly want that behavior. The existing minimum-price rule remains a secondary guard. `final_tradable_count` is the selected universe after this configured liquidity screen.
-
-Market context uses Upstox [NSE index instruments](https://upstox.com/developer/api-documentation/instruments/) and [daily historical candles](https://upstox.com/developer/api-documentation/get-historical-candle-data/). The broad Nifty 50 regime is informational by default; relative strength is the stock's return minus the index return over the configured completed-session lookback. Sector context is populated only for exact sector labels listed in `market_context.sector_index_keys`; unmapped sectors are reported unavailable rather than inferred. Index candles are cached in SQLite with a retrieval timestamp and refreshed after the configured TTL. `mode: filter` is opt-in; available benchmark and configured sector regimes must align with direction. By default, missing required context excludes the candidate in filter mode; `filter_unknown_policy: include` opts out of that fail-closed behavior.
-
-Fundamentals remain annotations, not candidate filters. Alerts expose Screener URL, fetched time, cache age, consolidated/standalone basis, and fresh/stale/unavailable status. If a refresh fails, the last cached values may be shown as **stale**; they are never labelled fresh.
-
-Optional derivatives context is disabled by default (`derivatives.enabled: false`). When enabled, the scanner checks current NSE F&O eligibility and uses Upstox's documented [option-contract](https://upstox.com/developer/api-documentation/get-option-contracts/) and [option-chain](https://upstox.com/developer/api-documentation/get-pc-option-chain/) APIs, selecting the nearest unexpired expiry and reporting aggregated call/put OI, PCR, retrieval time, and OI change when available. Non-F&O names, provider gaps, and scan-cap omissions remain explicitly unavailable; none are treated as zero or used to suppress technical signals.
-
-## Upstox pacing and daily candle cache
-
-The scanner stores historical daily OHLCV in SQLite (`ohlcv_cache`) and uses Upstox V3 full-market quotes in batches for each scan. The quote API supports up to 500 instrument keys per request; this project defaults to 100 keys per request to keep URLs comfortably sized. With 3,207 active shares that is about 33 quote requests, rather than 3,207 individual history requests on every scan. If an HTTP quote batch fails, the sweep fails closed before sending alerts. If a successful response omits individual symbols (for example, an illiquid instrument with no quote), only those symbols are skipped; alerts may be sent for fully quoted/evaluated symbols, and the summary is explicitly marked incomplete.
-
-On a new deployment, warm the history cache before expecting complete scans:
-
-```bash
-cd /home/ubuntu/repos/stock-monitor
-./.venv/bin/python -m src.cache_warmup
-```
-
-The warm-up is resumable: it commits every 20 completed symbols, and reruns skip symbols that already have the required history. The required history follows the slowest configured indicator (currently 210 daily bars). Historical requests are paced at 1 second each; with the checked-in Nifty 500 mode, the initial pass takes at least about 8 minutes, and longer if Upstox asks for retries. An `all_nse` pass over ~3,200 shares takes at least 54 minutes. Do not start a second warm-up concurrently. A nonzero exit status means there are stocks that still need cache repair; use the printed failed-symbol list and rerun after addressing the cause.
-
-During normal operation, the service checks for the latest completed daily session at 06:00 Asia/Kolkata on configured NSE trading sessions, using Upstox's historical-candle endpoint (not live quote OHLC). It first probes `RELIANCE`, `TCS`, and `360ONE`; a refresh of the configured universe starts only when all three report the same latest candle date. If the provider has not published a consistent recent session yet, the check skips without marking every symbol `no_bar` or deleting cached data. The paced pass targets that observed session date and runs in a background thread so it does not stall the scan scheduler; one in-process lock prevents duplicate runs. Per-symbol checkpoints make confirmed symbols resumable after interruption/restart. Missing bars and symbol-specific invalid instrument keys are checkpointed per symbol; broader provider failures stop the pass so it can safely resume after recovery.
-
-To manually run the same readiness-gated refresh outside 06:00–07:00 IST, use `./.venv/bin/python -m src.refresh_daily_cache --manual --universe nifty500`. It refreshes OHLCV only; it never runs scans or sends alerts. To remove OHLCV, refresh checkpoints, and fundamentals outside the configured universe after a verified backup, first use `./.venv/bin/python -m src.prune_market_cache` for a dry run, then add `--execute`. The instrument master and historical signals/delivery audit rows are retained.
-
-To intentionally send one manual alert sweep of the configured universe (uses the configured routes and normal per-destination escalation deduplication), run:
-
-```bash
-./.venv/bin/python -m src.scan_once
-```
-
-The command prints a JSON summary and exits nonzero if the scan is incomplete. Batch/API failures, mixed quote sessions, malformed OHLCV, or coverage below `scan.min_coverage` fail closed and dispatch no alerts. Individual missing-quote symbols and shares with less than the required daily history are skipped; alerts are eligible only if the configured minimum coverage is still met.
-
-Confirmed confluence signals use completed daily candles from SQLite. During an open NSE session, the scanner may also evaluate a **separate provisional intraday confluence** by appending the quote's current-session OHLC to an in-memory copy of completed history. Provisional alerts have a distinct signal type/deduplication key and are explicitly labelled with the session date and quote time; they are not finalized daily bars and are never written into `ohlcv_cache`. Provisional cumulative volume is compared with the existing average of complete prior-day volumes; this is a coarse comparison, not a time-of-day-adjusted baseline. The scanner validates quote freshness, price/volume ranges, OHLC consistency, cached candle integrity, and exchange-session dates before evaluation. `scan.min_coverage` defaults to `0.95` (95% of the configured universe must be evaluable); below that threshold the sweep sends no alerts.
-
-Market hours and session dates use `Asia/Kolkata` and the checked-in NSE Capital Market calendar in `config/nse_trading_calendar.yaml`. The file is versioned by year and cites the official circular at its header. Unknown years fail closed until their official calendar is added. Special sessions remain closed unless explicit hours are configured.
-
-`upstox.historical_min_interval_seconds`, `upstox.quote_min_interval_seconds`, `upstox.request_max_retries`, and `upstox.quote_batch_size` in `config/config.yaml` control pacing, bounded transient retries, and quote batching. HTTP 429 and 5xx/network errors use bounded backoff; permanent 4xx errors fail immediately. Historical backfill is paced below the standard user quota; normal recurring scans use batched quotes and cached history.
-
-## Alert escalation and delivery deduplication
-
-For each stock, direction, and calendar date, the scanner stores one confluence signal row. It sends the initial qualifying score (for example, 2/6), then sends again only when the score increases (for example, 3/6). The row's score, price, check snapshot, and chart reference are updated to the highest observed score. Delivery scores are recorded independently per destination, so an unchanged score is not resent and a failed destination can be retried without resending to destinations that succeeded. Existing `notified` confluence rows are migrated as already delivered at their stored score for pre-existing destinations to avoid rollout duplicates; a newly enabled group still receives its first alert.
-
-## Project Structure
-```
-stock-monitor/
-├── config/
-│   ├── config.yaml          # All settings (safe to commit)
-│   └── secrets.yaml         # API keys (NEVER commit — gitignored)
-├── data/
-│   └── stocks.db            # SQLite database
-├── src/
-│   ├── main.py              # Entry point + scheduler
-│   ├── config_loader.py     # Config + secrets merge
-│   ├── db.py                # SQLite models + helpers
-│   ├── scanner.py           # Main scanning orchestrator
-│   ├── fetcher/
-│   │   ├── upstox.py        # Upstox API (OHLCV, instruments, LTP)
-│   │   ├── upstox_auth_setup.py  # One-time OAuth2 setup
-│   │   └── fundamentals.py  # Screener.in scraper
-│   ├── signals/
-│   │   ├── rsi.py           # RSI signal
-│   │   ├── macd.py          # MACD crossover
-│   │   ├── ema_cross.py     # EMA crossovers (9×21, 21×50, 50×200)
-│   │   └── volume_breakout.py # Volume spike + price breakout
-│   └── notifiers/
-│       ├── base.py          # Abstract base + AlertPayload
-│       ├── telegram.py      # Telegram Bot API
-│       ├── discord.py       # Discord webhook
-│       └── email_notifier.py # SMTP email
-├── charts/
-│   ├── chart_generator.py   # Candlestick chart with indicators
-│   └── output/              # Generated chart PNGs
-├── systemd/
-│   └── stock-monitor.service
-├── setup.sh                 # One-time OCI setup script
-└── requirements.txt
-```
-
-## Signals Reference
-
-RSI can run in `mean_reversion` mode (the legacy oversold/overbought levels) or
-`trend_momentum` mode (configured bullish/bearish RSI thresholds). In
-`mean_reversion`, `confirmation: level` preserves the prior behavior, while
-`cross_back` waits for RSI to re-enter the range. The checked-in config
-explicitly selects the legacy mean-reversion policy.
-
-Confluence scores count independent groups, not individual checks: EMA pairs
-form the **trend** group, RSI and MACD form **momentum**, and volume breakout
-forms **participation**. Several EMA crosses can explain the trend vote but
-cannot create multiple votes. `min_groups_to_alert` defaults to 2. In
-`crossover` mode only fresh events count; in `trend` mode aligned EMA/MACD/RSI
-states can count as continuation, while volume remains event-based. Opposing
-group votes are rejected when `direction_consensus` is enabled. Alerts show
-the group score and raw checks so the result remains auditable.
-
-| Signal | Type | Trigger |
-|--------|------|---------|
-| RSI Oversold | BUY | Mean reversion: RSI at/below configured threshold (or crosses back above it if selected) |
-| RSI Overbought | SELL | Mean reversion: RSI at/above configured threshold (or crosses back below it if selected) |
-| MACD Bullish Cross | BUY | MACD crosses above signal line |
-| MACD Bearish Cross | SELL | MACD crosses below signal line |
-| EMA 9×21 Bullish | BUY | 9 EMA crosses above 21 EMA |
-| EMA 9×21 Bearish | SELL | 9 EMA crosses below 21 EMA |
-| EMA 21×50 Bullish | BUY | 21 EMA crosses above 50 EMA |
-| EMA 21×50 Bearish | SELL | 21 EMA crosses below 50 EMA |
-| Golden Cross | BUY | 50 EMA crosses above 200 EMA |
-| Death Cross | SELL | 50 EMA crosses below 200 EMA |
-| Volume Breakout Bullish | BUY | 2×+ volume + price breaks 20-day high |
-| Volume Breakout Bearish | SELL | 2×+ volume + price breaks 20-day low |
-
-## Telegram Alert Format
-
-Each alert includes:
-- 📍 Signal type + direction (BUY/SELL)
-- 💰 Current price
-- 🏢 Company name + market cap + cap category
-- 📊 P/E, ROE, promoter holding
-- 📉 Last 4 quarters net profit trend
-- 🔗 Screener.in link
-- 📸 Candlestick chart with EMA + RSI + MACD
-
-## Upstox Token Note
-
-Upstox access tokens expire **daily**. A cron job can automate re-auth if you have a headless flow, but for now the manual auth script must be run each morning before market open. Future enhancement: implement token persistence via Upstox refresh token.
-
-## Coming Next (Docker)
-Once stable on systemd, wrap in a Docker container for portability and easier updates.
-## Offline backtest and model risk references
-
-Run the historical replay from the repository root with the project virtualenv:
-
-```bash
-./.venv/bin/python -m src.backtest.cli --from-date 2025-01-01 --to-date 2025-12-31
-```
-
-The command reads only the local SQLite daily-candle cache and writes reproducible JSON, CSV, and text reports under `reports/backtests/` by default. Signals use data through the completed session close and enter at the next available session open; configured stop/target, fee, and slippage assumptions are included in the report. It sends no alerts. Point-in-time universe snapshots are applied when available; otherwise current-universe survivorship bias is disclosed. Market/sector context remains informational in the replay; filter mode is rejected because historical sector mappings are not stored point-in-time.
-
-Live alerts can include ATR-based stop/target references derived from completed daily bars. These are model estimates, not orders. Position quantity is omitted unless both `risk.account_capital_inr` and `risk.risk_percent` are explicitly configured.
-
-For an explicitly scheduled one-off readiness-gated cache refresh (including a weekend), use `./.venv/bin/python -m src.refresh_daily_cache_once`. This runs no signal scan or notifier. If provider probe dates do not agree, it safely skips rather than marking the universe missing.
+This repository is provided for software and research use. It is not investment advice, an execution system, or a guarantee of results. Review provider terms, data quality, configuration, and backtest assumptions before relying on alerts. No license file is currently included.
