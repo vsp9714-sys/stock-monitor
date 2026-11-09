@@ -19,7 +19,6 @@ years:
       - {date: "2026-11-10", name: "Diwali-Balipratipada"}
       - {date: "2026-11-24", name: "Prakash Gurpurb Sri Guru Nanak Dev"}
       - {date: "2026-12-25", name: "Christmas"}
-    # NSE announced Muhurat Trading for Nov 8; exact hours were not yet notified.
-    # Keep closed until official session times are added here.
+    # NSE Circular NSE/CMTR/76941 (2026-10-19): special live equity session.
     special_sessions:
-      "2026-11-08": {open_time: null, close_time: null, name: "Muhurat Trading (hours pending)"}
+      "2026-11-08": {open_time: "14:20", close_time: "15:30", name: "Diwali Muhurat Trading", source: "https://nsearchives.nseindia.com/content/circulars/CMTR76941.pdf"}

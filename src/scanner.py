@@ -57,7 +57,14 @@ from src.signals.rsi import detect_rsi_signal
 from src.signals.confluence import evaluate_confluence
 from src.signals.volume_breakout import detect_volume_breakout
 from src.universe import UniverseSelectionError, UniverseSelector
-from src.market_calendar import CalendarUnavailable, IST, is_market_open, is_trading_day
+from src.market_calendar import (
+    CalendarUnavailable,
+    IST,
+    is_valid_candle_day,
+    is_market_open,
+    is_trading_day,
+    latest_completed_session_day,
+)
 from src.market_context import average_traded_value, regime_for_candles, relative_strength
 from src.derivatives import nearest_expiry, summarize_option_chain
 from src.risk import risk_reference
@@ -130,6 +137,21 @@ def _valid_ohlcv_frame(frame: pd.DataFrame) -> bool:
         return not timestamps.isna().any() and not timestamps.duplicated().any()
     except (KeyError, TypeError, ValueError, OverflowError):
         return False
+
+
+def _json_default(value):
+    """Convert common NumPy/pandas/date values to JSON-native primitives."""
+    if value is pd.NA or value is pd.NaT:
+        return None
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return value.isoformat()
+    if isinstance(value, set):
+        return sorted(value, key=str)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def _daily_timestamp(value) -> datetime:
@@ -433,6 +455,8 @@ class Scanner:
                         candle_ts = _daily_timestamp(row.ts)
                         if before_daily_finalization and candle_ts.date() >= current_ist.date():
                             continue
+                        if not is_valid_candle_day(candle_ts.date(), getattr(self, "cfg", {}).get("market", {})):
+                            continue
                         symbol_rows.append({
                             "symbol": stock.symbol,
                             "interval": "1d",
@@ -526,6 +550,14 @@ class Scanner:
         target_day = target_session or current.date()
         if target_day > current.date():
             raise ValueError("Daily refresh target session cannot be in the future")
+        try:
+            if not is_trading_day(target_day, getattr(self, "cfg", {}).get("market", {})):
+                return {"universe_size": 0, "updated": 0, "failed": 0, "skipped": True,
+                        "reason": "target_not_trading_day", "session_date": target_day.isoformat()}
+        except CalendarUnavailable as exc:
+            logger.error("Daily refresh skipped for unknown target session: %s", exc)
+            return {"universe_size": 0, "updated": 0, "failed": 0, "skipped": True,
+                    "reason": "calendar_unavailable", "session_date": target_day.isoformat()}
 
         stocks = self.get_active_stocks(limit=limit)
         session = get_session()
@@ -562,12 +594,18 @@ class Scanner:
             # Persist the conservative cleanup before network work. If this
             # process stops, scans fall back to prior confirmed sessions.
             session.commit()
-            latest_by_symbol = dict(
-                session.query(OHLCVCache.symbol, func.max(OHLCVCache.ts))
+            latest_by_symbol = {}
+            for symbol, cached_ts in (
+                session.query(OHLCVCache.symbol, OHLCVCache.ts)
                 .filter(OHLCVCache.interval == "1d")
-                .group_by(OHLCVCache.symbol)
-                .all()
-            )
+                .order_by(OHLCVCache.symbol, OHLCVCache.ts.desc())
+                .yield_per(10000)
+            ):
+                if symbol in latest_by_symbol:
+                    continue
+                cached_day = pd.Timestamp(cached_ts).date()
+                if is_valid_candle_day(cached_day, getattr(self, "cfg", {}).get("market", {})):
+                    latest_by_symbol[symbol] = cached_ts
             for index, stock in enumerate(stocks, 1):
                 state = refresh_state.get(stock.symbol)
                 if state and state.session_date == target_day and state.status == "confirmed":
@@ -609,7 +647,9 @@ class Scanner:
                         # Never persist today's unfinished bar. The refresh runs
                         # after close; if the provider has not published today's
                         # completed candle yet, a later run will fetch it.
-                        if ts.date() > target_day:
+                        if ts.date() > target_day or not is_valid_candle_day(
+                            ts.date(), getattr(self, "cfg", {}).get("market", {})
+                        ):
                             continue
                         symbol_rows.append({
                             "symbol": stock.symbol,
@@ -707,7 +747,7 @@ class Scanner:
         checkpoint_symbols: int = 20,
         manual: bool = False,
     ) -> dict:
-        """Probe Upstox at the scheduled 06:00 IST run, then refresh the latest completed session.
+        """Probe Upstox during the scheduled 08:00 IST window, then refresh the latest completed session.
 
         A small liquid-symbol readiness probe avoids a full-universe pass while
         the provider is still publishing the prior session. The full pass is
@@ -724,9 +764,9 @@ class Scanner:
             return {"universe_size": 0, "updated": 0, "failed": 0, "skipped": True,
                     "reason": "calendar_unavailable"}
         if (not manual and not trading_day) or (
-            not manual and not (datetime_time(6, 0) <= current.time() < datetime_time(7, 0))
+            not manual and not (datetime_time(8, 0) <= current.time() < datetime_time(8, 30))
         ):
-            logger.info("Morning daily-candle readiness check skipped outside its weekday schedule window.")
+            logger.info("Morning daily-candle readiness check skipped outside its weekday 08:00-08:30 window.")
             return {"universe_size": 0, "updated": 0, "failed": 0, "skipped": True}
 
         stocks = {stock.symbol: stock for stock in self.get_active_stocks()}
@@ -738,7 +778,8 @@ class Scanner:
                     "reason": "probe_symbols_missing"}
 
         probe_dates = []
-        probe_from = (current.date() - timedelta(days=7)).isoformat()
+        expected_session = latest_completed_session_day(current, getattr(self, "cfg", {}).get("market", {}))
+        probe_from = (current.date() - timedelta(days=14)).isoformat()
         for symbol in probe_symbols:
             stock = stocks[symbol]
             candles = self.fetcher.get_historical_candles(
@@ -748,8 +789,21 @@ class Scanner:
                 logger.info("Daily refresh not ready: provider returned no recent candles for %s", symbol)
                 return {"universe_size": len(stocks), "updated": 0, "failed": 0, "skipped": True,
                         "reason": "provider_not_ready", "probe_symbol": symbol}
-            latest = max(_daily_timestamp(row.ts).date() for row in candles.itertuples(index=False))
-            probe_dates.append(latest)
+            valid_dates = [
+                _daily_timestamp(row.ts).date()
+                for row in candles.itertuples(index=False)
+                if _daily_timestamp(row.ts).date() <= expected_session
+                and is_valid_candle_day(_daily_timestamp(row.ts).date(), getattr(self, "cfg", {}).get("market", {}))
+            ]
+            if not valid_dates:
+                logger.info(
+                    "Daily refresh not ready: no valid completed NSE-session candles for %s; expected at most %s",
+                    symbol, expected_session,
+                )
+                return {"universe_size": len(stocks), "updated": 0, "failed": 0, "skipped": True,
+                        "reason": "provider_not_ready", "probe_symbol": symbol,
+                        "expected_session": expected_session.isoformat()}
+            probe_dates.append(max(valid_dates))
 
         if len(set(probe_dates)) != 1:
             logger.info("Daily refresh not ready: probe symbols disagree on latest session dates: %s", probe_dates)
@@ -757,12 +811,29 @@ class Scanner:
                     "reason": "probe_dates_disagree", "probe_dates": [d.isoformat() for d in probe_dates]}
 
         target = probe_dates[0]
+        if target < expected_session:
+            logger.info(
+                "Daily refresh not ready: latest valid probe session %s is older than expected completed session %s",
+                target, expected_session,
+            )
+            return {"universe_size": len(stocks), "updated": 0, "failed": 0, "skipped": True,
+                    "reason": "provider_not_ready", "session_date": target.isoformat(),
+                    "expected_session": expected_session.isoformat()}
         session = get_session()
         try:
-            cached_latest = session.query(func.max(OHLCVCache.ts)).filter(OHLCVCache.interval == "1d").scalar()
-            if cached_latest is not None and target < pd.Timestamp(cached_latest).date():
+            cached_dates = [
+                pd.Timestamp(value).date()
+                for (value,) in session.query(OHLCVCache.ts).filter(OHLCVCache.interval == "1d").distinct().all()
+                if value is not None
+            ]
+            valid_cached_dates = [
+                cached_day for cached_day in cached_dates
+                if is_valid_candle_day(cached_day, getattr(self, "cfg", {}).get("market", {}))
+            ]
+            cached_latest = max(valid_cached_dates, default=None)
+            if cached_latest is not None and target < cached_latest:
                 logger.warning("Daily refresh probe date %s is behind cache date %s; refusing regression.",
-                               target, pd.Timestamp(cached_latest).date())
+                               target, cached_latest)
                 return {"universe_size": len(stocks), "updated": 0, "failed": 0, "skipped": True,
                         "reason": "provider_behind_cache", "session_date": target.isoformat()}
         finally:
@@ -1039,6 +1110,10 @@ class Scanner:
                 .yield_per(10000)
             )
             for row in rows:
+                if not is_valid_candle_day(
+                    _daily_timestamp(row.ts).date(), getattr(self, "cfg", {}).get("market", {})
+                ):
+                    continue
                 grouped[row.symbol].append(tuple(row[1:]))
         return {
             symbol: pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
@@ -1378,7 +1453,7 @@ class Scanner:
                                     )
                                 } if fund else {"freshness": "unavailable"},
                                 "average_traded_value": liquidity_metrics.get(stock.symbol),
-                            }),
+                            }, default=_json_default),
                             chart_path=chart_path,
                         )
                         saved_detail = json.loads(saved.indicator_detail or "{}")

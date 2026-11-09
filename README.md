@@ -67,7 +67,7 @@ python -m src.fetcher.upstox_auth_setup
 - Confluence defaults to at least two agreeing independent groups, fresh-event `crossover` mode, and rejection of conflicting directions. RSI defaults to mean-reversion and level confirmation.
 - Confirmed alerts use completed daily candles. Provisional intraday alerts are separately labelled/deduplicated, use current-session OHLC only in memory, and do not write partial bars to the canonical daily cache. Provisional volume uses the accepted comparison with full prior-day volumes, not a time-of-day-adjusted baseline.
 - Market/sector context is informational by default. Derivatives/OI context is disabled by default. ATR risk levels are estimates, never orders; position size is omitted unless account capital and risk percent are configured.
-- The daily 06:00 IST readiness job refreshes cache only when the configured provider probes agree on the latest completed session. It does not scan or alert. The every-15-minute scheduler is separate.
+- The daily 08:00 IST readiness window (retries at 08:00, 08:10, and 08:20) refreshes cache only when the configured provider probes agree on the latest completed NSE session. It does not scan or alert. The every-15-minute market-hours scanner is separate.
 
 ## License and intended use
 

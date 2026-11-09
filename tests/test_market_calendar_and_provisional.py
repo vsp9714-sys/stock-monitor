@@ -1,9 +1,11 @@
 from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
+import json
+import numpy as np
 import pandas as pd
 
-from src.market_calendar import CalendarUnavailable, is_market_open, is_trading_day
+from src.market_calendar import CalendarUnavailable, is_market_open, is_trading_day, latest_completed_session_day
 from src.notifiers.base import AlertPayload
 from src.scanner import Scanner, _valid_ohlcv_frame, _validate_quote
 
@@ -12,11 +14,18 @@ def test_nse_calendar_uses_exchange_date_and_holiday_list():
     ist = ZoneInfo("Asia/Kolkata")
     assert is_trading_day(date(2026, 11, 6))
     assert not is_trading_day(date(2026, 11, 10))  # official NSE holiday
-    assert not is_trading_day(date(2026, 11, 8))  # Muhurat hours have not been published
+    assert is_trading_day(date(2026, 11, 8))  # NSE-published Muhurat special session
+    assert not is_trading_day(date(2026, 11, 15))  # ordinary Sunday
     assert not is_trading_day(date(2026, 11, 7))  # Saturday
     assert is_market_open(datetime(2026, 11, 6, 9, 16, tzinfo=ist))
     assert is_market_open(datetime(2026, 11, 6, 3, 46, tzinfo=timezone.utc))
     assert not is_market_open(datetime(2026, 11, 10, 10, 0, tzinfo=ist))
+
+
+def test_latest_completed_session_includes_published_muhurat_session():
+    ist = ZoneInfo("Asia/Kolkata")
+    assert latest_completed_session_day(datetime(2026, 11, 9, 8, 0, tzinfo=ist)) == date(2026, 11, 8)
+    assert latest_completed_session_day(datetime(2026, 11, 9, 16, 0, tzinfo=ist)) == date(2026, 11, 9)
 
 
 def test_unknown_calendar_year_fails_closed():
@@ -107,7 +116,9 @@ def test_intraday_path_is_separate_and_provisional(monkeypatch):
         evaluated.append((provisional, frame.copy()))
         signal_type = "provisional_intraday_confluence_buy" if provisional else "confluence_buy"
         return ({"signal_type": signal_type, "direction": "BUY", "price": frame.close.iloc[-1],
-                 "confluence_score": 2, "total_signals": 3, "checks": []}, frame)
+                 "confluence_score": 2, "total_signals": 3,
+                 "group_votes": {"trend": np.bool_(True)},
+                 "checks": [{"name": "numpy bool regression", "met": np.bool_(True)}]}, frame)
 
     scanner._scan_stock = evaluate
     delivered = []
@@ -117,6 +128,9 @@ def test_intraday_path_is_separate_and_provisional(monkeypatch):
 
     def fake_upsert_signal(**kwargs):
         detail = kwargs["indicator_detail"]
+        parsed_detail = json.loads(detail)
+        assert parsed_detail["group_votes"]["trend"] is True
+        assert parsed_detail["checks"][0]["met"] is True
         return type("Saved", (), {
             "id": len(delivered) + 1, "indicator_detail": detail,
             "indicator_value": kwargs["indicator_value"], "chart_path": "chart.png",
