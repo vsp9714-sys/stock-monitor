@@ -7,7 +7,7 @@ This is the detailed operator guide for the checked-in application. The source o
 The application has three distinct paths:
 
 1. **Scheduled scanner (`python -m src.main`)** — initializes SQLite and the verified instrument master, then scans every `market.scan_interval_minutes`. A scheduled tick only calls the scanner while the configured NSE session/calendar is open. Starting the process during open market hours triggers an immediate scan. Scans may send alerts.
-2. **Daily cache maintenance** — at 06:00 Asia/Kolkata on weekdays, it probes Upstox for the latest completed daily candle. The configured probe symbols must agree on a session date before the selected-universe refresh begins. It only writes cache/checkpoints; it does not scan or notify. Universe membership is separately refreshed at 08:30 IST; the verified instrument master at startup and 08:15 IST.
+2. **Daily cache maintenance** — during the 08:00–08:30 Asia/Kolkata window on weekdays, it probes Upstox at 08:00, 08:10, and 08:20 for the latest completed NSE session. The configured probe symbols must agree on a valid exchange session before the selected-universe refresh begins. It only writes cache/checkpoints; it does not scan or notify. Universe membership is separately refreshed at 08:30 IST; the verified instrument master at startup and 08:15 IST.
 3. **One-shot/offline commands** — cache warmup, manual cache refresh, scan-once, pruning, and backtest. Read each command's effect below; `scan_once` can send notifications while the cache commands and backtest do not.
 
 All times and exchange session dates are interpreted in `Asia/Kolkata`. The checked-in NSE Capital Market holiday calendar is versioned in `config/nse_trading_calendar.yaml`; an unknown year fails closed rather than assuming holidays or sessions.
@@ -34,7 +34,7 @@ Fetches sufficient daily history for the configured universe, uses durable check
 
 ### Run a readiness-gated cache refresh
 
-Scheduled equivalent, limited to the 06:00–07:00 IST window:
+Scheduled equivalent, limited to the 08:00–08:30 IST window:
 
 ```bash
 python -m src.refresh_daily_cache

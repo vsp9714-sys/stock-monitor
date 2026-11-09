@@ -217,9 +217,10 @@ def main() -> None:
     schedule.every().day.at("08:15", "Asia/Kolkata").do(refresh_instruments_job)
     schedule.every().day.at("08:30", "Asia/Kolkata").do(refresh_universe_job)
 
-    # At 06:00 IST on weekdays, probe Upstox's latest completed session and
-    # refresh it if ready. Otherwise retain the existing confirmed cache.
-    schedule.every().day.at("06:00", "Asia/Kolkata").do(refresh_daily_cache_job)
+    # Probe repeatedly in the 08:00-08:30 IST publication window. The readiness
+    # checks target the latest completed NSE session and reject weekend dates.
+    for minute in ("08:00", "08:10", "08:20"):
+        schedule.every().day.at(minute, "Asia/Kolkata").do(refresh_daily_cache_job)
 
     logger.info(f"Scheduler started. Scan interval: every {scan_interval} minutes.")
     logger.info("Market hours: 09:15 – 15:30 IST, Mon–Fri")

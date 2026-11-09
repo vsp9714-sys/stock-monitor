@@ -201,7 +201,7 @@ def test_cache_warmup_resumes_completed_symbols(test_db_session, monkeypatch):
         def get_daily_candles(self, instrument_key, days):
             self.calls.append(instrument_key)
             return pd.DataFrame([{
-                "ts": pd.Timestamp("2026-01-01") + pd.Timedelta(days=i),
+                "ts": pd.Timestamp("2026-01-05") + pd.Timedelta(days=i),
                 "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10,
             } for i in range(3)])
 
@@ -286,7 +286,7 @@ def test_manual_morning_readiness_check_can_run_outside_schedule_window(test_db_
         def get_historical_candles(self, instrument_key, interval, *, from_date, to_date):
             assert interval == "day"
             return pd.DataFrame([{
-                "ts": pd.Timestamp("2026-11-05"),
+                "ts": pd.Timestamp("2026-11-06"),
                 "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10,
             }])
 
@@ -304,9 +304,93 @@ def test_manual_morning_readiness_check_can_run_outside_schedule_window(test_db_
     scanner.refresh_completed_daily_cache = refresh
     result = scanner.refresh_latest_completed_daily_cache(now=now, manual=True)
     assert result["skipped"] is False
-    assert captured["target_session"].isoformat() == "2026-11-05"
+    assert captured["target_session"].isoformat() == "2026-11-06"
     assert captured["now"] == now
     assert captured["allow_weekend"] is True
+
+
+def test_morning_readiness_uses_published_muhurat_session(test_db_session, monkeypatch):
+    stocks = [
+        type("StockRef", (), {"symbol": symbol, "instrument_key": f"NSE_EQ|{symbol}"})()
+        for symbol in ("RELIANCE", "TCS", "360ONE")
+    ]
+
+    class Fetcher:
+        def get_historical_candles(self, instrument_key, interval, *, from_date, to_date):
+            return pd.DataFrame([
+                {"ts": pd.Timestamp(day), "open": 1, "high": 2, "low": 0.5,
+                 "close": 1.5, "volume": 10}
+                for day in ("2026-11-06", "2026-11-08")
+            ])
+
+    scanner = object.__new__(Scanner)
+    scanner.fetcher = Fetcher()
+    scanner.cfg = {"market": {}}
+    scanner.get_active_stocks = lambda: stocks
+    captured = {}
+    scanner.refresh_completed_daily_cache = lambda **kwargs: captured.update(kwargs) or {
+        "universe_size": 495, "updated": 495, "failed": 0, "skipped": False
+    }
+    monkeypatch.setattr("src.scanner.get_session", lambda: test_db_session)
+
+    result = scanner.refresh_latest_completed_daily_cache(
+        now=datetime(2026, 11, 9, 8, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+    )
+    assert result["skipped"] is False
+    assert captured["target_session"].isoformat() == "2026-11-08"
+
+
+def test_refresh_rejects_non_trading_target_without_fetching(test_db_session, monkeypatch):
+    scanner = object.__new__(Scanner)
+    scanner.cfg = {"market": {}}
+    scanner.get_active_stocks = lambda limit=None: pytest.fail("must reject target before work")
+    monkeypatch.setattr("src.scanner.get_session", lambda: test_db_session)
+    result = scanner.refresh_completed_daily_cache(
+        now=datetime(2026, 11, 16, 16, 0, tzinfo=ZoneInfo("Asia/Kolkata")),
+        target_session=datetime(2026, 11, 15).date(),
+    )
+    assert result["skipped"] is True
+    assert result["reason"] == "target_not_trading_day"
+
+
+def test_refresh_discards_non_trading_day_bars_from_provider(test_db_session, monkeypatch):
+    stock = type("StockRef", (), {"symbol": "AAA", "instrument_key": "NSE_EQ|AAA"})()
+
+    class Fetcher:
+        def get_historical_candles(self, instrument_key, interval, *, from_date, to_date):
+            return pd.DataFrame([
+                {"ts": pd.Timestamp(day), "open": 1, "high": 2, "low": 0.5,
+                 "close": close, "volume": 10}
+                for day, close in (("2026-11-13", 1.5), ("2026-11-15", 1.8))
+            ])
+
+    scanner = object.__new__(Scanner)
+    scanner.fetcher = Fetcher()
+    scanner.cfg = {"market": {}}
+    scanner.get_active_stocks = lambda limit=None: [stock]
+    monkeypatch.setattr("src.scanner.get_session", lambda: test_db_session)
+    result = scanner.refresh_completed_daily_cache(
+        now=datetime(2026, 11, 16, 16, 0, tzinfo=ZoneInfo("Asia/Kolkata")),
+        target_session=datetime(2026, 11, 13).date(), checkpoint_symbols=1,
+    )
+    assert result["updated"] == 1
+    rows = test_db_session.query(OHLCVCache).filter_by(interval="1d").all()
+    assert [row.ts.date().isoformat() for row in rows] == ["2026-11-13"]
+
+
+def test_scan_cache_loader_never_uses_sunday_daily_rows(test_db_session):
+    upsert_ohlcv_rows(test_db_session, [
+        {"symbol": "AAA", "interval": "1d", "ts": datetime(2026, 11, 13),
+         "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10},
+        {"symbol": "AAA", "interval": "1d", "ts": datetime(2026, 11, 15),
+         "open": 1.5, "high": 2, "low": 1, "close": 1.8, "volume": 2},
+    ])
+    scanner = object.__new__(Scanner)
+    scanner.cfg = {"market": {}}
+    stock = type("StockRef", (), {"symbol": "AAA"})()
+    frame = scanner._load_cached_daily_frames([stock], test_db_session)["AAA"]
+    assert len(frame) == 1
+    assert pd.Timestamp(frame.ts.iloc[-1]).date().isoformat() == "2026-11-13"
 
 
 def test_scheduled_readiness_check_still_obeys_time_window():

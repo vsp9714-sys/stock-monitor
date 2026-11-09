@@ -2,7 +2,7 @@
 
 Examples:
   python -m src.refresh_daily_cache --manual --universe nifty500
-  python -m src.refresh_daily_cache  # only when inside the configured 06:00-07:00 window
+  python -m src.refresh_daily_cache  # only when inside the configured 08:00-08:30 window
 
 This command refreshes OHLCV only; it never runs a scan or sends notifications.
 """
@@ -19,7 +19,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--manual", action="store_true",
-        help="allow a one-shot readiness check outside the scheduled 06:00-07:00 IST window",
+        help="allow a one-shot readiness check outside the scheduled 08:00-08:30 IST window",
     )
     parser.add_argument(
         "--universe", choices=("all_nse", "nifty500", "custom", "composed"),
