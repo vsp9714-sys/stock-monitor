@@ -120,6 +120,30 @@ def run_scan_job() -> None:
         logger.error(f"Scan job failed: {e}", exc_info=True)
 
 
+def run_power_hour_scan_job() -> None:
+    """Dedicated 15:15 IST Power Hour confirmation scan for end-of-day confirmed setups."""
+    if not is_market_hours():
+        logger.debug("Market closed — skipping 15:15 IST Power Hour scan.")
+        return
+    logger.info(f"[{next_scan_time()}] Running dedicated 3:15 PM Power Hour confirmation scan...")
+    try:
+        summary = scanner.run_scan()
+        logger.info("Scan universe provenance: %s", summary.universe_metadata)
+        if summary.complete:
+            logger.info(
+                "3:15 PM Power Hour scan complete: %s/%s evaluated; %s alerts dispatched.",
+                summary.evaluated_count, summary.universe_size, summary.alerts_dispatched,
+            )
+        else:
+            logger.error(
+                "3:15 PM Power Hour scan incomplete: %s/%s evaluated; %s failures; %s alerts dispatched.",
+                summary.evaluated_count, summary.universe_size,
+                summary.failed_count, summary.alerts_dispatched,
+            )
+    except Exception as e:
+        logger.error(f"3:15 PM Power Hour scan job failed: {e}", exc_info=True)
+
+
 def refresh_instruments_job() -> None:
     """Scheduled job: refresh instrument master daily before market open."""
     logger.info("Refreshing instrument master (daily job)...")
@@ -212,6 +236,9 @@ def main() -> None:
 
     # Schedule: scan every N minutes
     schedule.every(scan_interval).minutes.do(run_scan_job)
+
+    # Dedicated 3:15 PM IST Power Hour scan (end-of-day swing confirmation window)
+    schedule.every().day.at("15:15", "Asia/Kolkata").do(run_power_hour_scan_job)
 
     # Prepare instruments and configured membership before the market opens.
     schedule.every().day.at("08:15", "Asia/Kolkata").do(refresh_instruments_job)

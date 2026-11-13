@@ -25,6 +25,8 @@ class AlertPayload:
     provisional: bool = False
     signal_session_date: Optional[str] = None
     bar_status: Optional[str] = None
+    alert_tier: str = "confirmed_daily" # "confirmed_daily", "intraday_radar", "power_hour_confirmed"
+    clv: Optional[float] = None
 
     # Confluence metadata
     confluence_score: int = 1
@@ -64,8 +66,10 @@ class AlertPayload:
     chart_path: Optional[str] = None
 
     def format_signal_label(self) -> str:
-        if self.provisional and self.signal_type.startswith("provisional_intraday_confluence"):
-            return f"PROVISIONAL · Intraday Confluence {self.direction} ({self.confluence_score}/{self.total_signals} groups; {self.confluence_mode})"
+        if self.provisional:
+            if "power_hour" in self.signal_type or self.alert_tier == "power_hour_confirmed":
+                return f"CONFIRMED SWING ENTRY (3:15 PM Window) · {self.direction} ({self.confluence_score}/{self.total_signals} groups; {self.confluence_mode})"
+            return f"PROVISIONAL · Intraday Radar {self.direction} ({self.confluence_score}/{self.total_signals} groups; {self.confluence_mode})"
         if self.signal_type.startswith("confluence"):
             return f"Confluence {self.direction} ({self.confluence_score}/{self.total_signals} groups; {self.confluence_mode})"
         labels = {
@@ -87,6 +91,11 @@ class AlertPayload:
 
     def format_signal_provenance(self) -> str:
         if self.provisional:
+            if "power_hour" in self.signal_type or self.alert_tier == "power_hour_confirmed":
+                return (
+                    f"3:15 PM Power Hour session {self.signal_session_date or 'unknown'}; "
+                    f"EOD candle confirmation; quote time {self.quote_timestamp or 'unknown'}"
+                )
             return (
                 f"PROVISIONAL session {self.signal_session_date or 'unknown'}; "
                 f"bar not finalized; quote time {self.quote_timestamp or 'unknown'}"

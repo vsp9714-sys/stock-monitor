@@ -20,6 +20,7 @@ Flow per scan cycle:
       - Send ONE rich alert with all check statuses to Telegram/Discord/Email
 3. Deduplication: one alert per stock per direction per trading day
 """
+import inspect
 import json
 import logging
 import math
@@ -55,7 +56,7 @@ from src.signals.ema_cross import detect_ema_crossover
 from src.signals.macd import detect_macd_signal
 from src.signals.rsi import detect_rsi_signal
 from src.signals.confluence import evaluate_confluence
-from src.signals.volume_breakout import detect_volume_breakout
+from src.signals.volume_breakout import detect_volume_breakout, nse_expected_volume_fraction
 from src.universe import UniverseSelectionError, UniverseSelector
 from src.market_calendar import (
     CalendarUnavailable,
@@ -217,6 +218,7 @@ class Scanner:
         self.signal_cfg = self.cfg.get("signals", {})
         self.universe_cfg = self.cfg.get("universe", {})
         self.confluence_cfg = self.cfg.get("confluence", {})
+        self.guardrails_cfg = self.cfg.get("guardrails", {})
         from src.config_loader import validate_signal_config
         validate_signal_config(self.cfg)
         self.universe_selector = UniverseSelector(self.cfg, get_session)
@@ -858,7 +860,12 @@ class Scanner:
     # ─── Single Stock Scan & Confluence Evaluation ────────────────────────
 
     def _scan_stock(
-        self, stock: Stock, df: pd.DataFrame, provisional: bool = False
+        self,
+        stock: Stock,
+        df: pd.DataFrame,
+        provisional: bool = False,
+        current_time: Optional[datetime] = None,
+        is_power_hour: bool = False,
     ) -> tuple[Optional[dict], pd.DataFrame]:
         """
         Scan a single stock across all indicator checks and evaluate confluence.
@@ -1006,12 +1013,29 @@ class Scanner:
             # ── 4. Volume Breakout Check ────────────────────────────────
             if self.signal_cfg.get("volume_breakout", {}).get("enabled", True):
                 vol_cfg = self.signal_cfg["volume_breakout"]
+                vol_pace_cfg = getattr(self, "guardrails_cfg", {}).get("volume_pace", {})
+                use_pace = vol_pace_cfg.get("enabled", True)
+                min_floor = float(vol_pace_cfg.get("min_fraction_floor", 0.05))
+                frac = (
+                    nse_expected_volume_fraction(current_time, min_floor=min_floor)
+                    if (provisional and use_pace) else None
+                )
                 vol_result = detect_volume_breakout(
                     stock.symbol, df,
                     volume_multiplier=vol_cfg.get("volume_multiplier", 2.0),
                     lookback_days=vol_cfg.get("breakout_lookback_days", 20),
+                    expected_fraction=frac,
+                    min_fraction_floor=min_floor,
                 )
                 vol_ratio = vol_result.volume_ratio
+                raw_vol = getattr(vol_result, "raw_volume_ratio", vol_ratio) or vol_ratio
+                if provisional and frac is not None and frac < 0.95:
+                    value_text = f"{vol_ratio:.1f}× Pace"
+                    pace_desc_tag = f"R-Vol {vol_ratio:.1f}× pace"
+                else:
+                    value_text = f"{vol_ratio:.1f}× Avg Vol"
+                    pace_desc_tag = f"{vol_ratio:.1f}× Avg Vol"
+
                 if vol_result.triggered:
                     if vol_result.direction in ("BUY", "SELL"):
                         checks.append({
@@ -1023,10 +1047,10 @@ class Scanner:
                             "state_direction": vol_result.direction,
                             "met": True,
                             "direction": vol_result.direction,
-                            "value_text": f"{vol_ratio:.1f}× Avg Vol",
+                            "value_text": value_text,
                             "description": (
                                 ("Bullish Breakout" if vol_result.direction == "BUY" else "Bearish Breakdown")
-                                + (" (partial-session volume vs full-day history)" if provisional else "")
+                                + (f" ({pace_desc_tag}; partial-session volume vs full-day history)" if provisional else "")
                             ),
                         })
                     else:
@@ -1039,10 +1063,10 @@ class Scanner:
                             "state_direction": None,
                             "met": False,
                             "direction": None,
-                            "value_text": f"{vol_ratio:.1f}× Avg Vol",
+                            "value_text": value_text,
                             "description": (
                                 "Spike (No Price Breakout)"
-                                + (" (partial-session volume vs full-day history)" if provisional else "")
+                                + (f" ({pace_desc_tag}; partial-session volume vs full-day history)" if provisional else "")
                             ),
                         })
                 else:
@@ -1055,9 +1079,9 @@ class Scanner:
                         "state_direction": None,
                         "met": False,
                         "direction": None,
-                        "value_text": f"{vol_ratio:.1f}× Avg Vol",
+                        "value_text": value_text,
                         "description": (
-                            "Normal Volume (partial-session volume vs full-day history)"
+                            f"Normal Volume ({pace_desc_tag}; partial-session volume vs full-day history)"
                             if provisional else "Normal Volume"
                         ),
                     })
@@ -1076,6 +1100,56 @@ class Scanner:
             if consensus_dir is None:
                 return None, df
 
+            # ── 5. Wick Rejection Filter (Close Location Value / CLV) ───
+            guardrails_cfg = getattr(self, "guardrails_cfg", {})
+            wick_cfg = guardrails_cfg.get("wick_filter", {})
+            clv = None
+            if "high" in df.columns and "low" in df.columns and "close" in df.columns:
+                last_bar = df.iloc[-1]
+                day_high = float(last_bar["high"])
+                day_low = float(last_bar["low"])
+                day_close = float(last_bar["close"])
+                day_range = day_high - day_low
+                if day_range > 0:
+                    clv = (day_close - day_low) / day_range
+                else:
+                    clv = 0.5
+
+            apply_wick = wick_cfg.get("enabled", True) and (
+                (provisional and wick_cfg.get("apply_to_provisional", True)) or
+                (not provisional and wick_cfg.get("apply_to_daily", False))
+            )
+            if apply_wick and clv is not None:
+                min_buy_clv = float(wick_cfg.get("min_clv_buy", 0.70))
+                max_sell_clv = float(wick_cfg.get("max_clv_sell", 0.30))
+                if consensus_dir == "BUY" and clv < min_buy_clv:
+                    logger.debug(
+                        "%s: BUY signal rejected by wick filter (CLV %.2f < %.2f; upper wick rejection)",
+                        stock.symbol, clv, min_buy_clv,
+                    )
+                    return None, df
+                elif consensus_dir == "SELL" and clv > max_sell_clv:
+                    logger.debug(
+                        "%s: SELL signal rejected by wick filter (CLV %.2f > %.2f; lower wick rejection)",
+                        stock.symbol, clv, max_sell_clv,
+                    )
+                    return None, df
+
+            # Determine signal type, tier, and horizon
+            if provisional:
+                if is_power_hour:
+                    signal_type = f"power_hour_confluence_{consensus_dir.lower()}"
+                    alert_tier = "power_hour_confirmed"
+                    signal_horizon = "power_hour"
+                else:
+                    signal_type = f"provisional_intraday_confluence_{consensus_dir.lower()}"
+                    alert_tier = "intraday_radar"
+                    signal_horizon = "provisional_intraday"
+            else:
+                signal_type = f"confluence_{consensus_dir.lower()}"
+                alert_tier = "confirmed_daily"
+                signal_horizon = "confirmed_daily"
+
             # Confluence criteria satisfied!
             result = {
                 "symbol": stock.symbol,
@@ -1089,17 +1163,40 @@ class Scanner:
                 "score_version": 2,
                 "price": current_price,
                 "checks": confluence["checks"],
-                "signal_type": (
-                    f"provisional_intraday_confluence_{consensus_dir.lower()}"
-                    if provisional else f"confluence_{consensus_dir.lower()}"
-                ),
-                "signal_horizon": "provisional_intraday" if provisional else "confirmed_daily",
+                "signal_type": signal_type,
+                "signal_horizon": signal_horizon,
+                "alert_tier": alert_tier,
+                "clv": round(clv, 2) if clv is not None else None,
             }
             return result, df
 
         except Exception as e:
             logger.error(f"Error scanning {stock.symbol}: {e}", exc_info=False)
             raise
+
+    def _call_scan_stock(
+        self,
+        stock: Stock,
+        df: pd.DataFrame,
+        provisional: bool = False,
+        current_time: Optional[datetime] = None,
+        is_power_hour: bool = False,
+    ) -> tuple[Optional[dict], pd.DataFrame]:
+        """Safely call _scan_stock, adapting to legacy or test mocks with fewer parameters."""
+        sig = inspect.signature(self._scan_stock)
+        params = sig.parameters
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        param_names = set(params.keys())
+
+        kwargs = {}
+        if has_varkw or "provisional" in param_names:
+            kwargs["provisional"] = provisional
+        if has_varkw or "current_time" in param_names:
+            kwargs["current_time"] = current_time
+        if has_varkw or "is_power_hour" in param_names:
+            kwargs["is_power_hour"] = is_power_hour
+
+        return self._scan_stock(stock, df, **kwargs)
 
     # ─── Full Scan Cycle ─────────────────────────────────────────────────
 
@@ -1152,12 +1249,23 @@ class Scanner:
         current = current.astimezone(timezone.utc)
         current_ist = current.astimezone(IST)
         market_cfg = self.cfg.get("market", {})
+        ph_cfg = getattr(self, "guardrails_cfg", {}).get("two_tier_alerts", {})
+        ph_enabled = ph_cfg.get("enabled", True)
+        ph_start = ph_cfg.get("power_hour_start", "15:10")
+        try:
+            ph_h, ph_m = map(int, ph_start.split(":"))
+        except Exception:
+            ph_h, ph_m = 15, 10
         try:
             intraday_active = is_market_open(current_ist, market_cfg)
         except CalendarUnavailable as exc:
             universe_metadata.update({"calendar_available": False, "calendar_error": str(exc)})
             logger.error("Scan suppressed because exchange calendar is unavailable: %s", exc)
             return ScanSummary(len(stocks), 0, len(stocks), 0, False, universe_metadata)
+
+        is_power_hour = ph_enabled and intraday_active and (
+            current_ist.hour > ph_h or (current_ist.hour == ph_h and current_ist.minute >= ph_m)
+        )
 
         db = get_session()
         try:
@@ -1310,7 +1418,9 @@ class Scanner:
             failed = []
             def evaluate_paths(stock):
                 completed = valid_frames[stock.symbol]
-                daily_result, _ = self._scan_stock(stock, completed)
+                daily_result, _ = self._call_scan_stock(
+                    stock, completed, provisional=False, current_time=current, is_power_hour=is_power_hour
+                )
                 results = []
                 if daily_result:
                     results.append((daily_result, completed, False))
@@ -1321,7 +1431,9 @@ class Scanner:
                         **{field: float(quote[field]) for field in ("open", "high", "low", "close", "volume")},
                     }
                     intraday = pd.concat([completed, pd.DataFrame([quote_bar])], ignore_index=True)
-                    provisional_result, _ = self._scan_stock(stock, intraday, True)
+                    provisional_result, _ = self._call_scan_stock(
+                        stock, intraday, provisional=True, current_time=current, is_power_hour=is_power_hour
+                    )
                     if provisional_result:
                         provisional_result = {
                             **provisional_result,
@@ -1440,7 +1552,9 @@ class Scanner:
                             price=res["price"],
                             indicator_value=float(res["confluence_score"]),
                             indicator_detail=json.dumps({
-                                "signal_horizon": "provisional_intraday" if provisional else "confirmed_daily",
+                                "signal_horizon": res.get("signal_horizon", "provisional_intraday" if provisional else "confirmed_daily"),
+                                "alert_tier": res.get("alert_tier", "confirmed_daily"),
+                                "clv": res.get("clv"),
                                 "bar_status": "provisional" if provisional else "confirmed_daily_cache",
                                 "session_date": today.isoformat(),
                                 "quote_timestamp": res.get("quote_timestamp"),
@@ -1481,8 +1595,15 @@ class Scanner:
                                 quote["last_trade_time"] / 1000, timezone.utc
                             ).isoformat(),
                             indicator_value=float(saved_score),
-                            indicator_detail={"confluence_score": saved_score, "checks": saved_checks},
+                            indicator_detail={
+                                "confluence_score": saved_score,
+                                "checks": saved_checks,
+                                "clv": res.get("clv"),
+                                "alert_tier": res.get("alert_tier", "confirmed_daily"),
+                            },
                             provisional=provisional,
+                            alert_tier=res.get("alert_tier", "confirmed_daily"),
+                            clv=res.get("clv"),
                             signal_session_date=today.isoformat(),
                             bar_status="provisional" if provisional else "confirmed_daily_cache",
                             confluence_score=saved_score,
