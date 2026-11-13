@@ -70,15 +70,42 @@ class TelegramNotifier(BaseNotifier):
 
         confluence_tag = f" ({payload.confluence_score}/{payload.total_signals} groups)" if payload.total_signals > 1 else ""
 
+        tier = payload.alert_tier or (
+            "power_hour_confirmed" if "power_hour" in payload.signal_type
+            else ("intraday_radar" if payload.provisional else "confirmed_daily")
+        )
+
+        if tier == "power_hour_confirmed":
+            header_line = f"🟢 <b>{payload.symbol}</b> — {payload.direction} Signal{confluence_tag} [3:15 PM CONFIRMED ENTRY]"
+            tier_badge = "🎯 <b>3:15 PM Confirmation Window</b> — High-conviction close (CLV verified); review and enter before 15:30 IST"
+        elif tier == "intraday_radar":
+            header_line = f"🟡 <b>{payload.symbol}</b> — {payload.direction} Signal{confluence_tag} [INTRADAY RADAR]"
+            tier_badge = "⚠️ <b>Watchlist Setup (Do Not Chase)</b> — Intraday move in progress; watch for 3:15 PM confirmation"
+        else:
+            header_line = f"{direction_emoji} <b>{payload.symbol}</b> — {payload.direction} Signal{confluence_tag}"
+            tier_badge = f"📌 <b>{payload.format_signal_label()}</b>"
+
         lines = [
-            f"{direction_emoji} <b>{payload.symbol}</b> — {payload.direction} Signal{confluence_tag}",
-            f"📌 <b>{payload.format_signal_label()}</b>",
+            header_line,
+            tier_badge,
             "",
             f"{'⚠️' if payload.provisional else 'ℹ️'} <i>{html.escape(payload.format_signal_provenance())}</i>",
             f"🏢 <b>{payload.company_name}</b>",
             f"💰 Price: <b>₹{payload.price:,.2f}</b> ({html.escape(payload.price_source)})",
             f"🕒 Quote time: {html.escape(str(payload.quote_timestamp) if payload.quote_timestamp else 'unknown')}",
         ]
+
+        # Candle strength / CLV if available
+        clv_val = payload.clv
+        if clv_val is None and isinstance(payload.indicator_detail, dict):
+            clv_val = payload.indicator_detail.get("clv")
+        if clv_val is not None:
+            clv_pct = clv_val * 100
+            strength_desc = (
+                "Top of day range" if clv_val >= 0.70
+                else ("Bottom of day range" if clv_val <= 0.30 else "Mid range")
+            )
+            lines.append(f"🕯️ Candle Bar Strength: <b>{clv_pct:.0f}%</b> ({strength_desc}; CLV {clv_val:.2f})")
 
         # Multi-signal check list
         if payload.checks:

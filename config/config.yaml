@@ -80,6 +80,28 @@ confluence:
   # remains event-based.
   mode: "crossover"
 
+# ─── Execution Guardrails & Intraday Filtering ──────────────────────────────
+guardrails:
+  # Close Location Value (CLV) wick rejection filter: rejects false breakouts with large wicks
+  # CLV = (Close - Low) / (High - Low)
+  wick_filter:
+    enabled: true
+    min_clv_buy: 0.70    # Buy close must be in top 30% of day's range
+    max_clv_sell: 0.30   # Sell close must be in bottom 30% of day's range
+    apply_to_provisional: true
+    apply_to_daily: false
+
+  # Time-weighted volume pace (R-Volume) based on NSE intraday U-curve
+  volume_pace:
+    enabled: true
+    # Floor to prevent extreme projection multipliers in first 5 minutes
+    min_fraction_floor: 0.05
+
+  # Two-Tier Alert System: Watchlist Radar (morning/afternoon) vs Confirmed Entry (3:15 PM)
+  two_tier_alerts:
+    enabled: true
+    power_hour_start: "15:10"  # Scans at or after 15:10 IST trigger Tier 2 Confirmed Entry
+
 # ─── Stock Universe ──────────────────────────────────────────────────────────
 universe:
   # Modes: all_nse (legacy/default), nifty500, custom, composed
