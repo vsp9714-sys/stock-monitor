@@ -170,6 +170,21 @@ def refresh_universe_job() -> None:
                      e, exc_info=True)
 
 
+def generate_weekly_report_job() -> None:
+    """Scheduled job: generate and broadcast weekly paper trading report on weekend."""
+    logger.info("Generating weekly paper trading performance report...")
+    try:
+        from src.paper_trading import generate_weekly_report
+        session = get_session()
+        try:
+            report = generate_weekly_report(session, scanner.notifiers, scanner.cfg)
+            logger.info("Weekly paper trading report generated: %s", report.get("week"))
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"Weekly paper trading report job failed: {e}", exc_info=True)
+
+
 def refresh_daily_cache_job() -> None:
     """Probe provider readiness and refresh the latest completed session before market open."""
     if not _daily_refresh_lock.acquire(blocking=False):
@@ -239,6 +254,19 @@ def main() -> None:
 
     # Dedicated 3:15 PM IST Power Hour scan (end-of-day swing confirmation window)
     schedule.every().day.at("15:15", "Asia/Kolkata").do(run_power_hour_scan_job)
+
+    # Weekly paper trading performance scorecard on Saturday morning
+    pt_cfg = cfg.get("paper_trading", {})
+    if pt_cfg.get("enabled", True):
+        rep_day = str(pt_cfg.get("weekly_report_day", "saturday")).lower()
+        rep_time = str(pt_cfg.get("weekly_report_time", "09:00"))
+        if rep_day == "saturday":
+            schedule.every().saturday.at(rep_time, "Asia/Kolkata").do(generate_weekly_report_job)
+        elif rep_day == "sunday":
+            schedule.every().sunday.at(rep_time, "Asia/Kolkata").do(generate_weekly_report_job)
+        else:
+            schedule.every().saturday.at(rep_time, "Asia/Kolkata").do(generate_weekly_report_job)
+        logger.info(f"Weekly paper trading report scheduled: every {rep_day} at {rep_time} IST.")
 
     # Prepare instruments and configured membership before the market opens.
     schedule.every().day.at("08:15", "Asia/Kolkata").do(refresh_instruments_job)

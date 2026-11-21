@@ -156,3 +156,7 @@ class BaseNotifier(ABC):
         if target not in self.delivery_targets():
             raise ValueError(f"Unknown notification target: {target}")
         return self.notify(payload, send_chart=send_chart)
+
+    def broadcast_message(self, message: str) -> bool:
+        """Broadcast an arbitrary text or HTML message to all destinations."""
+        return False

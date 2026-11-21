@@ -203,6 +203,100 @@ class SignalDelivery(Base):
     )
 
 
+class PaperTrade(Base):
+    """Auto-created paper trade entry when a confluence alert fires."""
+    __tablename__ = "paper_trades"
+
+    id = Column(Integer, primary_key=True)
+    signal_id = Column(Integer, ForeignKey("signals.id", ondelete="SET NULL"), nullable=True, index=True)
+    symbol = Column(String(30), nullable=False, index=True)
+    direction = Column(String(10), nullable=False)  # BUY or SELL
+    entry_price = Column(Float, nullable=False)
+    entry_date = Column(Date, nullable=False, index=True)
+    entry_datetime = Column(DateTime, nullable=False)
+
+    # Risk references
+    stop_loss = Column(Float, nullable=False)
+    target_price = Column(Float, nullable=False)
+    atr_at_entry = Column(Float)
+    risk_distance = Column(Float)
+
+    # Signal & confluence metadata
+    confluence_score = Column(Integer)
+    alert_tier = Column(String(30))
+    signal_groups_json = Column(Text)
+
+    # Excursion tracking
+    max_favorable_excursion = Column(Float)
+    max_adverse_excursion = Column(Float)
+
+    # Exit tracking
+    exit_price = Column(Float)
+    exit_date = Column(Date)
+    exit_datetime = Column(DateTime)
+    exit_reason = Column(String(30))  # stop_hit, target_hit, time_expiry, manual
+    pnl_absolute = Column(Float)
+    pnl_percent = Column(Float)
+    r_multiple = Column(Float)
+
+    # Lifecycle state
+    status = Column(String(10), nullable=False, default="open", index=True)  # open, closed
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime)
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "direction", "entry_date", name="uq_paper_trade_symbol_dir_date"),
+    )
+
+
+class PaperTradeMilestone(Base):
+    """P&L milestone hit records — e.g. ±2.5%, ±5%."""
+    __tablename__ = "paper_trade_milestones"
+
+    id = Column(Integer, primary_key=True)
+    trade_id = Column(Integer, ForeignKey("paper_trades.id", ondelete="CASCADE"), nullable=False, index=True)
+    milestone_pct = Column(Float, nullable=False)
+    hit_price = Column(Float, nullable=False)
+    hit_datetime = Column(DateTime, nullable=False)
+    notified = Column(Boolean, default=False)
+    notified_at = Column(DateTime)
+
+    __table_args__ = (
+        UniqueConstraint("trade_id", "milestone_pct", name="uq_milestone_trade_pct"),
+    )
+
+
+class PaperTradeWeeklyReport(Base):
+    """Aggregated weekly paper trade performance snapshot."""
+    __tablename__ = "paper_trade_weekly_reports"
+
+    id = Column(Integer, primary_key=True)
+    week_start = Column(Date, nullable=False, unique=True, index=True)
+    week_end = Column(Date, nullable=False)
+    total_trades = Column(Integer, default=0)
+    open_trades = Column(Integer, default=0)
+    closed_trades = Column(Integer, default=0)
+    winners = Column(Integer, default=0)
+    losers = Column(Integer, default=0)
+    win_rate_pct = Column(Float)
+    avg_pnl_pct = Column(Float)
+    avg_r_multiple = Column(Float)
+    best_trade_symbol = Column(String(30))
+    best_trade_pnl_pct = Column(Float)
+    worst_trade_symbol = Column(String(30))
+    worst_trade_pnl_pct = Column(Float)
+    radar_trades = Column(Integer, default=0)
+    radar_win_rate = Column(Float)
+    confirmed_trades = Column(Integer, default=0)
+    confirmed_win_rate = Column(Float)
+    score_2_trades = Column(Integer, default=0)
+    score_2_win_rate = Column(Float)
+    score_3_trades = Column(Integer, default=0)
+    score_3_win_rate = Column(Float)
+    report_json = Column(Text)
+    generated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 # ─── Engine & Session ─────────────────────────────────────────────────────────
 
 _engine = None

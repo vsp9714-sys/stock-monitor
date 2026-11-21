@@ -57,6 +57,8 @@ from src.signals.macd import detect_macd_signal
 from src.signals.rsi import detect_rsi_signal
 from src.signals.confluence import evaluate_confluence
 from src.signals.volume_breakout import detect_volume_breakout, nse_expected_volume_fraction
+from src.signals.adx import adx_filter
+from src.paper_trading import record_paper_trade_entry, monitor_open_paper_trades
 from src.universe import UniverseSelectionError, UniverseSelector
 from src.market_calendar import (
     CalendarUnavailable,
@@ -1135,6 +1137,29 @@ class Scanner:
                     )
                     return None, df
 
+            # ── 6. ADX Trend Strength Filter ────────────────────────────
+            adx_cfg = guardrails_cfg.get("adx_filter", {})
+            adx_info = None
+            if adx_cfg.get("enabled", True):
+                apply_adx = (
+                    (provisional and adx_cfg.get("apply_to_provisional", True)) or
+                    (not provisional and adx_cfg.get("apply_to_daily", True))
+                )
+                if apply_adx:
+                    adx_info = adx_filter(
+                        df,
+                        period=int(adx_cfg.get("period", 14)),
+                        min_adx=float(adx_cfg.get("min_adx", 20.0)),
+                        strong_threshold=float(adx_cfg.get("strong_trend_threshold", 25.0)),
+                    )
+                    if not adx_info.get("passed", True):
+                        logger.debug(
+                            "%s: %s signal rejected by ADX filter (ADX %.1f < %.1f; %s market / no trend)",
+                            stock.symbol, consensus_dir, adx_info.get("adx") or 0.0,
+                            float(adx_cfg.get("min_adx", 20.0)), adx_info.get("trend_strength", "weak"),
+                        )
+                        return None, df
+
             # Determine signal type, tier, and horizon
             if provisional:
                 if is_power_hour:
@@ -1167,6 +1192,7 @@ class Scanner:
                 "signal_horizon": signal_horizon,
                 "alert_tier": alert_tier,
                 "clv": round(clv, 2) if clv is not None else None,
+                "adx": adx_info,
             }
             return result, df
 
@@ -1555,6 +1581,7 @@ class Scanner:
                                 "signal_horizon": res.get("signal_horizon", "provisional_intraday" if provisional else "confirmed_daily"),
                                 "alert_tier": res.get("alert_tier", "confirmed_daily"),
                                 "clv": res.get("clv"),
+                                "adx": res.get("adx"),
                                 "bar_status": "provisional" if provisional else "confirmed_daily_cache",
                                 "session_date": today.isoformat(),
                                 "quote_timestamp": res.get("quote_timestamp"),
@@ -1599,6 +1626,7 @@ class Scanner:
                                 "confluence_score": saved_score,
                                 "checks": saved_checks,
                                 "clv": res.get("clv"),
+                                "adx": res.get("adx"),
                                 "alert_tier": res.get("alert_tier", "confirmed_daily"),
                             },
                             provisional=provisional,
@@ -1646,10 +1674,42 @@ class Scanner:
                                 "Confluence alert/update dispatched for %s: %s (%s/%s groups)",
                                 stock.symbol, res["direction"], saved_score, saved_total,
                             )
+                            try:
+                                record_paper_trade_entry(
+                                    session=db,
+                                    signal_id=saved.id,
+                                    symbol=stock.symbol,
+                                    direction=res["direction"],
+                                    entry_price=res["price"],
+                                    risk_ref=risk_context,
+                                    confluence_result=res,
+                                    alert_tier=res.get("alert_tier", "confirmed_daily"),
+                                    session_date=today,
+                                    config=self.cfg,
+                                )
+                            except Exception as pe:
+                                logger.error("Failed to record paper trade entry for %s: %s", stock.symbol, pe)
                     except Exception as exc:
                         logger.error("Error processing alert for %s: %s", stock.symbol, exc, exc_info=True)
 
             universe_metadata["market_context_filtered_count"] = market_context_filtered
+
+            # Monitor open paper trades during every scan cycle
+            try:
+                quotes_by_symbol = {
+                    s.symbol: fresh_quotes[s.instrument_key]
+                    for s in tradable_candidates
+                    if s.instrument_key in fresh_quotes
+                }
+                monitor_open_paper_trades(
+                    session=db,
+                    quotes_by_symbol=quotes_by_symbol,
+                    notifiers=self.notifiers,
+                    config=self.cfg,
+                    session_date=today,
+                )
+            except Exception as pe:
+                logger.error("Paper trade monitoring failed: %s", pe, exc_info=True)
 
             logger.info(
                 "Scan complete: mode=%s selected=%s source_counts=%s series_excluded=%s eligible=%s; "

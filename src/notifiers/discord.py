@@ -148,3 +148,18 @@ class DiscordNotifier(BaseNotifier):
         except requests.RequestException as e:
             logger.error(f"Discord chart alert failed for {payload.symbol}: {e}")
             return False
+
+    def broadcast_message(self, message: str) -> bool:
+        if not self.enabled or not self.webhook_url:
+            return False
+        try:
+            resp = requests.post(
+                self.webhook_url,
+                json={"content": message},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error(f"Discord broadcast error: {e}")
+            return False

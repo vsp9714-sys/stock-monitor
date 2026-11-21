@@ -132,3 +132,10 @@ class EmailNotifier(BaseNotifier):
         subject = f"[{payload.direction}] {payload.symbol} — {payload.format_signal_label()}"
         html = self._build_html(payload)
         return self._send_email(subject, html, payload.chart_path)
+
+    def broadcast_message(self, message: str) -> bool:
+        if not self.enabled or not self.to_addrs:
+            return False
+        subject = "Stock Monitor Notification"
+        html = f"<div style='font-family: sans-serif; white-space: pre-wrap;'>{message}</div>"
+        return self._send_email(subject, html)
