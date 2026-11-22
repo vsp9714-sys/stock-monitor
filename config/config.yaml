@@ -108,7 +108,7 @@ guardrails:
     min_clv_buy: 0.70    # Buy close must be in top 30% of day's range
     max_clv_sell: 0.30   # Sell close must be in bottom 30% of day's range
     apply_to_provisional: true
-    apply_to_daily: false
+    apply_to_daily: true
 
   # Time-weighted volume pace (R-Volume) based on NSE intraday U-curve
   volume_pace:
@@ -153,7 +153,7 @@ paper_trading:
   enabled: true
   strategy_version: "v1_baseline"
   allowed_directions: ["BUY"] # Long-only CNC delivery validation
-  max_hold_days: 10              # Maximum holding duration in trading days
+  max_hold_days: 20              # Maximum holding duration in trading days
   cooldown_days: 3               # Minimum days before re-entering same symbol & direction
   round_trip_cost_pct: 0.30      # Statutory NSE CNC charges + slippage deduction
   trailing_stop_mode: "none"     # "none" | "breakeven_1r" | "supertrend"
@@ -233,13 +233,13 @@ risk:
 # ─── Offline backtest assumptions ────────────────────────────────────────────
 backtest:
   atr_period: 14
-  stop_atr_multiple: 1.5
+  stop_atr_multiple: 2.0
   target_r_multiple: 2.0
   fee_bps_per_side: 5.0
   slippage_bps_per_side: 5.0
   train_fraction: 0.7
   max_hold_days: null         # Optional: set to 10 to mirror paper_trading
-  allowed_directions: ["BUY", "SELL"]
+  allowed_directions: ["BUY"]
 
 # ─── Fundamental Data ─────────────────────────────────────────────────────────
 fundamentals:
