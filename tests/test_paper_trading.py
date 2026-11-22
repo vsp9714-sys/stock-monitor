@@ -117,7 +117,7 @@ class TestPaperTradeEntryCreation:
         )
         assert t1 is not None
 
-        # Second attempt on same session date should not create a second row
+        # Second attempt on same session date and same tier should not create a second row
         t2 = record_paper_trade_entry(
             session=db_session,
             signal_id=2,
@@ -126,12 +126,46 @@ class TestPaperTradeEntryCreation:
             entry_price=1505.0,
             risk_ref=risk_ref,
             confluence_result=confluence_res,
-            alert_tier="confirmed_daily",
+            alert_tier="intraday_radar",
             session_date=date(2026, 11, 20),
             config=sample_config,
         )
         assert t2.id == t1.id
         assert db_session.query(PaperTrade).filter_by(symbol="INFY").count() == 1
+
+    def test_record_paper_trade_tier_isolation(self, db_session, sample_config):
+        """Radar (10:30) and Power-Hour Confirmed (15:15) maintain separate virtual books."""
+        risk_ref = {"status": "available", "stop_reference": 980.0, "target_reference": 1040.0}
+        confluence_res = {"confluence_score": 2}
+        t_radar = record_paper_trade_entry(
+            session=db_session,
+            signal_id=1,
+            symbol="INFY",
+            direction="BUY",
+            entry_price=1500.0,
+            risk_ref=risk_ref,
+            confluence_result=confluence_res,
+            alert_tier="intraday_radar",
+            session_date=date(2026, 11, 20),
+            config=sample_config,
+        )
+        assert t_radar is not None
+
+        t_confirmed = record_paper_trade_entry(
+            session=db_session,
+            signal_id=2,
+            symbol="INFY",
+            direction="BUY",
+            entry_price=1505.0,
+            risk_ref=risk_ref,
+            confluence_result=confluence_res,
+            alert_tier="power_hour_confirmed",
+            session_date=date(2026, 11, 20),
+            config=sample_config,
+        )
+        assert t_confirmed is not None
+        assert t_confirmed.id != t_radar.id
+        assert db_session.query(PaperTrade).filter_by(symbol="INFY").count() == 2
 
     def test_record_paper_trade_open_guard(self, db_session, sample_config):
         risk_ref = {"status": "available", "stop_reference": 980.0, "target_reference": 1040.0}
@@ -424,3 +458,191 @@ class TestWeeklyReport:
         assert db_report.closed_trades == 2
         assert len(notifier.broadcasts) >= 1
         assert "Weekly Paper Trading Report" in notifier.broadcasts[-1]
+
+
+class TestPhase1AndPhase2PaperTradingEnhancements:
+    def test_main_weekly_report_job_no_name_error(self, monkeypatch):
+        """BUG-1: generate_weekly_report_job in src.main must not raise NameError for get_session."""
+        from types import SimpleNamespace
+        import src.main as main_mod
+        from src.db import Base, create_sqlite_engine
+        from sqlalchemy.orm import sessionmaker
+
+        engine = create_sqlite_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        TestSession = sessionmaker(bind=engine)
+
+        monkeypatch.setattr(main_mod, "get_session", lambda: TestSession())
+        monkeypatch.setattr(main_mod, "scanner", SimpleNamespace(notifiers=[], cfg={"paper_trading": {"enabled": True}}))
+
+        # Should execute cleanly without NameError
+        main_mod.generate_weekly_report_job()
+
+    def test_notifiers_broadcast_message_enabled_attribute(self):
+        """BUG-8: DiscordNotifier and EmailNotifier must have self.enabled attribute."""
+        from src.notifiers.discord import DiscordNotifier
+        from src.notifiers.email_notifier import EmailNotifier
+
+        dn = DiscordNotifier({"notifications": {"discord": {"enabled": False, "webhook_url": "https://discord.com/api/webhooks/test"}}})
+        assert hasattr(dn, "enabled")
+        assert dn.enabled is False
+        assert dn.broadcast_message("test") is False
+
+        en = EmailNotifier({"notifications": {"email": {"enabled": False, "username": "test_user", "password": "test_password", "to_addrs": ["to@example.com"]}}})
+        assert hasattr(en, "enabled")
+        assert en.enabled is False
+        assert en.broadcast_message("test") is False
+
+    def test_trading_days_between_nse_calendar(self):
+        """trading_days_between must count only NSE trading sessions, excluding weekends and holidays."""
+        from src.paper_trading import trading_days_between
+
+        # 2026-11-06 (Fri) to 2026-11-09 (Mon) -> 1 trading session (Monday)
+        # Note: 2026-11-10 is Diwali Balipratipada (holiday in config/nse_trading_calendar.yaml)
+        # 2026-11-09 to 2026-11-11 -> Nov 10 is holiday, Nov 11 is trading day -> exactly 1 session!
+        d_mon = date(2026, 11, 9)
+        d_wed = date(2026, 11, 11)
+        count = trading_days_between(d_mon, d_wed)
+        assert count == 1  # only Nov 11 is a trading day
+
+    def test_allowed_directions_skips_sell(self, db_session, sample_config):
+        """Long-only validation: when allowed_directions is ['BUY'], SELL alerts return None."""
+        sample_config["paper_trading"]["allowed_directions"] = ["BUY"]
+        res_sell = record_paper_trade_entry(
+            session=db_session,
+            signal_id=1,
+            symbol="INFY",
+            direction="SELL",
+            entry_price=1500.0,
+            risk_ref={"status": "available", "stop_reference": 1530.0, "target_reference": 1440.0},
+            confluence_result={"confluence_score": 2},
+            alert_tier="confirmed_daily",
+            session_date=date(2026, 11, 20),
+            config=sample_config,
+        )
+        assert res_sell is None
+        assert db_session.query(PaperTrade).filter_by(symbol="INFY").count() == 0
+
+    def test_intraday_high_low_stop_first_exit(self, db_session, sample_config):
+        """On subsequent days, if quote['low'] <= stop_loss, close as stop_hit even if last_price > stop."""
+        trade = record_paper_trade_entry(
+            session=db_session,
+            signal_id=1,
+            symbol="BHARTIARTL",
+            direction="BUY",
+            entry_price=1000.0,
+            risk_ref={"status": "available", "stop_reference": 950.0, "target_reference": 1100.0, "risk_distance": 50.0},
+            confluence_result={"confluence_score": 2},
+            alert_tier="confirmed_daily",
+            session_date=date(2026, 11, 20),
+            config=sample_config,
+        )
+
+        # Subsequent session: open 980, low 940 (hits stop), high 1020, last_price 1010
+        quotes = {"BHARTIARTL": {
+            "open": 980.0, "high": 1020.0, "low": 940.0, "last_price": 1010.0
+        }}
+        monitor_open_paper_trades(
+            session=db_session,
+            quotes_by_symbol=quotes,
+            notifiers=[],
+            config=sample_config,
+            session_date=date(2026, 11, 21),
+        )
+
+        db_session.refresh(trade)
+        assert trade.status == "closed"
+        assert trade.exit_reason == "stop_hit"
+        # Since open (980) > stop (950), fill is at stop_loss (950)
+        assert trade.exit_price == 950.0
+        assert trade.max_favorable_excursion == 1020.0
+        assert trade.max_adverse_excursion == 940.0
+
+    def test_cost_deduction_and_net_r_multiple(self, db_session, sample_config):
+        """round_trip_cost_pct (e.g. 0.30%) reduces net pnl_percent and net_r_multiple."""
+        sample_config["paper_trading"]["round_trip_cost_pct"] = 0.30
+        trade = record_paper_trade_entry(
+            session=db_session,
+            signal_id=1,
+            symbol="ITC",
+            direction="BUY",
+            entry_price=400.0,
+            risk_ref={"status": "available", "stop_reference": 380.0, "target_reference": 440.0, "risk_distance": 20.0},
+            confluence_result={"confluence_score": 2},
+            alert_tier="confirmed_daily",
+            session_date=date(2026, 11, 20),
+            config=sample_config,
+        )
+
+        # Target hit at 440 (+10% gross)
+        quotes = {"ITC": {"open": 420.0, "high": 445.0, "low": 415.0, "last_price": 440.0}}
+        monitor_open_paper_trades(
+            session=db_session,
+            quotes_by_symbol=quotes,
+            notifiers=[],
+            config=sample_config,
+            session_date=date(2026, 11, 21),
+        )
+
+        db_session.refresh(trade)
+        assert trade.status == "closed"
+        assert trade.exit_reason == "target_hit"
+        assert trade.exit_price == 440.0
+        assert trade.gross_pnl_percent == 10.0
+        assert trade.cost_percent == 0.30
+        assert trade.pnl_percent == 9.70
+        assert trade.r_multiple == 2.0
+        # risk_distance_pct = 20 / 400 * 100 = 5%
+        # net_r_multiple = 9.70 / 5.0 = 1.94
+        assert trade.net_r_multiple == 1.94
+
+    def test_weekly_report_profit_factor_expectancy_and_direction_split(self, db_session, sample_config):
+        """Weekly report includes profit_factor, expectancy_r, and direction_stats."""
+        week_start = date(2026, 11, 16)
+        week_end = date(2026, 11, 20)
+
+        # Closed BUY trade (+10% net, +2.0R)
+        t_buy = PaperTrade(
+            symbol="BUY1", direction="BUY", entry_price=100.0, entry_date=week_start,
+            entry_datetime=datetime.now(timezone.utc), stop_loss=95.0, target_price=110.0,
+            risk_distance=5.0, confluence_score=2, alert_tier="confirmed_daily",
+            exit_price=110.0, exit_date=week_start + timedelta(days=2),
+            exit_reason="target_hit", pnl_absolute=10.0, gross_pnl_percent=10.0,
+            cost_percent=0.30, pnl_percent=9.70, r_multiple=2.0, net_r_multiple=1.94,
+            status="closed", created_at=datetime.now(timezone.utc),
+        )
+        # Closed SELL trade (-5% net, -1.0R)
+        t_sell = PaperTrade(
+            symbol="SELL1", direction="SELL", entry_price=100.0, entry_date=week_start,
+            entry_datetime=datetime.now(timezone.utc), stop_loss=105.0, target_price=90.0,
+            risk_distance=5.0, confluence_score=2, alert_tier="confirmed_daily",
+            exit_price=105.0, exit_date=week_start + timedelta(days=3),
+            exit_reason="stop_hit", pnl_absolute=-5.0, gross_pnl_percent=-5.0,
+            cost_percent=0.30, pnl_percent=-5.30, r_multiple=-1.0, net_r_multiple=-1.06,
+            status="closed", created_at=datetime.now(timezone.utc),
+        )
+        db_session.add_all([t_buy, t_sell])
+        db_session.commit()
+
+        rep = generate_weekly_report(
+            session=db_session,
+            notifiers=[],
+            config=sample_config,
+            week_start_date=week_start,
+            week_end_date=week_end,
+            send_notification=False,
+        )
+
+        assert rep["closed_trades"] == 2
+        assert rep["profit_factor"] == round(9.70 / 5.30, 2)
+        assert rep["expectancy_r"] == round((1.94 - 1.06) / 2, 2)
+        assert rep["direction_stats"]["buy_trades"] == 1
+        assert rep["direction_stats"]["buy_win_rate"] == 100.0
+        assert rep["direction_stats"]["sell_trades"] == 1
+        assert rep["direction_stats"]["sell_win_rate"] == 0.0
+
+        db_rep = db_session.query(PaperTradeWeeklyReport).filter_by(week_start=week_start).first()
+        assert db_rep.profit_factor == rep["profit_factor"]
+        assert db_rep.expectancy_r == rep["expectancy_r"]
+        assert db_rep.buy_trades == 1
+        assert db_rep.sell_trades == 1

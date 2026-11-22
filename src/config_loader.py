@@ -76,6 +76,8 @@ def load_config() -> dict[str, Any]:
     _apply_env_overrides(config)
     validate_signal_config(config)
     validate_candidate_context_config(config)
+    validate_guardrails_config(config)
+    validate_paper_trading_config(config)
     return config
 
 
@@ -166,6 +168,80 @@ def validate_candidate_context_config(config: dict[str, Any]) -> None:
         not math.isfinite(float(capital)) or float(capital) <= 0 or risk_percent is None
     ):
         raise ValueError("risk sizing requires positive account_capital_inr and risk_percent")
+    max_tranche = risk.get("max_tranche_inr")
+    if max_tranche is not None:
+        try:
+            val = float(max_tranche)
+            if not math.isfinite(val) or val <= 0:
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise ValueError("risk.max_tranche_inr must be positive numeric when configured") from exc
+    max_risk_dist = risk.get("max_risk_distance_pct")
+    if max_risk_dist is not None:
+        try:
+            val = float(max_risk_dist)
+            if not math.isfinite(val) or val <= 0:
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise ValueError("risk.max_risk_distance_pct must be positive numeric when configured") from exc
+
+
+def validate_guardrails_config(config: dict[str, Any]) -> None:
+    """Validate guardrails such as trend_gate, rsi_exhaustion, and adx_filter."""
+    guardrails = config.get("guardrails", {}) or {}
+
+    # trend_gate
+    tg = guardrails.get("trend_gate", {}) or {}
+    if tg.get("enabled", False):
+        try:
+            fast_p = int(tg.get("fast_ema", 50))
+            slow_p = int(tg.get("slow_ema", 200))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("guardrails.trend_gate EMA periods must be integers") from exc
+        if fast_p < 1 or slow_p <= fast_p:
+            raise ValueError("guardrails.trend_gate requires 1 <= fast_ema < slow_ema")
+
+    # rsi_exhaustion
+    re = guardrails.get("rsi_exhaustion", {}) or {}
+    if re.get("enabled", False):
+        try:
+            max_buy = float(re.get("max_rsi_buy", 68.0))
+            min_sell = float(re.get("min_rsi_sell", 32.0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("guardrails.rsi_exhaustion thresholds must be numeric") from exc
+        if not (0 <= min_sell < max_buy <= 100):
+            raise ValueError("guardrails.rsi_exhaustion requires 0 <= min_rsi_sell < max_rsi_buy <= 100")
+
+    # adx_filter
+    adx = guardrails.get("adx_filter", {}) or {}
+    if adx.get("enabled", False):
+        try:
+            period = int(adx.get("period", 14))
+            min_adx = float(adx.get("min_adx", 20.0))
+            strong = float(adx.get("strong_trend_threshold", 25.0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("guardrails.adx_filter parameters must be numeric") from exc
+        if period < 1 or min_adx < 0 or strong < min_adx:
+            raise ValueError("guardrails.adx_filter requires period >= 1 and 0 <= min_adx <= strong_trend_threshold")
+
+
+def validate_paper_trading_config(config: dict[str, Any]) -> None:
+    """Validate paper trading parameters."""
+    pt = config.get("paper_trading", {}) or {}
+    if not pt.get("enabled", False):
+        return
+    directions = pt.get("allowed_directions")
+    if directions is not None:
+        if not isinstance(directions, list) or not all(str(d).upper() in {"BUY", "SELL"} for d in directions):
+            raise ValueError("paper_trading.allowed_directions must be a list containing 'BUY' and/or 'SELL'")
+    cost_pct = pt.get("round_trip_cost_pct")
+    if cost_pct is not None:
+        try:
+            val = float(cost_pct)
+            if not math.isfinite(val) or val < 0:
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise ValueError("paper_trading.round_trip_cost_pct must be non-negative numeric") from exc
 
 
 def _apply_env_overrides(config: dict) -> None:

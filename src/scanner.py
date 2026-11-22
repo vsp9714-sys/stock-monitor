@@ -39,6 +39,7 @@ from src.db import (
     DailyCandleRefresh,
     MarketContextCache,
     OHLCVCache,
+    PaperTrade,
     Signal,
     Stock,
     get_delivery_score,
@@ -52,9 +53,9 @@ from src.db import (
 from src.fetcher.fundamentals import FundamentalsFetcher
 from src.fetcher.upstox import UpstoxAPIError, UpstoxFetcher
 from src.notifiers.base import AlertPayload, BaseNotifier
-from src.signals.ema_cross import detect_ema_crossover
+from src.signals.ema_cross import detect_ema_crossover, compute_ema
 from src.signals.macd import detect_macd_signal
-from src.signals.rsi import detect_rsi_signal
+from src.signals.rsi import detect_rsi_signal, compute_rsi
 from src.signals.confluence import evaluate_confluence
 from src.signals.volume_breakout import detect_volume_breakout, nse_expected_volume_fraction
 from src.signals.adx import adx_filter
@@ -883,6 +884,7 @@ class Scanner:
                 return None, None  # Skip penny stocks
 
             checks = []
+            rsi_val = None
 
             # ── 1. RSI Check ────────────────────────────────────────────
             if self.signal_cfg.get("rsi", {}).get("enabled", True):
@@ -1102,8 +1104,107 @@ class Scanner:
             if consensus_dir is None:
                 return None, df
 
-            # ── 5. Wick Rejection Filter (Close Location Value / CLV) ───
+            # ── Guardrails & Filters ────────────────────────────────────
             guardrails_cfg = getattr(self, "guardrails_cfg", {})
+
+            # ── Macro-Trend Gate (Close > EMA 50 > EMA 200) ───────────────
+            trend_gate_cfg = guardrails_cfg.get("trend_gate", {})
+            trend_gate_info = None
+            if trend_gate_cfg.get("enabled", False):
+                apply_trend = (
+                    (provisional and trend_gate_cfg.get("apply_to_provisional", True)) or
+                    (not provisional and trend_gate_cfg.get("apply_to_daily", True))
+                )
+                if apply_trend:
+                    fast_p = int(trend_gate_cfg.get("fast_ema", 50))
+                    slow_p = int(trend_gate_cfg.get("slow_ema", 200))
+                    req_price_fast = bool(trend_gate_cfg.get("require_price_above_fast", True))
+                    req_fast_slow = bool(trend_gate_cfg.get("require_fast_above_slow", True))
+                    fail_closed = bool(trend_gate_cfg.get("fail_closed_on_short_history", False))
+                    closes = df["close"].astype(float)
+                    if len(df) < slow_p + 10:
+                        if fail_closed:
+                            logger.debug(
+                                "%s: %s rejected by trend gate (insufficient history %d < %d)",
+                                stock.symbol, consensus_dir, len(df), slow_p + 10,
+                            )
+                            return None, df
+                        trend_gate_info = {
+                            "status": "unavailable",
+                            "reason": "insufficient_history",
+                            "passed": True,
+                        }
+                    else:
+                        ema_fast_s = compute_ema(closes, fast_p)
+                        ema_slow_s = compute_ema(closes, slow_p)
+                        ema_fast = float(ema_fast_s.iloc[-1])
+                        ema_slow = float(ema_slow_s.iloc[-1])
+                        passed_trend = True
+                        if consensus_dir == "BUY":
+                            if req_price_fast and current_price <= ema_fast:
+                                passed_trend = False
+                            if req_fast_slow and ema_fast <= ema_slow:
+                                passed_trend = False
+                        elif consensus_dir == "SELL":
+                            if req_price_fast and current_price >= ema_fast:
+                                passed_trend = False
+                            if req_fast_slow and ema_fast >= ema_slow:
+                                passed_trend = False
+
+                        trend_gate_info = {
+                            "status": "available",
+                            "passed": passed_trend,
+                            "ema_fast": round(ema_fast, 2),
+                            "ema_slow": round(ema_slow, 2),
+                            "fast_period": fast_p,
+                            "slow_period": slow_p,
+                        }
+                        if not passed_trend:
+                            logger.debug(
+                                "%s: %s rejected by trend gate (price %.2f, EMA%d %.2f, EMA%d %.2f)",
+                                stock.symbol, consensus_dir, current_price, fast_p, ema_fast, slow_p, ema_slow,
+                            )
+                            return None, df
+
+            # ── RSI Exhaustion Ceiling ──────────────────────────────────
+            rsi_ex_cfg = guardrails_cfg.get("rsi_exhaustion", {})
+            rsi_exhaustion_info = None
+            if rsi_ex_cfg.get("enabled", False):
+                apply_rsi_ex = (
+                    (provisional and rsi_ex_cfg.get("apply_to_provisional", True)) or
+                    (not provisional and rsi_ex_cfg.get("apply_to_daily", True))
+                )
+                if apply_rsi_ex:
+                    max_rsi_buy = float(rsi_ex_cfg.get("max_rsi_buy", 68.0))
+                    min_rsi_sell = float(rsi_ex_cfg.get("min_rsi_sell", 32.0))
+                    val_to_check = None
+                    if rsi_val is not None:
+                        val_to_check = float(rsi_val)
+                    elif len(df) >= 15:
+                        rsi_series = compute_rsi(df["close"].astype(float), 14)
+                        if not rsi_series.empty and pd.notna(rsi_series.iloc[-1]):
+                            val_to_check = float(rsi_series.iloc[-1])
+
+                    if val_to_check is not None:
+                        passed_rsi_ex = True
+                        if consensus_dir == "BUY" and val_to_check > max_rsi_buy:
+                            passed_rsi_ex = False
+                        elif consensus_dir == "SELL" and val_to_check < min_rsi_sell:
+                            passed_rsi_ex = False
+                        rsi_exhaustion_info = {
+                            "passed": passed_rsi_ex,
+                            "rsi": round(val_to_check, 2),
+                            "max_rsi_buy": max_rsi_buy,
+                            "min_rsi_sell": min_rsi_sell,
+                        }
+                        if not passed_rsi_ex:
+                            logger.debug(
+                                "%s: %s rejected by RSI exhaustion (RSI %.2f)",
+                                stock.symbol, consensus_dir, val_to_check,
+                            )
+                            return None, df
+
+            # ── Wick Rejection Filter (Close Location Value / CLV) ───────
             wick_cfg = guardrails_cfg.get("wick_filter", {})
             clv = None
             if "high" in df.columns and "low" in df.columns and "close" in df.columns:
@@ -1137,7 +1238,7 @@ class Scanner:
                     )
                     return None, df
 
-            # ── 6. ADX Trend Strength Filter ────────────────────────────
+            # ── ADX Trend Strength Filter ───────────────────────────────
             adx_cfg = guardrails_cfg.get("adx_filter", {})
             adx_info = None
             if adx_cfg.get("enabled", True):
@@ -1151,6 +1252,8 @@ class Scanner:
                         period=int(adx_cfg.get("period", 14)),
                         min_adx=float(adx_cfg.get("min_adx", 20.0)),
                         strong_threshold=float(adx_cfg.get("strong_trend_threshold", 25.0)),
+                        direction=consensus_dir,
+                        require_di_alignment=bool(adx_cfg.get("require_di_alignment", True)),
                     )
                     if not adx_info.get("passed", True):
                         logger.debug(
@@ -1193,6 +1296,8 @@ class Scanner:
                 "alert_tier": alert_tier,
                 "clv": round(clv, 2) if clv is not None else None,
                 "adx": adx_info,
+                "trend_gate": trend_gate_info,
+                "rsi_exhaustion": rsi_exhaustion_info,
             }
             return result, df
 
@@ -1297,9 +1402,32 @@ class Scanner:
         try:
             minimum = self.required_daily_candles()
             frames = self._load_cached_daily_frames(stocks, db)
+
+            # Ensure open paper trade symbols also get quotes even if not in current universe
+            open_pt_symbols = []
+            try:
+                q = db.query(PaperTrade.symbol).filter_by(status="open")
+                if hasattr(q, "distinct"):
+                    q = q.distinct()
+                if hasattr(q, "all"):
+                    open_pt_symbols = [row[0] for row in q.all()]
+            except Exception:
+                open_pt_symbols = []
+
+            universe_symbols = {s.symbol for s in stocks}
+            missing_pt_symbols = [sym for sym in open_pt_symbols if sym not in universe_symbols]
+            extra_pt_stocks = []
+            if missing_pt_symbols:
+                try:
+                    extra_pt_stocks = db.query(Stock).filter(Stock.symbol.in_(missing_pt_symbols)).all()
+                except Exception:
+                    extra_pt_stocks = []
+            all_quote_stocks = list(stocks) + list(extra_pt_stocks)
+            keys_to_fetch = list({s.instrument_key for s in all_quote_stocks if getattr(s, "instrument_key", None)})
+
             try:
                 quotes = self.fetcher.get_full_market_quotes(
-                    [stock.instrument_key for stock in stocks],
+                    keys_to_fetch,
                     batch_size=int(self.cfg.get("upstox", {}).get("quote_batch_size", 100)),
                     allow_missing=True,
                 )
@@ -1325,6 +1453,12 @@ class Scanner:
                     continue
                 quote_dates.add(trade_time.astimezone(IST).date())
                 fresh_quotes[stock.instrument_key] = quote
+            for stock in extra_pt_stocks:
+                quote = quotes.get(stock.instrument_key)
+                if quote is not None:
+                    _, r = _validate_quote(quote, current, max_age)
+                    if not r:
+                        fresh_quotes[stock.instrument_key] = quote
             if skipped_reasons:
                 logger.warning(
                     "Quote validation skipped %s/%s symbols; reason counts=%s; examples=%s",
@@ -1698,7 +1832,7 @@ class Scanner:
             try:
                 quotes_by_symbol = {
                     s.symbol: fresh_quotes[s.instrument_key]
-                    for s in tradable_candidates
+                    for s in all_quote_stocks
                     if s.instrument_key in fresh_quotes
                 }
                 monitor_open_paper_trades(

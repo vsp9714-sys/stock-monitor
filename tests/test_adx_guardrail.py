@@ -219,3 +219,45 @@ class TestScannerADXGuardrailIntegration:
         assert res["adx"]["passed"] is True
         assert res["adx"]["trend_strength"] == "strong"
         assert res["adx"]["adx"] >= 25.0
+
+
+class TestADXDirectionalAlignmentAndWarmup:
+    def test_adx_filter_direction_alignment_buy_rejected_on_downtrend(self):
+        """In a strong downtrend (-DI > +DI), BUY direction must be rejected even if ADX >= 25."""
+        downtrend_df = _make_trending_down_candles(70)
+        res_buy = adx_filter(downtrend_df, period=14, min_adx=20.0, direction="BUY", require_di_alignment=True)
+        assert res_buy["adx"] >= 25.0
+        assert res_buy["minus_di"] > res_buy["plus_di"]
+        assert res_buy["passed"] is False
+        assert res_buy["reason"] == "di_opposes_buy"
+
+        # Invert to SELL: should pass since -DI > +DI aligns with SELL
+        res_sell = adx_filter(downtrend_df, period=14, min_adx=20.0, direction="SELL", require_di_alignment=True)
+        assert res_sell["passed"] is True
+        assert res_sell["reason"] == "ok"
+
+    def test_adx_filter_direction_alignment_sell_rejected_on_uptrend(self):
+        """In a strong uptrend (+DI > -DI), SELL direction must be rejected."""
+        uptrend_df = _make_trending_up_candles(70)
+        res_sell = adx_filter(uptrend_df, period=14, min_adx=20.0, direction="SELL", require_di_alignment=True)
+        assert res_sell["adx"] >= 25.0
+        assert res_sell["plus_di"] > res_sell["minus_di"]
+        assert res_sell["passed"] is False
+        assert res_sell["reason"] == "di_opposes_sell"
+
+    def test_adx_warmup_requires_2_times_period_plus_1(self):
+        """Ensure warmup check returns insufficient_history when bars < (2 * period) + 1."""
+        period = 14
+        # Need >= 29 bars for period=14
+        short_28 = _make_trending_up_candles(28)
+        assert len(short_28) == 28
+        res_28 = adx_filter(short_28, period=period)
+        assert res_28["passed"] is True
+        assert res_28["trend_strength"] == "unavailable"
+        assert res_28["reason"] == "insufficient_history"
+
+        # Exactly 29 bars: should compute ADX
+        exact_29 = _make_trending_up_candles(29)
+        res_29 = adx_filter(exact_29, period=period)
+        assert res_29["trend_strength"] != "unavailable"
+        assert res_29["adx"] is not None

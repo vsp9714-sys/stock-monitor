@@ -107,28 +107,47 @@ def generate_signal_chart(
         Path to saved chart PNG, or None if generation failed.
     """
     try:
-        df = df.copy().tail(lookback_candles).reset_index(drop=True)
-        if len(df) < 10:
+        full_df = df.copy().reset_index(drop=True)
+        if len(full_df) < 10:
+            return None
+
+        closes = full_df["close"].astype(float)
+
+        # Compute EMAs on full history before slicing
+        ema9 = compute_ema(closes, 9)
+        ema21 = compute_ema(closes, 21)
+        ema50 = compute_ema(closes, 50) if len(full_df) >= 60 else None
+        ema200 = compute_ema(closes, 200) if len(full_df) >= 210 else None
+
+        # Compute RSI on full history before slicing
+        rsi_series = compute_rsi(closes, 14) if len(full_df) >= 24 else None
+
+        # Compute MACD on full history before slicing
+        macd_line, sig_line, histogram = compute_macd(closes) if len(full_df) >= 40 else (None, None, None)
+
+        # Slice to lookback_candles for display
+        display_df = full_df.tail(lookback_candles).reset_index(drop=True)
+        if len(display_df) < 10:
             return None
 
         # Prepare mplfinance-compatible DataFrame
-        plot_df = df.set_index("ts")[["open", "high", "low", "close", "volume"]]
+        plot_df = display_df.set_index("ts")[["open", "high", "low", "close", "volume"]]
         plot_df.index = pd.DatetimeIndex(plot_df.index)
         plot_df.columns = ["Open", "High", "Low", "Close", "Volume"]
 
-        closes = df["close"].astype(float)
-
-        # Compute EMAs
-        ema9 = compute_ema(closes, 9)
-        ema21 = compute_ema(closes, 21)
-        ema50 = compute_ema(closes, 50) if len(df) >= 60 else None
-        ema200 = compute_ema(closes, 200) if len(df) >= 210 else None
-
-        # Compute RSI
-        rsi_series = compute_rsi(closes, 14) if len(df) >= 24 else None
-
-        # Compute MACD
-        macd_line, sig_line, histogram = compute_macd(closes) if len(df) >= 40 else (None, None, None)
+        n = len(plot_df)
+        ema9 = ema9.tail(n)
+        ema21 = ema21.tail(n)
+        if ema50 is not None:
+            ema50 = ema50.tail(n)
+        if ema200 is not None:
+            ema200 = ema200.tail(n)
+        if rsi_series is not None:
+            rsi_series = rsi_series.tail(n)
+        if macd_line is not None:
+            macd_line = macd_line.tail(n)
+            sig_line = sig_line.tail(n)
+            histogram = histogram.tail(n)
 
         # ── Build addplot list ────────────────────────────────────────────
         addplots = []

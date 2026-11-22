@@ -196,3 +196,126 @@ def test_main_power_hour_scheduled_job():
     import src.main as main_module
     assert hasattr(main_module, "run_power_hour_scan_job")
     assert callable(main_module.run_power_hour_scan_job)
+
+
+def test_trend_gate_rejects_buy_when_downtrend(monkeypatch):
+    """When trend_gate is enabled, BUY signal must be rejected if price <= EMA50 or EMA50 <= EMA200."""
+    scanner = Scanner.__new__(Scanner)
+    scanner.cfg = {
+        "guardrails": {
+            "trend_gate": {
+                "enabled": True,
+                "fast_ema": 50,
+                "slow_ema": 200,
+                "require_price_above_fast": True,
+                "require_fast_above_slow": True,
+                "fail_closed_on_short_history": False,
+                "apply_to_provisional": True,
+                "apply_to_daily": True,
+            },
+            "wick_filter": {"enabled": False},
+            "adx_filter": {"enabled": False},
+        },
+        "confluence": {"mode": "crossover", "min_groups_to_alert": 2},
+        "signals": {
+            "rsi": {"enabled": False},
+            "macd": {"enabled": False},
+            "ema_crossover": {"enabled": False},
+            "volume_breakout": {"enabled": False},
+        },
+    }
+    scanner.guardrails_cfg = scanner.cfg["guardrails"]
+    scanner.confluence_cfg = scanner.cfg["confluence"]
+    scanner.signal_cfg = scanner.cfg["signals"]
+    scanner.universe_cfg = {"min_price": 10}
+
+    import src.scanner as scanner_module
+    monkeypatch.setattr(
+        scanner_module,
+        "evaluate_confluence",
+        lambda checks, **kwargs: {
+            "direction": "BUY",
+            "score": 2,
+            "total_groups": 3,
+            "group_votes": {"trend": "BUY"},
+            "conflicting_groups": [],
+            "checks": [],
+        },
+    )
+
+    from src.db import Stock
+    stock = Stock(symbol="DOWNTREND", company_name="Downtrend Co")
+    # 250 bars of declining prices (EMA50 < EMA200)
+    prices = [200.0 - i * 0.5 for i in range(250)]
+    df = pd.DataFrame({
+        "open": prices, "high": [p + 1 for p in prices], "low": [p - 1 for p in prices],
+        "close": prices, "volume": [1000] * 250,
+    })
+
+    res, _ = scanner._scan_stock(stock, df, provisional=False)
+    assert res is None  # Trend gate rejects BUY in macro downtrend
+
+
+def test_rsi_exhaustion_ceiling_rejects_overbought_buy(monkeypatch):
+    """When RSI is above max_rsi_buy (68.0), BUY signal must be rejected."""
+    scanner = Scanner.__new__(Scanner)
+    scanner.cfg = {
+        "guardrails": {
+            "trend_gate": {"enabled": False},
+            "rsi_exhaustion": {
+                "enabled": True,
+                "max_rsi_buy": 68.0,
+                "min_rsi_sell": 32.0,
+                "apply_to_provisional": True,
+                "apply_to_daily": True,
+            },
+            "wick_filter": {"enabled": False},
+            "adx_filter": {"enabled": False},
+        },
+        "confluence": {"mode": "crossover", "min_groups_to_alert": 2},
+        "signals": {
+            "rsi": {
+                "enabled": True,
+                "period": 14,
+                "mode": "trend_momentum",
+                "confirmation": "level",
+                "oversold_threshold": 30,
+                "overbought_threshold": 70,
+                "bullish_threshold": 55,
+                "bearish_threshold": 45,
+            },
+            "macd": {"enabled": False},
+            "ema_crossover": {"enabled": False},
+            "volume_breakout": {"enabled": False},
+        },
+    }
+    scanner.guardrails_cfg = scanner.cfg["guardrails"]
+    scanner.confluence_cfg = scanner.cfg["confluence"]
+    scanner.signal_cfg = scanner.cfg["signals"]
+    scanner.universe_cfg = {"min_price": 10}
+
+    import src.scanner as scanner_module
+    monkeypatch.setattr(
+        scanner_module,
+        "evaluate_confluence",
+        lambda checks, **kwargs: {
+            "direction": "BUY",
+            "score": 2,
+            "total_groups": 3,
+            "group_votes": {"momentum": "BUY"},
+            "conflicting_groups": [],
+            "checks": [],
+        },
+    )
+
+    from src.db import Stock
+    stock = Stock(symbol="OVERBOUGHT", company_name="Overbought Co")
+    # Steady climb produces RSI > 80
+    prices = [100.0 + i * 2.0 for i in range(50)]
+    df = pd.DataFrame({
+        "open": prices, "high": [p + 1 for p in prices], "low": [p - 1 for p in prices],
+        "close": prices, "volume": [1000] * 50,
+    })
+
+    res, _ = scanner._scan_stock(stock, df, provisional=False)
+    assert res is None  # RSI exhaustion rejects BUY with RSI > 68.0

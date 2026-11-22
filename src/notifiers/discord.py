@@ -27,6 +27,7 @@ class DiscordNotifier(BaseNotifier):
 
     def __init__(self, cfg: dict):
         dc = cfg.get("notifications", {}).get("discord", {})
+        self.enabled = bool(dc.get("enabled", True))
         self.webhook_url = dc.get("webhook_url", "")
         self.send_chart_cfg = dc.get("send_chart", True)
 

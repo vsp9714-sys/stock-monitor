@@ -347,3 +347,81 @@ def test_signal_detail_serializes_numpy_and_pandas_types(test_db_session):
     assert loaded["checks"][0]["state_met"] is True
     assert loaded["checks"][0]["value"] == 1420.5
     assert loaded["session_date"] == "2026-11-09"
+
+
+def test_ensure_schema_migrations_upgrades_legacy_paper_trades_table(tmp_path):
+    """Confirm ensure_schema_migrations safely migrates legacy tables and preserves existing rows."""
+    from sqlalchemy import text
+    from src.db import create_sqlite_engine, ensure_schema_migrations
+
+    db_path = tmp_path / "legacy.db"
+    engine = create_sqlite_engine(f"sqlite:///{db_path}")
+
+    # Create legacy table schema without new columns and with old 3-column unique constraint
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE TABLE paper_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id INTEGER,
+                symbol VARCHAR(30) NOT NULL,
+                direction VARCHAR(10) NOT NULL,
+                entry_price FLOAT NOT NULL,
+                entry_date DATE NOT NULL,
+                entry_datetime DATETIME NOT NULL,
+                stop_loss FLOAT NOT NULL,
+                target_price FLOAT NOT NULL,
+                atr_at_entry FLOAT,
+                risk_distance FLOAT,
+                confluence_score INTEGER,
+                alert_tier VARCHAR(30),
+                signal_groups_json TEXT,
+                max_favorable_excursion FLOAT,
+                max_adverse_excursion FLOAT,
+                exit_price FLOAT,
+                exit_date DATE,
+                exit_datetime DATETIME,
+                exit_reason VARCHAR(30),
+                pnl_absolute FLOAT,
+                pnl_percent FLOAT,
+                r_multiple FLOAT,
+                status VARCHAR(10) NOT NULL DEFAULT 'open',
+                created_at DATETIME,
+                updated_at DATETIME,
+                CONSTRAINT uq_paper_trade_symbol_dir_date UNIQUE (symbol, direction, entry_date)
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO paper_trades (symbol, direction, entry_price, entry_date, entry_datetime, stop_loss, target_price, alert_tier, status)
+            VALUES ('INFY', 'BUY', 1500.0, '2026-11-20', '2026-11-20 10:00:00', 1470.0, 1560.0, 'intraday_radar', 'open')
+        """))
+        conn.commit()
+
+    # Run migration
+    ensure_schema_migrations(engine)
+
+    # Verify existing row survived and new columns were added
+    with engine.connect() as conn:
+        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(paper_trades)")).fetchall()}
+        assert "gross_pnl_percent" in cols
+        assert "cost_percent" in cols
+        assert "net_r_multiple" in cols
+        assert "fits_tranche_rules" in cols
+        assert "strategy_version" in cols
+
+        # Check existing row data
+        row = conn.execute(text("SELECT symbol, direction, entry_price, alert_tier FROM paper_trades WHERE symbol='INFY'")).fetchone()
+        assert row is not None
+        assert row[0] == "INFY"
+        assert row[1] == "BUY"
+        assert row[2] == 1500.0
+        assert row[3] == "intraday_radar"
+
+        # Now test that tier-isolated unique constraint allows same day entry for power_hour_confirmed!
+        conn.execute(text("""
+            INSERT INTO paper_trades (symbol, direction, entry_price, entry_date, entry_datetime, stop_loss, target_price, alert_tier, status)
+            VALUES ('INFY', 'BUY', 1510.0, '2026-11-20', '2026-11-20 15:15:00', 1480.0, 1570.0, 'power_hour_confirmed', 'open')
+        """))
+        conn.commit()
+
+        count = conn.execute(text("SELECT count(*) FROM paper_trades WHERE symbol='INFY'")).scalar()
+        assert count == 2

@@ -9,7 +9,7 @@ Wilder's ADX quantifies trend strength independently of direction.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -28,7 +28,7 @@ def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     Returns:
         DataFrame with columns ['plus_di', 'minus_di', 'adx'].
     """
-    if df is None or len(df) < period + 2:
+    if df is None or len(df) < (2 * period) + 1:
         empty = pd.Series(index=df.index if df is not None else None, dtype=float)
         return pd.DataFrame({"plus_di": empty, "minus_di": empty, "adx": empty})
 
@@ -91,6 +91,8 @@ def adx_filter(
     period: int = 14,
     min_adx: float = 20.0,
     strong_threshold: float = 25.0,
+    direction: Optional[str] = None,
+    require_di_alignment: bool = True,
 ) -> dict[str, Any]:
     """
     Evaluate ADX trend strength against configured thresholds.
@@ -104,7 +106,7 @@ def adx_filter(
         - trend_strength (str): 'strong', 'moderate', 'weak', or 'unavailable'
         - reason (str): Explanatory reason
     """
-    if df is None or len(df) < period + 2:
+    if df is None or len(df) < (2 * period) + 1:
         return {
             "passed": True,
             "adx": None,
@@ -135,6 +137,17 @@ def adx_filter(
         m_di = float(latest_minus_di) if not np.isnan(latest_minus_di) else 0.0
 
         passed = adx_val >= min_adx
+        reason = "ok" if passed else "adx_below_threshold"
+
+        if passed and require_di_alignment and direction:
+            dir_upper = str(direction).upper()
+            if dir_upper == "BUY" and p_di <= m_di:
+                passed = False
+                reason = "di_opposes_buy"
+            elif dir_upper == "SELL" and m_di <= p_di:
+                passed = False
+                reason = "di_opposes_sell"
+
         if adx_val >= strong_threshold:
             strength = "strong"
         elif adx_val >= min_adx:
@@ -148,7 +161,7 @@ def adx_filter(
             "plus_di": round(p_di, 2),
             "minus_di": round(m_di, 2),
             "trend_strength": strength,
-            "reason": "ok" if passed else "adx_below_threshold",
+            "reason": reason,
         }
     except Exception as exc:
         logger.warning("Error evaluating ADX filter: %s", exc)

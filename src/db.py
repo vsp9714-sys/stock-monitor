@@ -237,7 +237,12 @@ class PaperTrade(Base):
     exit_reason = Column(String(30))  # stop_hit, target_hit, time_expiry, manual
     pnl_absolute = Column(Float)
     pnl_percent = Column(Float)
+    gross_pnl_percent = Column(Float)
+    cost_percent = Column(Float)
     r_multiple = Column(Float)
+    net_r_multiple = Column(Float)
+    fits_tranche_rules = Column(Boolean)
+    strategy_version = Column(String(30))
 
     # Lifecycle state
     status = Column(String(10), nullable=False, default="open", index=True)  # open, closed
@@ -245,7 +250,7 @@ class PaperTrade(Base):
     updated_at = Column(DateTime)
 
     __table_args__ = (
-        UniqueConstraint("symbol", "direction", "entry_date", name="uq_paper_trade_symbol_dir_date"),
+        UniqueConstraint("symbol", "direction", "entry_date", "alert_tier", name="uq_paper_trade_symbol_dir_date_tier"),
     )
 
 
@@ -281,6 +286,12 @@ class PaperTradeWeeklyReport(Base):
     win_rate_pct = Column(Float)
     avg_pnl_pct = Column(Float)
     avg_r_multiple = Column(Float)
+    profit_factor = Column(Float)
+    expectancy_r = Column(Float)
+    buy_trades = Column(Integer, default=0)
+    buy_win_rate = Column(Float)
+    sell_trades = Column(Integer, default=0)
+    sell_win_rate = Column(Float)
     best_trade_symbol = Column(String(30))
     best_trade_pnl_pct = Column(Float)
     worst_trade_symbol = Column(String(30))
@@ -295,6 +306,58 @@ class PaperTradeWeeklyReport(Base):
     score_3_win_rate = Column(Float)
     report_json = Column(Text)
     generated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+# ─── Schema Migrations ────────────────────────────────────────────────────────
+
+def ensure_schema_migrations(engine):
+    """Ensure new columns and updated unique constraints exist on existing SQLite databases."""
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        pt_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(paper_trades)")).fetchall()}
+        if pt_cols:
+            if "gross_pnl_percent" not in pt_cols:
+                conn.execute(text("ALTER TABLE paper_trades ADD COLUMN gross_pnl_percent REAL"))
+            if "cost_percent" not in pt_cols:
+                conn.execute(text("ALTER TABLE paper_trades ADD COLUMN cost_percent REAL"))
+            if "net_r_multiple" not in pt_cols:
+                conn.execute(text("ALTER TABLE paper_trades ADD COLUMN net_r_multiple REAL"))
+            if "fits_tranche_rules" not in pt_cols:
+                conn.execute(text("ALTER TABLE paper_trades ADD COLUMN fits_tranche_rules BOOLEAN"))
+            if "strategy_version" not in pt_cols:
+                conn.execute(text("ALTER TABLE paper_trades ADD COLUMN strategy_version VARCHAR(30)"))
+
+        wr_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(paper_trade_weekly_reports)")).fetchall()}
+        if wr_cols:
+            if "profit_factor" not in wr_cols:
+                conn.execute(text("ALTER TABLE paper_trade_weekly_reports ADD COLUMN profit_factor REAL"))
+            if "expectancy_r" not in wr_cols:
+                conn.execute(text("ALTER TABLE paper_trade_weekly_reports ADD COLUMN expectancy_r REAL"))
+            if "buy_trades" not in wr_cols:
+                conn.execute(text("ALTER TABLE paper_trade_weekly_reports ADD COLUMN buy_trades INTEGER DEFAULT 0"))
+            if "buy_win_rate" not in wr_cols:
+                conn.execute(text("ALTER TABLE paper_trade_weekly_reports ADD COLUMN buy_win_rate REAL"))
+            if "sell_trades" not in wr_cols:
+                conn.execute(text("ALTER TABLE paper_trade_weekly_reports ADD COLUMN sell_trades INTEGER DEFAULT 0"))
+            if "sell_win_rate" not in wr_cols:
+                conn.execute(text("ALTER TABLE paper_trade_weekly_reports ADD COLUMN sell_win_rate REAL"))
+
+        # Check unique constraint on paper_trades: upgrade if uq_paper_trade_symbol_dir_date exists without alert_tier
+        res = conn.execute(text("SELECT sql FROM sqlite_master WHERE type='table' AND name='paper_trades'")).fetchone()
+        if res and res[0]:
+            table_sql = res[0]
+            if "uq_paper_trade_symbol_dir_date" in table_sql and "uq_paper_trade_symbol_dir_date_tier" not in table_sql:
+                logger.info("Migrating paper_trades unique constraint to include alert_tier...")
+                current_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(paper_trades)")).fetchall()]
+                col_list = ", ".join(current_cols)
+                conn.execute(text("PRAGMA foreign_keys=OFF"))
+                conn.execute(text("ALTER TABLE paper_trades RENAME TO paper_trades_old"))
+                Base.metadata.tables["paper_trades"].create(conn)
+                conn.execute(text(f"INSERT INTO paper_trades ({col_list}) SELECT {col_list} FROM paper_trades_old"))
+                conn.execute(text("DROP TABLE paper_trades_old"))
+                conn.execute(text("PRAGMA foreign_keys=ON"))
+                logger.info("Migrated paper_trades successfully.")
+        conn.commit()
 
 
 # ─── Engine & Session ─────────────────────────────────────────────────────────
@@ -312,6 +375,7 @@ def get_engine():
         db_url = f"sqlite:///{db_path.absolute()}"
         _engine = create_sqlite_engine(db_url)
         Base.metadata.create_all(_engine)
+        ensure_schema_migrations(_engine)
         logger.info(f"Database initialized at {db_path.absolute()}")
     return _engine
 
