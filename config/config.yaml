@@ -38,14 +38,14 @@ signals:
     period: 14
     # mean_reversion keeps the former <=30 / >=70 rule. trend_momentum uses
     # the configured 55 / 45 RSI state thresholds and can be selected explicitly.
-    mode: "mean_reversion"
+    mode: "trend_momentum"
     # level preserves the former behavior; cross_back waits for re-entry from
     # an extreme. Crossover confluence independently requires a fresh event.
     confirmation: "level"
-    oversold_threshold: 30       # RSI below this → BUY signal
-    overbought_threshold: 70     # RSI above this → SELL signal
-    bullish_threshold: 55
-    bearish_threshold: 45
+    oversold_threshold: 30       # RSI below this → BUY signal (reference)
+    overbought_threshold: 70     # RSI above this → SELL signal (reference)
+    bullish_threshold: 55        # Active in trend_momentum mode
+    bearish_threshold: 45        # Active in trend_momentum mode
 
   macd:
     enabled: true
@@ -101,6 +101,27 @@ guardrails:
   two_tier_alerts:
     enabled: true
     power_hour_start: "15:10"  # Scans at or after 15:10 IST trigger Tier 2 Confirmed Entry
+
+  # Average Directional Index (ADX) trend strength filter
+  # Rejects false breakouts and whipsaw crossovers in choppy/sideways markets
+  adx_filter:
+    enabled: true
+    period: 14
+    min_adx: 20.0                # Minimum ADX to allow alert (ADX < 20 indicates choppy market)
+    strong_trend_threshold: 25.0 # ADX >= 25 marks strong trend confirmation in alerts
+    apply_to_provisional: true
+    apply_to_daily: true
+
+# ─── Paper Trading & Alert Validation ─────────────────────────────────────────
+paper_trading:
+  enabled: true
+  max_hold_days: 10              # Maximum holding duration in trading days
+  milestones: [2.5, -2.5, 5.0, -5.0]  # P&L milestone alert thresholds (%)
+  send_milestone_alerts: true    # Broadcast milestone alerts via Telegram
+  send_exit_alerts: true         # Broadcast exit (stop/target/time) alerts via Telegram
+  weekly_report_day: "saturday"  # Day of week for weekly performance report
+  weekly_report_time: "09:00"    # Time of day (Asia/Kolkata)
+  cooldown_days: 3               # Minimum days before re-entering same symbol & direction
 
 # ─── Stock Universe ──────────────────────────────────────────────────────────
 universe:

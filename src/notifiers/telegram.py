@@ -175,6 +175,13 @@ class TelegramNotifier(BaseNotifier):
                 )
             elif oi.get("status") == "unavailable":
                 lines.append(f"📊 Options OI: unavailable ({html.escape(str(oi.get('reason', 'unknown')))}).")
+        adx_info = payload.indicator_detail.get("adx")
+        if adx_info and adx_info.get("adx") is not None:
+            lines.append(
+                f"⚡ ADX: <b>{adx_info['adx']:.1f}</b> "
+                f"({html.escape(str(adx_info.get('trend_strength', '')).title())} Trend) · "
+                f"+DI: {adx_info.get('plus_di', 0):.1f} · -DI: {adx_info.get('minus_di', 0):.1f}"
+            )
         risk = payload.risk_context or {}
         if risk.get("status") == "available":
             size = (
@@ -323,6 +330,13 @@ class TelegramNotifier(BaseNotifier):
         if success:
             logger.info(f"Telegram alert sent for {payload.symbol} to {target}")
         return success
+
+    def broadcast_message(self, message: str) -> bool:
+        """Broadcast a message to all configured Telegram destinations."""
+        if not self.destinations:
+            return False
+        results = [self._send_message(message, chat_id) for chat_id in self.destinations.values()]
+        return any(results)
 
 
 def _config_switch(value) -> bool:
