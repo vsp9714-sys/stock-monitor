@@ -163,3 +163,22 @@ def test_chart_generation(tmp_path):
     assert os.path.exists(chart_path)
     assert chart_path.endswith(".png")
     assert os.path.getsize(chart_path) > 1000
+
+
+def test_chart_generation_with_ema200(tmp_path):
+    """When df >= 220 bars, chart generation computes EMA200 on full df before slicing."""
+    df = _generate_synthetic_ohlcv(230, trend="up")
+    chart_path = generate_signal_chart(
+        symbol="RELIANCE",
+        company_name="Reliance Industries Ltd",
+        df=df,
+        signal_type="confluence_buy",
+        direction="BUY",
+        indicator_value=3.0,
+        lookback_candles=60,
+    )
+    assert chart_path is not None
+    import os
+    assert os.path.exists(chart_path)
+    assert chart_path.endswith(".png")
+    assert os.path.getsize(chart_path) > 1000

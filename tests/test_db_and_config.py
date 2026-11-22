@@ -347,3 +347,129 @@ def test_signal_detail_serializes_numpy_and_pandas_types(test_db_session):
     assert loaded["checks"][0]["state_met"] is True
     assert loaded["checks"][0]["value"] == 1420.5
     assert loaded["session_date"] == "2026-11-09"
+
+
+def test_ensure_schema_migrations_upgrades_legacy_paper_trades_table(tmp_path):
+    """Confirm ensure_schema_migrations safely migrates legacy tables, handles indexes, and preserves foreign keys."""
+    from sqlalchemy import text
+    from sqlalchemy.exc import IntegrityError
+    import pytest
+    from src.db import create_sqlite_engine, ensure_schema_migrations
+
+    db_path = tmp_path / "legacy.db"
+    engine = create_sqlite_engine(f"sqlite:///{db_path}")
+
+    # Create legacy table schema without new columns and with old 3-column unique constraint
+    with engine.connect() as conn:
+        conn.execute(text("CREATE TABLE signals (id INTEGER PRIMARY KEY)"))
+        conn.execute(text("""
+            CREATE TABLE paper_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id INTEGER,
+                symbol VARCHAR(30) NOT NULL,
+                direction VARCHAR(10) NOT NULL,
+                entry_price FLOAT NOT NULL,
+                entry_date DATE NOT NULL,
+                entry_datetime DATETIME NOT NULL,
+                stop_loss FLOAT NOT NULL,
+                target_price FLOAT NOT NULL,
+                atr_at_entry FLOAT,
+                risk_distance FLOAT,
+                confluence_score INTEGER,
+                alert_tier VARCHAR(30),
+                signal_groups_json TEXT,
+                max_favorable_excursion FLOAT,
+                max_adverse_excursion FLOAT,
+                exit_price FLOAT,
+                exit_date DATE,
+                exit_datetime DATETIME,
+                exit_reason VARCHAR(30),
+                pnl_absolute FLOAT,
+                pnl_percent FLOAT,
+                r_multiple FLOAT,
+                status VARCHAR(10) NOT NULL DEFAULT 'open',
+                created_at DATETIME,
+                updated_at DATETIME,
+                CONSTRAINT uq_paper_trade_symbol_dir_date UNIQUE (symbol, direction, entry_date)
+            )
+        """))
+        # Create all 4 SQLAlchemy indexes on paper_trades
+        conn.execute(text("CREATE INDEX ix_paper_trades_symbol ON paper_trades (symbol)"))
+        conn.execute(text("CREATE INDEX ix_paper_trades_signal_id ON paper_trades (signal_id)"))
+        conn.execute(text("CREATE INDEX ix_paper_trades_entry_date ON paper_trades (entry_date)"))
+        conn.execute(text("CREATE INDEX ix_paper_trades_status ON paper_trades (status)"))
+
+        # Create paper_trade_milestones child table with foreign key
+        conn.execute(text("""
+            CREATE TABLE paper_trade_milestones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id INTEGER NOT NULL,
+                milestone_pct FLOAT NOT NULL,
+                hit_price FLOAT NOT NULL,
+                hit_datetime DATETIME NOT NULL,
+                notified BOOLEAN DEFAULT 0,
+                notified_at DATETIME,
+                FOREIGN KEY (trade_id) REFERENCES paper_trades (id) ON DELETE CASCADE
+            )
+        """))
+
+        conn.execute(text("""
+            INSERT INTO paper_trades (id, symbol, direction, entry_price, entry_date, entry_datetime, stop_loss, target_price, alert_tier, status)
+            VALUES (1, 'INFY', 'BUY', 1500.0, '2026-11-20', '2026-11-20 10:00:00', 1470.0, 1560.0, 'intraday_radar', 'open')
+        """))
+        conn.execute(text("""
+            INSERT INTO paper_trade_milestones (trade_id, milestone_pct, hit_price, hit_datetime, notified)
+            VALUES (1, 2.5, 1537.5, '2026-11-20 11:00:00', 0)
+        """))
+        conn.commit()
+
+    # Run migration
+    ensure_schema_migrations(engine)
+
+    # Verify existing row survived, new columns were added, and child FK remains intact
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text("PRAGMA foreign_keys=ON"))
+
+        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(paper_trades)")).fetchall()}
+        assert "gross_pnl_percent" in cols
+        assert "cost_percent" in cols
+        assert "net_r_multiple" in cols
+        assert "fits_tranche_rules" in cols
+        assert "strategy_version" in cols
+
+        # Check existing row data in paper_trades
+        row = conn.execute(text("SELECT symbol, direction, entry_price, alert_tier FROM paper_trades WHERE symbol='INFY'")).fetchone()
+        assert row is not None
+        assert row[0] == "INFY"
+        assert row[1] == "BUY"
+        assert row[2] == 1500.0
+        assert row[3] == "intraday_radar"
+
+        # Verify child table DDL in sqlite_master still references paper_trades (not paper_trades_old)
+        milestone_sql = conn.execute(text("SELECT sql FROM sqlite_master WHERE type='table' AND name='paper_trade_milestones'")).scalar()
+        assert "REFERENCES paper_trades" in milestone_sql
+        assert "paper_trades_old" not in milestone_sql
+
+        # Verify inserting a second milestone succeeds with PRAGMA foreign_keys=ON
+        conn.execute(text("""
+            INSERT INTO paper_trade_milestones (trade_id, milestone_pct, hit_price, hit_datetime, notified)
+            VALUES (1, 5.0, 1575.0, '2026-11-20 12:00:00', 0)
+        """))
+        milestones_count = conn.execute(text("SELECT count(*) FROM paper_trade_milestones WHERE trade_id=1")).scalar()
+        assert milestones_count == 2
+
+        # Verify foreign keys are active: invalid FK should fail
+        with pytest.raises(IntegrityError):
+            conn.execute(text("""
+                INSERT INTO paper_trade_milestones (trade_id, milestone_pct, hit_price, hit_datetime, notified)
+                VALUES (999, 5.0, 100.0, '2026-11-20 12:00:00', 0)
+            """))
+
+        # Test that tier-isolated unique constraint allows same day entry for power_hour_confirmed
+        conn.execute(text("""
+            INSERT INTO paper_trades (symbol, direction, entry_price, entry_date, entry_datetime, stop_loss, target_price, alert_tier, status)
+            VALUES ('INFY', 'BUY', 1510.0, '2026-11-20', '2026-11-20 15:15:00', 1480.0, 1570.0, 'power_hour_confirmed', 'open')
+        """))
+
+        count = conn.execute(text("SELECT count(*) FROM paper_trades WHERE symbol='INFY'")).scalar()
+        assert count == 2

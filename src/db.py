@@ -237,7 +237,12 @@ class PaperTrade(Base):
     exit_reason = Column(String(30))  # stop_hit, target_hit, time_expiry, manual
     pnl_absolute = Column(Float)
     pnl_percent = Column(Float)
+    gross_pnl_percent = Column(Float)
+    cost_percent = Column(Float)
     r_multiple = Column(Float)
+    net_r_multiple = Column(Float)
+    fits_tranche_rules = Column(Boolean)
+    strategy_version = Column(String(30))
 
     # Lifecycle state
     status = Column(String(10), nullable=False, default="open", index=True)  # open, closed
@@ -245,7 +250,7 @@ class PaperTrade(Base):
     updated_at = Column(DateTime)
 
     __table_args__ = (
-        UniqueConstraint("symbol", "direction", "entry_date", name="uq_paper_trade_symbol_dir_date"),
+        UniqueConstraint("symbol", "direction", "entry_date", "alert_tier", name="uq_paper_trade_symbol_dir_date_tier"),
     )
 
 
@@ -281,6 +286,12 @@ class PaperTradeWeeklyReport(Base):
     win_rate_pct = Column(Float)
     avg_pnl_pct = Column(Float)
     avg_r_multiple = Column(Float)
+    profit_factor = Column(Float)
+    expectancy_r = Column(Float)
+    buy_trades = Column(Integer, default=0)
+    buy_win_rate = Column(Float)
+    sell_trades = Column(Integer, default=0)
+    sell_win_rate = Column(Float)
     best_trade_symbol = Column(String(30))
     best_trade_pnl_pct = Column(Float)
     worst_trade_symbol = Column(String(30))
@@ -295,6 +306,114 @@ class PaperTradeWeeklyReport(Base):
     score_3_win_rate = Column(Float)
     report_json = Column(Text)
     generated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+# ─── Schema Migrations ────────────────────────────────────────────────────────
+
+def ensure_schema_migrations(engine):
+    """Ensure new columns and updated unique constraints exist on existing SQLite databases."""
+    from sqlalchemy import text
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        pt_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(paper_trades)")).fetchall()}
+        if pt_cols:
+            if "gross_pnl_percent" not in pt_cols:
+                conn.execute(text("ALTER TABLE paper_trades ADD COLUMN gross_pnl_percent REAL"))
+            if "cost_percent" not in pt_cols:
+                conn.execute(text("ALTER TABLE paper_trades ADD COLUMN cost_percent REAL"))
+            if "net_r_multiple" not in pt_cols:
+                conn.execute(text("ALTER TABLE paper_trades ADD COLUMN net_r_multiple REAL"))
+            if "fits_tranche_rules" not in pt_cols:
+                conn.execute(text("ALTER TABLE paper_trades ADD COLUMN fits_tranche_rules BOOLEAN"))
+            if "strategy_version" not in pt_cols:
+                conn.execute(text("ALTER TABLE paper_trades ADD COLUMN strategy_version VARCHAR(30)"))
+
+        wr_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(paper_trade_weekly_reports)")).fetchall()}
+        if wr_cols:
+            if "profit_factor" not in wr_cols:
+                conn.execute(text("ALTER TABLE paper_trade_weekly_reports ADD COLUMN profit_factor REAL"))
+            if "expectancy_r" not in wr_cols:
+                conn.execute(text("ALTER TABLE paper_trade_weekly_reports ADD COLUMN expectancy_r REAL"))
+            if "buy_trades" not in wr_cols:
+                conn.execute(text("ALTER TABLE paper_trade_weekly_reports ADD COLUMN buy_trades INTEGER DEFAULT 0"))
+            if "buy_win_rate" not in wr_cols:
+                conn.execute(text("ALTER TABLE paper_trade_weekly_reports ADD COLUMN buy_win_rate REAL"))
+            if "sell_trades" not in wr_cols:
+                conn.execute(text("ALTER TABLE paper_trade_weekly_reports ADD COLUMN sell_trades INTEGER DEFAULT 0"))
+            if "sell_win_rate" not in wr_cols:
+                conn.execute(text("ALTER TABLE paper_trade_weekly_reports ADD COLUMN sell_win_rate REAL"))
+
+        # Check unique constraint on paper_trades: upgrade if legacy constraint exists without alert_tier
+        res = conn.execute(text("SELECT sql FROM sqlite_master WHERE type='table' AND name='paper_trades'")).fetchone()
+        if res and res[0]:
+            table_sql = res[0]
+            if "uq_paper_trade_symbol_dir_date" in table_sql and "uq_paper_trade_symbol_dir_date_tier" not in table_sql:
+                logger.info("Migrating paper_trades unique constraint to include alert_tier...")
+                # 1. Disable FKs outside a transaction in autocommit mode so SQLite does not rewrite child FKs
+                conn.execute(text("PRAGMA foreign_keys=OFF"))
+                conn.execute(text("BEGIN TRANSACTION"))
+                try:
+                    conn.execute(text("""
+                        CREATE TABLE paper_trades_new (
+                            id INTEGER PRIMARY KEY,
+                            signal_id INTEGER,
+                            symbol VARCHAR(30) NOT NULL,
+                            direction VARCHAR(10) NOT NULL,
+                            entry_price FLOAT NOT NULL,
+                            entry_date DATE NOT NULL,
+                            entry_datetime DATETIME NOT NULL,
+                            stop_loss FLOAT NOT NULL,
+                            target_price FLOAT NOT NULL,
+                            atr_at_entry FLOAT,
+                            risk_distance FLOAT,
+                            confluence_score INTEGER,
+                            alert_tier VARCHAR(30),
+                            signal_groups_json TEXT,
+                            max_favorable_excursion FLOAT,
+                            max_adverse_excursion FLOAT,
+                            exit_price FLOAT,
+                            exit_date DATE,
+                            exit_datetime DATETIME,
+                            exit_reason VARCHAR(30),
+                            pnl_absolute FLOAT,
+                            pnl_percent FLOAT,
+                            gross_pnl_percent FLOAT,
+                            cost_percent FLOAT,
+                            r_multiple FLOAT,
+                            net_r_multiple FLOAT,
+                            fits_tranche_rules BOOLEAN,
+                            strategy_version VARCHAR(30),
+                            status VARCHAR(10) NOT NULL DEFAULT 'open',
+                            created_at DATETIME,
+                            updated_at DATETIME,
+                            FOREIGN KEY(signal_id) REFERENCES signals (id) ON DELETE SET NULL,
+                            CONSTRAINT uq_paper_trade_symbol_dir_date_tier UNIQUE (symbol, direction, entry_date, alert_tier)
+                        )
+                    """))
+                    existing_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(paper_trades)")).fetchall()]
+                    target_cols = [
+                        "id", "signal_id", "symbol", "direction", "entry_price", "entry_date", "entry_datetime",
+                        "stop_loss", "target_price", "atr_at_entry", "risk_distance", "confluence_score", "alert_tier",
+                        "signal_groups_json", "max_favorable_excursion", "max_adverse_excursion", "exit_price",
+                        "exit_date", "exit_datetime", "exit_reason", "pnl_absolute", "pnl_percent",
+                        "gross_pnl_percent", "cost_percent", "r_multiple", "net_r_multiple", "fits_tranche_rules",
+                        "strategy_version", "status", "created_at", "updated_at",
+                    ]
+                    common_cols = [c for c in existing_cols if c in target_cols]
+                    col_str = ", ".join(common_cols)
+                    conn.execute(text(f"INSERT INTO paper_trades_new ({col_str}) SELECT {col_str} FROM paper_trades"))
+                    conn.execute(text("DROP TABLE paper_trades"))
+                    conn.execute(text("ALTER TABLE paper_trades_new RENAME TO paper_trades"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_paper_trades_symbol ON paper_trades (symbol)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_paper_trades_signal_id ON paper_trades (signal_id)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_paper_trades_entry_date ON paper_trades (entry_date)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_paper_trades_status ON paper_trades (status)"))
+                    conn.execute(text("COMMIT"))
+                except Exception:
+                    conn.execute(text("ROLLBACK"))
+                    raise
+                finally:
+                    conn.execute(text("PRAGMA foreign_keys=ON"))
+                logger.info("Migrated paper_trades successfully.")
 
 
 # ─── Engine & Session ─────────────────────────────────────────────────────────
@@ -312,6 +431,7 @@ def get_engine():
         db_url = f"sqlite:///{db_path.absolute()}"
         _engine = create_sqlite_engine(db_url)
         Base.metadata.create_all(_engine)
+        ensure_schema_migrations(_engine)
         logger.info(f"Database initialized at {db_path.absolute()}")
     return _engine
 

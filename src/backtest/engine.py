@@ -37,6 +37,20 @@ def simulate_period(
     target_multiple = float(bt.get("target_r_multiple", risk_cfg.get("target_r_multiple", 2.0)))
     fee_bps = float(bt.get("fee_bps_per_side", 5.0))
     slippage_bps = float(bt.get("slippage_bps_per_side", 5.0))
+    raw_max_hold = bt.get("max_hold_days")
+    max_hold_days: int | None = None
+    if raw_max_hold is not None:
+        try:
+            val = int(raw_max_hold)
+            if val > 0:
+                max_hold_days = val
+        except (ValueError, TypeError):
+            max_hold_days = None
+
+    raw_allowed = bt.get("allowed_directions")
+    allowed_directions: set[str] | None = None
+    if raw_allowed is not None:
+        allowed_directions = {str(d).upper() for d in raw_allowed}
     trades: list[dict[str, Any]] = []
     total_symbol_sessions = 0
     exposure_sessions = 0
@@ -63,6 +77,9 @@ def simulate_period(
             # The evaluator sees only completed data through the current close.
             signal = evaluate(symbol, frame.iloc[: i + 1].copy())
             if not signal or signal.get("direction") not in {"BUY", "SELL"}:
+                i += 1
+                continue
+            if allowed_directions is not None and signal.get("direction") not in allowed_directions:
                 i += 1
                 continue
             entry_idx = i + 1
@@ -113,6 +130,10 @@ def simulate_period(
                         exit_price = target
                         exit_reason, exit_idx = "target", j
                         break
+                if max_hold_days is not None and (j - entry_idx + 1) >= max_hold_days:
+                    exit_price = float(bar["close"])
+                    exit_reason, exit_idx = "time_expiry", j
+                    break
             exit_fill = exit_price * (1 - slip if side == 1 else 1 + slip)
             gross_pct = side * (exit_price / raw_entry - 1.0) * 100.0
             # Slippage is represented in the actual fills above; charge fees
@@ -147,6 +168,11 @@ def simulate_period(
             max_drawdown = max(max_drawdown, (peak - equity) / peak)
     wins = sum(value > 0 for value in returns)
     losses = sum(value < 0 for value in returns)
+    pos_sum = sum(value for value in returns if value > 0)
+    neg_sum = abs(sum(value for value in returns if value < 0))
+    profit_factor = round(pos_sum / neg_sum, 2) if neg_sum > 0 else None
+    valid_r = [t["net_r_multiple"] for t in trades if t.get("net_r_multiple") is not None]
+    expectancy_r = round(sum(valid_r) / len(valid_r), 2) if valid_r else None
     summary = {
         "trade_count": len(trades), "wins": wins, "losses": losses,
         "win_rate_pct": wins / len(trades) * 100 if trades else None,
@@ -156,6 +182,8 @@ def simulate_period(
         "max_drawdown_pct_sequential_trade_equity": max_drawdown * 100,
         "exposure_pct_symbol_sessions": exposure_sessions / total_symbol_sessions * 100 if total_symbol_sessions else None,
         "closed_trade_equity_multiple_sequential": equity,
+        "profit_factor": profit_factor,
+        "expectancy_r": expectancy_r,
         "skipped": skipped,
     }
     return {"summary": summary, "trades": trades}

@@ -184,11 +184,24 @@ class TelegramNotifier(BaseNotifier):
             )
         risk = payload.risk_context or {}
         if risk.get("status") == "available":
-            size = (
-                f" · quantity {risk['quantity']} (risk budget ₹{risk.get('risk_budget_inr', 0):,.0f})"
-                if risk.get("position_size_status") == "available" else
-                " · quantity not configured" if risk.get("position_size_status") == "unconfigured" else ""
-            )
+            if risk.get("position_size_status") == "available":
+                qty = risk["quantity"]
+                budget = risk.get("risk_budget_inr", 0)
+                notional = risk.get("notional_inr")
+                actual_risk = risk.get("actual_risk_inr")
+                constraint = risk.get("sizing_constraint")
+                details = [f"risk budget ₹{budget:,.0f}"]
+                if notional is not None:
+                    details.append(f"notional ₹{notional:,.0f}")
+                if actual_risk is not None:
+                    details.append(f"actual risk ₹{actual_risk:,.0f}")
+                if constraint == "tranche_capped":
+                    details.append("tranche capped")
+                size = f" · quantity {qty} ({', '.join(details)})"
+            elif risk.get("position_size_status") == "unconfigured":
+                size = " · quantity not configured"
+            else:
+                size = ""
             lines.append(
                 f"⚠️ Model risk references only (not an order): stop {risk['stop_atr_multiple']:.2f}×ATR "
                 f"(₹{risk['stop_reference']:.2f}) · "

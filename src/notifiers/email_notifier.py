@@ -29,6 +29,7 @@ class EmailNotifier(BaseNotifier):
 
     def __init__(self, cfg: dict):
         email_cfg = cfg.get("notifications", {}).get("email", {})
+        self.enabled = bool(email_cfg.get("enabled", True))
         self.smtp_host = email_cfg.get("smtp_host", "smtp.gmail.com")
         self.smtp_port = email_cfg.get("smtp_port", 587)
         self.username = email_cfg.get("username", "")

@@ -25,7 +25,7 @@ from pathlib import Path
 import schedule
 
 from src.config_loader import get_config
-from src.db import get_engine
+from src.db import get_engine, get_session
 from src.fetcher.upstox import UpstoxFetcher
 from src.market_calendar import CalendarUnavailable, IST, is_market_open
 from src.scanner import Scanner

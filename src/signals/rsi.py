@@ -45,9 +45,11 @@ def compute_rsi(closes: pd.Series, period: int = 14) -> pd.Series:
     avg_gain = gains.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     avg_loss = losses.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
+    # When avg_loss == 0, RSI is 100.0 if avg_gain > 0, else 50.0
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    rsi_series = 100.0 - (100.0 / (1.0 + rs))
+    rsi_series = rsi_series.where(avg_loss != 0, np.where(avg_gain > 0, 100.0, 50.0))
+    return rsi_series
 
 
 def detect_rsi_signal(

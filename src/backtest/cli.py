@@ -85,6 +85,7 @@ def run_backtest(start_date: date, end_date: date, symbols: list[str] | None, ou
     evaluator.signal_cfg = cfg.get("signals", {})
     evaluator.universe_cfg = cfg.get("universe", {})
     evaluator.confluence_cfg = cfg.get("confluence", {})
+    evaluator.guardrails_cfg = cfg.get("guardrails", {})
 
     market_context_cfg = cfg.get("market_context", {}) or {}
     if market_context_cfg.get("mode", "informational") == "filter":
@@ -139,7 +140,7 @@ def run_backtest(start_date: date, end_date: date, symbols: list[str] | None, ou
     else:
         walk_forward = {"status": "unavailable", "reason": "fewer_than_four_sessions"}
 
-    strategy_cfg = {key: cfg.get(key) for key in ("signals", "confluence", "backtest", "risk")}
+    strategy_cfg = {key: cfg.get(key) for key in ("signals", "confluence", "guardrails", "backtest", "risk")}
     config_hash = hashlib.sha256(json.dumps(strategy_cfg, sort_keys=True, default=str).encode()).hexdigest()
     limits = [
         "Only locally cached daily OHLCV is used; the command performs no network requests and sends no alerts.",
@@ -186,7 +187,12 @@ def run_backtest(start_date: date, end_date: date, symbols: list[str] | None, ou
             f"Benchmark: {report['benchmark']}", f"Walk-forward: {walk_forward['status']}", "Limitations:"]
     text.extend(f"- {item}" for item in limits)
     (out_dir / "summary.txt").write_text("\n".join(text) + "\n")
-    return {"output_dir": str(out_dir), "overall": total["summary"], "walk_forward": walk_forward}
+    return {
+        "output_dir": str(out_dir),
+        "overall": total["summary"],
+        "walk_forward": walk_forward,
+        "config_hash_sha256": config_hash,
+    }
 
 
 def main() -> None:

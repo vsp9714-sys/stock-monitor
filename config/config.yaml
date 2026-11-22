@@ -82,6 +82,25 @@ confluence:
 
 # ─── Execution Guardrails & Intraday Filtering ──────────────────────────────
 guardrails:
+  # Macro-Trend Gate (Close > EMA 50 > EMA 200 for BUY; inverse for SELL)
+  trend_gate:
+    enabled: true
+    fast_ema: 50
+    slow_ema: 200
+    require_price_above_fast: true
+    require_fast_above_slow: true
+    fail_closed_on_short_history: false
+    apply_to_provisional: true
+    apply_to_daily: true
+
+  # RSI Exhaustion Ceiling (caps extended breakout buys / oversold sells)
+  rsi_exhaustion:
+    enabled: true
+    max_rsi_buy: 68.0
+    min_rsi_sell: 32.0
+    apply_to_provisional: true
+    apply_to_daily: true
+
   # Close Location Value (CLV) wick rejection filter: rejects false breakouts with large wicks
   # CLV = (Close - Low) / (High - Low)
   wick_filter:
@@ -109,19 +128,40 @@ guardrails:
     period: 14
     min_adx: 20.0                # Minimum ADX to allow alert (ADX < 20 indicates choppy market)
     strong_trend_threshold: 25.0 # ADX >= 25 marks strong trend confirmation in alerts
+    require_di_alignment: true
+    allow_rising_adx_on_bb_squeeze: true
+    squeeze_min_adx: 15.0
     apply_to_provisional: true
     apply_to_daily: true
+
+  relative_strength:
+    enabled: false            # Enable in Phase 3 (v2_enhanced)
+    lookback_short: 20
+    lookback_long: 50
+    min_rs_rating_buy: 60
+    require_positive_excess_buy: true
+    max_rs_rating_sell: 40
+
+  event_blackout:
+    enabled: false            # Enable in Phase 3
+    mode: "warn"              # "warn" | "filter"
+    blackout_trading_days: 3
+    fail_open: true
 
 # ─── Paper Trading & Alert Validation ─────────────────────────────────────────
 paper_trading:
   enabled: true
+  strategy_version: "v1_baseline"
+  allowed_directions: ["BUY"] # Long-only CNC delivery validation
   max_hold_days: 10              # Maximum holding duration in trading days
+  cooldown_days: 3               # Minimum days before re-entering same symbol & direction
+  round_trip_cost_pct: 0.30      # Statutory NSE CNC charges + slippage deduction
+  trailing_stop_mode: "none"     # "none" | "breakeven_1r" | "supertrend"
   milestones: [2.5, -2.5, 5.0, -5.0]  # P&L milestone alert thresholds (%)
-  send_milestone_alerts: true    # Broadcast milestone alerts via Telegram
+  send_milestone_alerts: false   # Broadcast milestone alerts via Telegram
   send_exit_alerts: true         # Broadcast exit (stop/target/time) alerts via Telegram
   weekly_report_day: "saturday"  # Day of week for weekly performance report
   weekly_report_time: "09:00"    # Time of day (Asia/Kolkata)
-  cooldown_days: 3               # Minimum days before re-entering same symbol & direction
 
 # ─── Stock Universe ──────────────────────────────────────────────────────────
 universe:
@@ -186,7 +226,9 @@ risk:
   stop_atr_multiple: 1.5
   target_r_multiple: 2.0
   account_capital_inr: null  # leave unset to omit quantity sizing
-  risk_percent: 0.5
+  risk_percent: 1.0           # ₹5,000 max risk on ₹5,00,000
+  max_tranche_inr: 100000     # Hard ₹1,00,000 capital cap per trade
+  max_risk_distance_pct: 6.0
 
 # ─── Offline backtest assumptions ────────────────────────────────────────────
 backtest:
@@ -196,6 +238,8 @@ backtest:
   fee_bps_per_side: 5.0
   slippage_bps_per_side: 5.0
   train_fraction: 0.7
+  max_hold_days: null         # Optional: set to 10 to mirror paper_trading
+  allowed_directions: ["BUY", "SELL"]
 
 # ─── Fundamental Data ─────────────────────────────────────────────────────────
 fundamentals:
