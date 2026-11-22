@@ -187,3 +187,65 @@ def test_simulate_period_max_hold_days_and_allowed_directions():
         }},
     )
     assert len(res_skip["trades"]) == 0
+
+
+def test_run_backtest_sets_guardrails_cfg_and_changes_config_hash(monkeypatch, tmp_path):
+    """Verify run_backtest() sets evaluator.guardrails_cfg and changes config_hash_sha256 when guardrails change."""
+    from datetime import datetime, timedelta, date
+    from src.backtest.cli import run_backtest
+    import src.backtest.cli as cli_mod
+    from src.db import Base, create_sqlite_engine, Stock, OHLCVCache
+    from sqlalchemy.orm import sessionmaker
+
+    engine = create_sqlite_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    stock = Stock(symbol="SBIN", company_name="State Bank", is_active=True)
+    session.add(stock)
+    for i in range(40):
+        c = OHLCVCache(
+            symbol="SBIN", interval="1d",
+            ts=datetime(2026, 1, 1) + timedelta(days=i),
+            open=500.0, high=510.0, low=495.0, close=505.0, volume=10000,
+        )
+        session.add(c)
+    session.commit()
+
+    evaluator_instances = []
+    orig_scan = cli_mod.Scanner._scan_stock
+
+    def fake_scan(self, stock, frame, provisional=False):
+        evaluator_instances.append(self)
+        return orig_scan(self, stock, frame, provisional=provisional)
+
+    monkeypatch.setattr(cli_mod.Scanner, "_scan_stock", fake_scan)
+    monkeypatch.setattr(cli_mod, "get_session", lambda: Session())
+
+    cfg1 = {
+        "signals": {}, "confluence": {},
+        "guardrails": {"adx_filter": {"enabled": True, "min_adx": 20.0}},
+        "backtest": {"train_fraction": 0.7},
+        "risk": {},
+    }
+    monkeypatch.setattr(cli_mod, "get_config", lambda: cfg1)
+
+    rep1 = run_backtest(date(2026, 1, 30), date(2026, 2, 8), ["SBIN"], tmp_path / "bt1")
+    assert evaluator_instances[-1].guardrails_cfg == cfg1["guardrails"]
+    hash1 = rep1["config_hash_sha256"]
+
+    # Now change guardrails.adx_filter.min_adx
+    cfg2 = {
+        "signals": {}, "confluence": {},
+        "guardrails": {"adx_filter": {"enabled": True, "min_adx": 25.0}},
+        "backtest": {"train_fraction": 0.7},
+        "risk": {},
+    }
+    monkeypatch.setattr(cli_mod, "get_config", lambda: cfg2)
+
+    rep2 = run_backtest(date(2026, 1, 30), date(2026, 2, 8), ["SBIN"], tmp_path / "bt2")
+    assert evaluator_instances[-1].guardrails_cfg == cfg2["guardrails"]
+    hash2 = rep2["config_hash_sha256"]
+
+    assert hash1 != hash2

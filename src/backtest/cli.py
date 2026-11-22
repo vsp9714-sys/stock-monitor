@@ -187,7 +187,12 @@ def run_backtest(start_date: date, end_date: date, symbols: list[str] | None, ou
             f"Benchmark: {report['benchmark']}", f"Walk-forward: {walk_forward['status']}", "Limitations:"]
     text.extend(f"- {item}" for item in limits)
     (out_dir / "summary.txt").write_text("\n".join(text) + "\n")
-    return {"output_dir": str(out_dir), "overall": total["summary"], "walk_forward": walk_forward}
+    return {
+        "output_dir": str(out_dir),
+        "overall": total["summary"],
+        "walk_forward": walk_forward,
+        "config_hash_sha256": config_hash,
+    }
 
 
 def main() -> None:

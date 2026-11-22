@@ -887,7 +887,7 @@ class Scanner:
             rsi_val = None
 
             # ── 1. RSI Check ────────────────────────────────────────────
-            if self.signal_cfg.get("rsi", {}).get("enabled", True):
+            if "rsi" in self.signal_cfg and self.signal_cfg["rsi"].get("enabled", True):
                 rsi_cfg = self.signal_cfg["rsi"]
                 oversold = rsi_cfg.get("oversold_threshold", 30)
                 overbought = rsi_cfg.get("overbought_threshold", 70)
@@ -917,7 +917,7 @@ class Scanner:
                 })
 
             # ── 2. MACD Check ───────────────────────────────────────────
-            if self.signal_cfg.get("macd", {}).get("enabled", True):
+            if "macd" in self.signal_cfg and self.signal_cfg["macd"].get("enabled", True):
                 macd_cfg = self.signal_cfg["macd"]
                 macd_result = detect_macd_signal(
                     stock.symbol, df,
@@ -965,7 +965,7 @@ class Scanner:
                     })
 
             # ── 3. EMA Crossover Checks ─────────────────────────────────
-            if self.signal_cfg.get("ema_crossover", {}).get("enabled", True):
+            if "ema_crossover" in self.signal_cfg and self.signal_cfg["ema_crossover"].get("enabled", True):
                 ema_cfg = self.signal_cfg["ema_crossover"]
                 pairs = [tuple(p) for p in ema_cfg.get("pairs", [[9, 21], [21, 50]])]
                 for fast_p, slow_p in pairs:
@@ -1015,7 +1015,7 @@ class Scanner:
                         })
 
             # ── 4. Volume Breakout Check ────────────────────────────────
-            if self.signal_cfg.get("volume_breakout", {}).get("enabled", True):
+            if "volume_breakout" in self.signal_cfg and self.signal_cfg["volume_breakout"].get("enabled", True):
                 vol_cfg = self.signal_cfg["volume_breakout"]
                 vol_pace_cfg = getattr(self, "guardrails_cfg", {}).get("volume_pace", {})
                 use_pace = vol_pace_cfg.get("enabled", True)
@@ -1178,12 +1178,14 @@ class Scanner:
                     max_rsi_buy = float(rsi_ex_cfg.get("max_rsi_buy", 68.0))
                     min_rsi_sell = float(rsi_ex_cfg.get("min_rsi_sell", 32.0))
                     val_to_check = None
-                    if rsi_val is not None:
+                    if rsi_val is not None and pd.notna(rsi_val):
                         val_to_check = float(rsi_val)
-                    elif len(df) >= 15:
-                        rsi_series = compute_rsi(df["close"].astype(float), 14)
-                        if not rsi_series.empty and pd.notna(rsi_series.iloc[-1]):
-                            val_to_check = float(rsi_series.iloc[-1])
+                    else:
+                        rsi_p = int(self.signal_cfg.get("rsi", {}).get("period", 14))
+                        if len(df) >= rsi_p + 1:
+                            rsi_series = compute_rsi(df["close"].astype(float), rsi_p)
+                            if not rsi_series.empty and pd.notna(rsi_series.iloc[-1]):
+                                val_to_check = float(rsi_series.iloc[-1])
 
                     if val_to_check is not None:
                         passed_rsi_ex = True
@@ -1716,6 +1718,8 @@ class Scanner:
                                 "alert_tier": res.get("alert_tier", "confirmed_daily"),
                                 "clv": res.get("clv"),
                                 "adx": res.get("adx"),
+                                "trend_gate": res.get("trend_gate"),
+                                "rsi_exhaustion": res.get("rsi_exhaustion"),
                                 "bar_status": "provisional" if provisional else "confirmed_daily_cache",
                                 "session_date": today.isoformat(),
                                 "quote_timestamp": res.get("quote_timestamp"),

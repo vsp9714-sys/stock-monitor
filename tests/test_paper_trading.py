@@ -646,3 +646,160 @@ class TestPhase1AndPhase2PaperTradingEnhancements:
         assert db_rep.expectancy_r == rep["expectancy_r"]
         assert db_rep.buy_trades == 1
         assert db_rep.sell_trades == 1
+
+    def test_entry_day_phantom_fill_guard(self, db_session, sample_config):
+        """On cur_date == entry_date, quote['low'] <= stop_loss with last_price > stop_loss must NOT close the trade."""
+        trade = record_paper_trade_entry(
+            session=db_session,
+            signal_id=1,
+            symbol="TCS",
+            direction="BUY",
+            entry_price=3500.0,
+            risk_ref={"status": "available", "stop_reference": 3400.0, "target_reference": 3700.0, "risk_distance": 100.0},
+            confluence_result={"confluence_score": 2},
+            alert_tier="confirmed_daily",
+            session_date=date(2026, 11, 20),
+            config=sample_config,
+        )
+        assert trade is not None
+        # On same date, an earlier dip had low=3350, but current last_price is 3520 (above stop)
+        quotes = {"TCS": {"open": 3480.0, "high": 3550.0, "low": 3350.0, "last_price": 3520.0}}
+        monitor_open_paper_trades(
+            session=db_session,
+            quotes_by_symbol=quotes,
+            notifiers=[],
+            config=sample_config,
+            session_date=date(2026, 11, 20),
+        )
+        db_session.refresh(trade)
+        assert trade.status == "open"
+        assert trade.exit_reason is None
+
+    def test_cooldown_checks_exit_date_not_entry_date(self, db_session, sample_config):
+        """Trade entered 15 days ago, exited 1 trading day ago -> suppressed by 3-day cooldown."""
+        sample_config["paper_trading"]["cooldown_days"] = 3
+        # Trade entered 15 days ago, exited on 2026-11-19
+        old_trade = PaperTrade(
+            symbol="RELIANCE",
+            direction="BUY",
+            entry_price=2400.0,
+            entry_date=date(2026, 11, 5),
+            entry_datetime=datetime.now(timezone.utc),
+            stop_loss=2300.0,
+            target_price=2600.0,
+            alert_tier="confirmed_daily",
+            status="closed",
+            exit_date=date(2026, 11, 19),
+            exit_price=2600.0,
+            exit_reason="target_hit",
+            pnl_percent=8.33,
+        )
+        db_session.add(old_trade)
+        db_session.commit()
+
+        # New signal on 2026-11-20 (only 1 trading session after exit_date)
+        new_trade = record_paper_trade_entry(
+            session=db_session,
+            signal_id=2,
+            symbol="RELIANCE",
+            direction="BUY",
+            entry_price=2620.0,
+            risk_ref={"status": "available", "stop_reference": 2550.0, "target_reference": 2750.0},
+            confluence_result={"confluence_score": 2},
+            alert_tier="confirmed_daily",
+            session_date=date(2026, 11, 20),
+            config=sample_config,
+        )
+        assert new_trade is None  # Suppressed because exit_date was only 1 session ago
+
+    def test_open_paper_trade_unioned_into_quote_fetch_and_monitored(self, monkeypatch):
+        """Open PaperTrade symbol excluded from universe is unioned into quote fetch and monitored in run_scan."""
+        import pandas as pd
+        from src.scanner import Scanner
+        from src.db import Base, create_sqlite_engine, Stock, PaperTrade
+        from sqlalchemy.orm import sessionmaker
+
+        engine = create_sqlite_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        db = Session()
+
+        stock_in = Stock(symbol="IN_UNIV", company_name="In Universe", instrument_key="NSE_EQ|IN", is_active=True)
+        stock_out = Stock(symbol="OUT_UNIV", company_name="Out Universe", instrument_key="NSE_EQ|OUT", is_active=True)
+        db.add_all([stock_in, stock_out])
+
+        # Create open paper trade for OUT_UNIV
+        pt_out = PaperTrade(
+            symbol="OUT_UNIV",
+            direction="BUY",
+            entry_price=100.0,
+            entry_date=date(2026, 11, 19),
+            entry_datetime=datetime.now(timezone.utc),
+            stop_loss=90.0,
+            target_price=120.0,
+            status="open",
+            alert_tier="confirmed_daily",
+        )
+        db.add(pt_out)
+        db.commit()
+
+        from zoneinfo import ZoneInfo
+        now_dt = datetime(2026, 11, 20, 15, 30, tzinfo=ZoneInfo("Asia/Kolkata"))
+        now_ts = int(now_dt.timestamp() * 1000)
+
+        # Mock fetcher
+        fetched_keys = []
+        class FakeFetcher:
+            def get_full_market_quotes(self, keys, **kwargs):
+                fetched_keys.extend(keys)
+                return {
+                    "NSE_EQ|IN": {
+                        "last_price": 500.0, "open": 490.0, "high": 510.0, "low": 485.0,
+                        "close": 500.0, "prev_close_price": 495.0, "volume": 100000,
+                        "last_trade_time": str(now_ts), "ts": str(now_ts),
+                    },
+                    "NSE_EQ|OUT": {
+                        "last_price": 125.0, "open": 115.0, "high": 126.0, "low": 114.0,
+                        "close": 125.0, "prev_close_price": 110.0, "volume": 50000,
+                        "last_trade_time": str(now_ts), "ts": str(now_ts),
+                    },
+                }
+
+        scanner = object.__new__(Scanner)
+        scanner.cfg = {
+            "upstox": {"quote_batch_size": 100, "max_quote_age_seconds": 999999},
+            "scan": {"min_coverage": 0.0},
+            "universe": {"tradability": {"enabled": False}},
+            "signals": {}, "guardrails": {}, "confluence": {},
+            "paper_trading": {"enabled": True},
+        }
+        scanner.paper_trading_cfg = scanner.cfg["paper_trading"]
+        scanner.universe_cfg = scanner.cfg["universe"]
+        scanner.scan_cfg = scanner.cfg["scan"]
+        scanner.signal_cfg = scanner.cfg["signals"]
+        scanner.guardrails_cfg = scanner.cfg["guardrails"]
+        scanner.confluence_cfg = scanner.cfg["confluence"]
+        scanner.fetcher = FakeFetcher()
+        scanner.notifiers = []
+        scanner.get_active_stocks = lambda limit=None: [stock_in]  # Only stock_in is in universe!
+        scanner.required_daily_candles = lambda: 30
+        scanner._load_cached_daily_frames = lambda stocks, db: {
+            "IN_UNIV": pd.DataFrame([{
+                "ts": pd.Timestamp("2026-10-01") + pd.Timedelta(days=i),
+                "open": 500, "high": 510, "low": 490, "close": 500, "volume": 10000,
+            } for i in range(35)])
+        }
+        # Provide a fresh session factory for Scanner.run_scan
+        monkeypatch.setattr("src.scanner.get_session", lambda: Session())
+        monkeypatch.setattr("src.scanner.is_market_open", lambda *args, **kwargs: True)
+
+        summary = scanner.run_scan(now=now_dt)
+
+        # 1. Assert NSE_EQ|OUT was fetched
+        assert "NSE_EQ|OUT" in fetched_keys
+        # 2. Assert OUT_UNIV was monitored and closed (target_price was 120, quote high was 126, last 125)
+        with Session() as check_sess:
+            pt_refreshed = check_sess.query(PaperTrade).filter_by(symbol="OUT_UNIV").first()
+            assert pt_refreshed is not None
+            assert pt_refreshed.status == "closed"
+            assert pt_refreshed.exit_reason == "target_hit"

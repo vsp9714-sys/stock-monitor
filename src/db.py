@@ -313,7 +313,7 @@ class PaperTradeWeeklyReport(Base):
 def ensure_schema_migrations(engine):
     """Ensure new columns and updated unique constraints exist on existing SQLite databases."""
     from sqlalchemy import text
-    with engine.connect() as conn:
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         pt_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(paper_trades)")).fetchall()}
         if pt_cols:
             if "gross_pnl_percent" not in pt_cols:
@@ -342,22 +342,78 @@ def ensure_schema_migrations(engine):
             if "sell_win_rate" not in wr_cols:
                 conn.execute(text("ALTER TABLE paper_trade_weekly_reports ADD COLUMN sell_win_rate REAL"))
 
-        # Check unique constraint on paper_trades: upgrade if uq_paper_trade_symbol_dir_date exists without alert_tier
+        # Check unique constraint on paper_trades: upgrade if legacy constraint exists without alert_tier
         res = conn.execute(text("SELECT sql FROM sqlite_master WHERE type='table' AND name='paper_trades'")).fetchone()
         if res and res[0]:
             table_sql = res[0]
             if "uq_paper_trade_symbol_dir_date" in table_sql and "uq_paper_trade_symbol_dir_date_tier" not in table_sql:
                 logger.info("Migrating paper_trades unique constraint to include alert_tier...")
-                current_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(paper_trades)")).fetchall()]
-                col_list = ", ".join(current_cols)
+                # 1. Disable FKs outside a transaction in autocommit mode so SQLite does not rewrite child FKs
                 conn.execute(text("PRAGMA foreign_keys=OFF"))
-                conn.execute(text("ALTER TABLE paper_trades RENAME TO paper_trades_old"))
-                Base.metadata.tables["paper_trades"].create(conn)
-                conn.execute(text(f"INSERT INTO paper_trades ({col_list}) SELECT {col_list} FROM paper_trades_old"))
-                conn.execute(text("DROP TABLE paper_trades_old"))
-                conn.execute(text("PRAGMA foreign_keys=ON"))
+                conn.execute(text("BEGIN TRANSACTION"))
+                try:
+                    conn.execute(text("""
+                        CREATE TABLE paper_trades_new (
+                            id INTEGER PRIMARY KEY,
+                            signal_id INTEGER,
+                            symbol VARCHAR(30) NOT NULL,
+                            direction VARCHAR(10) NOT NULL,
+                            entry_price FLOAT NOT NULL,
+                            entry_date DATE NOT NULL,
+                            entry_datetime DATETIME NOT NULL,
+                            stop_loss FLOAT NOT NULL,
+                            target_price FLOAT NOT NULL,
+                            atr_at_entry FLOAT,
+                            risk_distance FLOAT,
+                            confluence_score INTEGER,
+                            alert_tier VARCHAR(30),
+                            signal_groups_json TEXT,
+                            max_favorable_excursion FLOAT,
+                            max_adverse_excursion FLOAT,
+                            exit_price FLOAT,
+                            exit_date DATE,
+                            exit_datetime DATETIME,
+                            exit_reason VARCHAR(30),
+                            pnl_absolute FLOAT,
+                            pnl_percent FLOAT,
+                            gross_pnl_percent FLOAT,
+                            cost_percent FLOAT,
+                            r_multiple FLOAT,
+                            net_r_multiple FLOAT,
+                            fits_tranche_rules BOOLEAN,
+                            strategy_version VARCHAR(30),
+                            status VARCHAR(10) NOT NULL DEFAULT 'open',
+                            created_at DATETIME,
+                            updated_at DATETIME,
+                            FOREIGN KEY(signal_id) REFERENCES signals (id) ON DELETE SET NULL,
+                            CONSTRAINT uq_paper_trade_symbol_dir_date_tier UNIQUE (symbol, direction, entry_date, alert_tier)
+                        )
+                    """))
+                    existing_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(paper_trades)")).fetchall()]
+                    target_cols = [
+                        "id", "signal_id", "symbol", "direction", "entry_price", "entry_date", "entry_datetime",
+                        "stop_loss", "target_price", "atr_at_entry", "risk_distance", "confluence_score", "alert_tier",
+                        "signal_groups_json", "max_favorable_excursion", "max_adverse_excursion", "exit_price",
+                        "exit_date", "exit_datetime", "exit_reason", "pnl_absolute", "pnl_percent",
+                        "gross_pnl_percent", "cost_percent", "r_multiple", "net_r_multiple", "fits_tranche_rules",
+                        "strategy_version", "status", "created_at", "updated_at",
+                    ]
+                    common_cols = [c for c in existing_cols if c in target_cols]
+                    col_str = ", ".join(common_cols)
+                    conn.execute(text(f"INSERT INTO paper_trades_new ({col_str}) SELECT {col_str} FROM paper_trades"))
+                    conn.execute(text("DROP TABLE paper_trades"))
+                    conn.execute(text("ALTER TABLE paper_trades_new RENAME TO paper_trades"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_paper_trades_symbol ON paper_trades (symbol)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_paper_trades_signal_id ON paper_trades (signal_id)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_paper_trades_entry_date ON paper_trades (entry_date)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_paper_trades_status ON paper_trades (status)"))
+                    conn.execute(text("COMMIT"))
+                except Exception:
+                    conn.execute(text("ROLLBACK"))
+                    raise
+                finally:
+                    conn.execute(text("PRAGMA foreign_keys=ON"))
                 logger.info("Migrated paper_trades successfully.")
-        conn.commit()
 
 
 # ─── Engine & Session ─────────────────────────────────────────────────────────

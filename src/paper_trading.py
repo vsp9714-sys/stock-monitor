@@ -100,7 +100,7 @@ def record_paper_trade_entry(
                 PaperTrade.direction == direction,
                 PaperTrade.alert_tier == alert_tier,
                 PaperTrade.status == "closed",
-            ).order_by(PaperTrade.id.desc()).first()
+            ).order_by(PaperTrade.exit_date.desc(), PaperTrade.id.desc()).first()
             if latest_closed:
                 exit_ref = latest_closed.exit_date or latest_closed.entry_date
                 days_since_exit = trading_days_between(exit_ref, entry_session_date, config.get("market"))
@@ -217,7 +217,7 @@ def monitor_open_paper_trades(
 
         exit_reason = None
         exit_price = current_price
-        is_entry_day = (cur_date == trade.entry_date)
+        is_entry_day = (cur_date <= trade.entry_date)
 
         # Excursion tracking & stop/target evaluation
         if trade.direction == "BUY":
@@ -298,12 +298,6 @@ def monitor_open_paper_trades(
                 elif not has_low and current_price <= trade.target_price:
                     exit_reason = "target_hit"
                     exit_price = current_price
-                if day_high >= trade.stop_loss:
-                    exit_reason = "stop_hit"
-                    exit_price = max(day_open, trade.stop_loss)
-                elif day_low <= trade.target_price:
-                    exit_reason = "target_hit"
-                    exit_price = trade.target_price
 
         days_held = trading_days_between(trade.entry_date, cur_date, config.get("market"))
         if not exit_reason and days_held >= max_hold_days:
@@ -338,7 +332,7 @@ def monitor_open_paper_trades(
                 trade.gross_pnl_percent, trade.pnl_percent, trade.net_r_multiple or 0.0,
             )
             if send_exits:
-                _send_exit_notification(trade, notifiers)
+                _send_exit_notification(trade, notifiers, config=config)
         else:
             trade.updated_at = datetime.now(timezone.utc)
             session.commit()
@@ -413,14 +407,14 @@ def _check_and_fire_milestones(
             session.commit()
 
 
-def _send_exit_notification(trade: PaperTrade, notifiers: list[BaseNotifier]) -> None:
+def _send_exit_notification(trade: PaperTrade, notifiers: list[BaseNotifier], config: Optional[dict] = None) -> None:
     """Send trade closure alert."""
     emoji = "🎯" if trade.exit_reason == "target_hit" else ("🛑" if trade.exit_reason == "stop_hit" else "⏳")
     reason_name = trade.exit_reason.replace("_", " ").title() if trade.exit_reason else "Closed"
     pnl_sign = "+" if (trade.pnl_percent or 0) > 0 else ""
     r_val = trade.net_r_multiple if trade.net_r_multiple is not None else trade.r_multiple
     r_text = f" ({r_val:+.1f}R)" if r_val is not None else ""
-    days_held = trading_days_between(trade.entry_date, trade.exit_date) if trade.exit_date else 0
+    days_held = trading_days_between(trade.entry_date, trade.exit_date, (config or {}).get("market")) if trade.exit_date else 0
     cost_info = f" [Gross: {trade.gross_pnl_percent:+.2f}%, Costs: -{trade.cost_percent:.2f}%]" if trade.gross_pnl_percent is not None else ""
     msg = (
         f"{emoji} <b>Paper Trade Closed: {reason_name}</b>\n"
@@ -524,6 +518,25 @@ def generate_weekly_report(
     score_3_closed = [t for t in closed_this_week if t.confluence_score == 3]
     score_3_win_rate = (sum(1 for t in score_3_closed if (t.pnl_percent or 0) > 0) / len(score_3_closed) * 100.0) if score_3_closed else None
 
+    # MFE / MAE calculations across closed trades
+    mfes = []
+    maes = []
+    for t in closed_this_week:
+        if t.entry_price and t.entry_price > 0:
+            if t.direction == "BUY":
+                if t.max_favorable_excursion is not None:
+                    mfes.append(((t.max_favorable_excursion - t.entry_price) / t.entry_price) * 100.0)
+                if t.max_adverse_excursion is not None:
+                    maes.append(((t.max_adverse_excursion - t.entry_price) / t.entry_price) * 100.0)
+            else:  # SELL
+                if t.max_favorable_excursion is not None:
+                    mfes.append(((t.entry_price - t.max_favorable_excursion) / t.entry_price) * 100.0)
+                if t.max_adverse_excursion is not None:
+                    maes.append(((t.entry_price - t.max_adverse_excursion) / t.entry_price) * 100.0)
+
+    avg_mfe_pct = round(sum(mfes) / len(mfes), 2) if mfes else None
+    avg_mae_pct = round(sum(maes) / len(maes), 2) if maes else None
+
     report_data = {
         "week": f"{week_start.isoformat()} to {week_end.isoformat()}",
         "week_start": week_start.isoformat(),
@@ -539,6 +552,8 @@ def generate_weekly_report(
         "avg_r_multiple": round(avg_r, 2) if closed_this_week else None,
         "profit_factor": profit_factor,
         "expectancy_r": expectancy_r,
+        "avg_mfe_pct": avg_mfe_pct,
+        "avg_mae_pct": avg_mae_pct,
         "direction_stats": {
             "buy_trades": len(buy_closed),
             "buy_win_rate": round(buy_win_rate, 1) if buy_win_rate is not None else None,
@@ -588,6 +603,10 @@ def generate_weekly_report(
             lines.append(f"• Profit Factor: <b>{profit_factor:.2f}</b>")
         if expectancy_r is not None:
             lines.append(f"• Expectancy (R): <b>{expectancy_r:+.2f}R</b>")
+        if avg_mfe_pct is not None and avg_mae_pct is not None:
+            lines.append(f"• Avg MFE / MAE: <b>{avg_mfe_pct:+.2f}% / {avg_mae_pct:+.2f}%</b>")
+        elif avg_mfe_pct is not None:
+            lines.append(f"• Avg MFE: <b>{avg_mfe_pct:+.2f}%</b>")
         if best_trade:
             b_r = best_trade.net_r_multiple if best_trade.net_r_multiple is not None else best_trade.r_multiple
             lines.append(f"🏆 Best: <b>{best_trade.symbol}</b> ({best_trade.pnl_percent:+.2f}%, {b_r or 0:+.1f}R)")
@@ -700,10 +719,6 @@ def generate_weekly_report(
         existing_rep.score_3_win_rate = round(score_3_win_rate, 1) if score_3_win_rate is not None else None
         existing_rep.report_json = json.dumps(report_data)
         existing_rep.generated_at = datetime.now(timezone.utc)
-
-    session.commit()
-    report_data["formatted_message"] = report_text
-    return report_data
 
     session.commit()
     report_data["formatted_message"] = report_text
