@@ -45,6 +45,13 @@ def trading_days_between(
     return count
 
 
+def alert_type_for_tier(alert_tier: Optional[str]) -> str:
+    """Map alert_tier to canonical alert_type: 'intraday' or 'day_end'."""
+    if not alert_tier:
+        return "day_end"
+    return "intraday" if "intraday" in str(alert_tier).lower() else "day_end"
+
+
 def record_paper_trade_entry(
     session: Session,
     signal_id: Optional[int],
@@ -56,12 +63,14 @@ def record_paper_trade_entry(
     alert_tier: str,
     session_date: date,
     config: dict[str, Any],
+    alert_type: Optional[str] = None,
+    rs_rating: Optional[int] = None,
 ) -> Optional[PaperTrade]:
     """
     Auto-create a paper trade entry when a confluence alert fires.
     Applies deduplication rules:
-    - Unique constraint: (symbol, direction, entry_date, alert_tier)
-    - Open trade guard: cannot enter if an open trade for symbol & direction & tier exists
+    - Unique constraint: (symbol, direction, entry_date, alert_type)
+    - Open trade guard: cannot enter if an open trade for symbol & direction & alert_type exists
     - Cooldown window: cannot re-enter within cooldown_days since last exit_date
     """
     pt_cfg = config.get("paper_trading", {})
@@ -75,21 +84,22 @@ def record_paper_trade_entry(
 
     try:
         entry_session_date = session_date or datetime.now(IST).date()
+        trade_alert_type = alert_type or alert_type_for_tier(alert_tier)
 
-        # Dedup Rule 1: No duplicate trade on same session date for symbol, direction, and tier
+        # Dedup Rule 1: No duplicate trade on same session date for symbol, direction, and alert_type
         existing_today = session.query(PaperTrade).filter_by(
-            symbol=symbol, direction=direction, alert_tier=alert_tier, entry_date=entry_session_date
+            symbol=symbol, direction=direction, alert_type=trade_alert_type, entry_date=entry_session_date
         ).first()
         if existing_today:
-            logger.debug("Paper trade already exists today for %s %s (%s)", symbol, direction, alert_tier)
+            logger.debug("Paper trade already exists today for %s %s (%s)", symbol, direction, trade_alert_type)
             return existing_today
 
-        # Dedup Rule 2: No new trade if active open trade exists in same direction and tier
+        # Dedup Rule 2: No new trade if active open trade exists in same direction and alert_type
         open_trade = session.query(PaperTrade).filter_by(
-            symbol=symbol, direction=direction, alert_tier=alert_tier, status="open"
+            symbol=symbol, direction=direction, alert_type=trade_alert_type, status="open"
         ).first()
         if open_trade:
-            logger.debug("Active open paper trade already exists for %s %s (%s); skipping duplicate", symbol, direction, alert_tier)
+            logger.debug("Active open paper trade already exists for %s %s (%s); skipping duplicate", symbol, direction, trade_alert_type)
             return None
 
         # Dedup Rule 3: Cooldown period (minimum trading days since exit_date of latest closed trade)
@@ -98,7 +108,7 @@ def record_paper_trade_entry(
             latest_closed = session.query(PaperTrade).filter(
                 PaperTrade.symbol == symbol,
                 PaperTrade.direction == direction,
-                PaperTrade.alert_tier == alert_tier,
+                PaperTrade.alert_type == trade_alert_type,
                 PaperTrade.status == "closed",
             ).order_by(PaperTrade.exit_date.desc(), PaperTrade.id.desc()).first()
             if latest_closed:
@@ -107,7 +117,7 @@ def record_paper_trade_entry(
                 if days_since_exit < cooldown_days:
                     logger.debug(
                         "Paper trade for %s %s (%s) suppressed by %d-session cooldown (last exited/entered %s)",
-                        symbol, direction, alert_tier, cooldown_days, exit_ref,
+                        symbol, direction, trade_alert_type, cooldown_days, exit_ref,
                     )
                     return None
 
@@ -118,10 +128,11 @@ def record_paper_trade_entry(
             atr = float(risk_ref.get("atr") or 0.0)
             risk_dist = float(risk_ref.get("risk_distance") or 0.0)
         else:
-            # Fallback risk reference: 2% stop, 4% target (2.0R)
+            # Fallback risk reference: 2% stop, target_r multiple
+            target_r = float(config.get("risk", {}).get("target_r_multiple", 1.5))
             risk_dist = entry_price * 0.02
             stop_loss = entry_price - risk_dist if direction == "BUY" else entry_price + risk_dist
-            target_price = entry_price + (risk_dist * 2.0) if direction == "BUY" else entry_price - (risk_dist * 2.0)
+            target_price = entry_price + (risk_dist * target_r) if direction == "BUY" else entry_price - (risk_dist * target_r)
             atr = None
 
         confluence_score = int(
@@ -149,6 +160,8 @@ def record_paper_trade_entry(
             risk_distance=round(risk_dist, 2) if risk_dist is not None else None,
             confluence_score=confluence_score,
             alert_tier=alert_tier,
+            alert_type=trade_alert_type,
+            rs_rating_at_entry=rs_rating,
             signal_groups_json=json.dumps(group_votes),
             max_favorable_excursion=round(float(entry_price), 2),
             max_adverse_excursion=round(float(entry_price), 2),
@@ -219,6 +232,12 @@ def monitor_open_paper_trades(
         exit_price = current_price
         is_entry_day = (cur_date <= trade.entry_date)
 
+        trailing_mode = pt_cfg.get("trailing_stop_mode", "none")
+        is_ratcheted = (trade.direction == "BUY" and trade.stop_loss >= trade.entry_price) or (
+            trade.direction == "SELL" and trade.stop_loss <= trade.entry_price
+        )
+        stop_reason = "trailing_stop" if is_ratcheted else "stop_hit"
+
         # Excursion tracking & stop/target evaluation
         if trade.direction == "BUY":
             pnl_pct = ((current_price - trade.entry_price) / trade.entry_price) * 100.0
@@ -232,7 +251,7 @@ def monitor_open_paper_trades(
                     current_price,
                 )
                 if current_price <= trade.stop_loss:
-                    exit_reason = "stop_hit"
+                    exit_reason = stop_reason
                     exit_price = current_price
                 elif current_price >= trade.target_price:
                     exit_reason = "target_hit"
@@ -248,10 +267,10 @@ def monitor_open_paper_trades(
                 )
                 # Stop-first collision rule: check stop on low first, target on high next
                 if has_low and day_low <= trade.stop_loss:
-                    exit_reason = "stop_hit"
+                    exit_reason = stop_reason
                     exit_price = min(day_open, trade.stop_loss)
                 elif not has_low and current_price <= trade.stop_loss:
-                    exit_reason = "stop_hit"
+                    exit_reason = stop_reason
                     exit_price = current_price
                 elif has_high and day_high >= trade.target_price:
                     exit_reason = "target_hit"
@@ -271,7 +290,7 @@ def monitor_open_paper_trades(
                     current_price,
                 )
                 if current_price >= trade.stop_loss:
-                    exit_reason = "stop_hit"
+                    exit_reason = stop_reason
                     exit_price = current_price
                 elif current_price <= trade.target_price:
                     exit_reason = "target_hit"
@@ -287,10 +306,10 @@ def monitor_open_paper_trades(
                 )
                 # Stop-first collision rule: check stop on high first, target on low next
                 if has_high and day_high >= trade.stop_loss:
-                    exit_reason = "stop_hit"
+                    exit_reason = stop_reason
                     exit_price = max(day_open, trade.stop_loss)
                 elif not has_high and current_price >= trade.stop_loss:
-                    exit_reason = "stop_hit"
+                    exit_reason = stop_reason
                     exit_price = current_price
                 elif has_low and day_low <= trade.target_price:
                     exit_reason = "target_hit"
@@ -298,6 +317,16 @@ def monitor_open_paper_trades(
                 elif not has_low and current_price <= trade.target_price:
                     exit_reason = "target_hit"
                     exit_price = current_price
+
+        # Ratchet stop for next cycle if trailing stop active and trade open
+        if not exit_reason and trailing_mode == "breakeven_1r":
+            risk_dist = float(trade.risk_distance or (trade.entry_price * 0.02))
+            if trade.direction == "BUY":
+                if (trade.max_favorable_excursion or current_price) >= trade.entry_price + risk_dist:
+                    trade.stop_loss = max(trade.stop_loss, trade.entry_price)
+            else:
+                if (trade.max_favorable_excursion or current_price) <= trade.entry_price - risk_dist:
+                    trade.stop_loss = min(trade.stop_loss, trade.entry_price)
 
         days_held = trading_days_between(trade.entry_date, cur_date, config.get("market"))
         if not exit_reason and days_held >= max_hold_days:
@@ -381,9 +410,10 @@ def _check_and_fire_milestones(
 
         emoji = "🟢" if m > 0 else "🔴"
         sign = "+" if m > 0 else ""
+        type_tag = "[Intraday]" if getattr(trade, "alert_type", None) == "intraday" else "[Day-End]"
         tier_label = trade.alert_tier.replace("_", " ").title() if trade.alert_tier else "Alert"
         msg = (
-            f"{emoji} <b>Paper Trade Milestone Hit: {sign}{m:.1f}%</b>\n"
+            f"{emoji} <b>{type_tag} Paper Trade Milestone Hit: {sign}{m:.1f}%</b>\n"
             f"─────────────────────\n"
             f"📌 <b>{trade.symbol}</b> ({trade.direction}) · {tier_label}\n"
             f"💵 Entry: ₹{trade.entry_price:,.2f} → Current: ₹{current_price:,.2f}\n"
@@ -410,6 +440,7 @@ def _check_and_fire_milestones(
 def _send_exit_notification(trade: PaperTrade, notifiers: list[BaseNotifier], config: Optional[dict] = None) -> None:
     """Send trade closure alert."""
     emoji = "🎯" if trade.exit_reason == "target_hit" else ("🛑" if trade.exit_reason == "stop_hit" else "⏳")
+    type_tag = "[Intraday]" if getattr(trade, "alert_type", None) == "intraday" else "[Day-End]"
     reason_name = trade.exit_reason.replace("_", " ").title() if trade.exit_reason else "Closed"
     pnl_sign = "+" if (trade.pnl_percent or 0) > 0 else ""
     r_val = trade.net_r_multiple if trade.net_r_multiple is not None else trade.r_multiple
@@ -417,7 +448,7 @@ def _send_exit_notification(trade: PaperTrade, notifiers: list[BaseNotifier], co
     days_held = trading_days_between(trade.entry_date, trade.exit_date, (config or {}).get("market")) if trade.exit_date else 0
     cost_info = f" [Gross: {trade.gross_pnl_percent:+.2f}%, Costs: -{trade.cost_percent:.2f}%]" if trade.gross_pnl_percent is not None else ""
     msg = (
-        f"{emoji} <b>Paper Trade Closed: {reason_name}</b>\n"
+        f"{emoji} <b>{type_tag} Paper Trade Closed: {reason_name}</b>\n"
         f"─────────────────────\n"
         f"📌 <b>{trade.symbol}</b> ({trade.direction})\n"
         f"💵 Entry: ₹{trade.entry_price:,.2f} → Exit: ₹{trade.exit_price:,.2f}\n"
@@ -511,6 +542,19 @@ def generate_weekly_report(
     confirmed_closed = [t for t in closed_this_week if t.alert_tier in {"confirmed_daily", "power_hour_confirmed"}]
     confirmed_win_rate = (sum(1 for t in confirmed_closed if (t.pnl_percent or 0) > 0) / len(confirmed_closed) * 100.0) if confirmed_closed else None
 
+    # Alert Type breakdown
+    intraday_closed = [t for t in closed_this_week if getattr(t, "alert_type", None) == "intraday" or (t.alert_tier and "intraday" in t.alert_tier.lower())]
+    day_end_closed = [t for t in closed_this_week if t not in intraday_closed]
+
+    intraday_wr = (sum(1 for t in intraday_closed if (t.pnl_percent or 0) > 0) / len(intraday_closed) * 100.0) if intraday_closed else None
+    day_end_wr = (sum(1 for t in day_end_closed if (t.pnl_percent or 0) > 0) / len(day_end_closed) * 100.0) if day_end_closed else None
+
+    intraday_r_vals = [t.net_r_multiple if t.net_r_multiple is not None else t.r_multiple for t in intraday_closed if (t.net_r_multiple is not None or t.r_multiple is not None)]
+    day_end_r_vals = [t.net_r_multiple if t.net_r_multiple is not None else t.r_multiple for t in day_end_closed if (t.net_r_multiple is not None or t.r_multiple is not None)]
+
+    intraday_avg_r = (sum(intraday_r_vals) / len(intraday_r_vals)) if intraday_r_vals else None
+    day_end_avg_r = (sum(day_end_r_vals) / len(day_end_r_vals)) if day_end_r_vals else None
+
     # Score breakdown
     score_2_closed = [t for t in closed_this_week if t.confluence_score == 2]
     score_2_win_rate = (sum(1 for t in score_2_closed if (t.pnl_percent or 0) > 0) / len(score_2_closed) * 100.0) if score_2_closed else None
@@ -576,6 +620,14 @@ def generate_weekly_report(
             "confirmed_trades": len(confirmed_closed),
             "confirmed_win_rate": round(confirmed_win_rate, 1) if confirmed_win_rate is not None else None,
         },
+        "alert_type_stats": {
+            "intraday_trades": len(intraday_closed),
+            "intraday_win_rate": round(intraday_wr, 1) if intraday_wr is not None else None,
+            "intraday_avg_r": round(intraday_avg_r, 2) if intraday_avg_r is not None else None,
+            "day_end_trades": len(day_end_closed),
+            "day_end_win_rate": round(day_end_wr, 1) if day_end_wr is not None else None,
+            "day_end_avg_r": round(day_end_avg_r, 2) if day_end_avg_r is not None else None,
+        },
         "score_stats": {
             "score_2_trades": len(score_2_closed),
             "score_2_win_rate": round(score_2_win_rate, 1) if score_2_win_rate is not None else None,
@@ -619,6 +671,15 @@ def generate_weekly_report(
             lines.append(f"• Radar: {len(radar_closed)} trades ({radar_win_rate:.1f}% win rate)")
         if confirmed_closed:
             lines.append(f"• Confirmed Entry: {len(confirmed_closed)} trades ({confirmed_win_rate:.1f}% win rate)")
+        if intraday_closed or day_end_closed:
+            lines.append("")
+            lines.append("🏷️ <b>By Alert Type:</b>")
+            if intraday_closed:
+                r_str = f", Avg R: {intraday_avg_r:+.2f}R" if intraday_avg_r is not None else ""
+                lines.append(f"• Intraday: {len(intraday_closed)} trades ({intraday_wr:.1f}% win rate{r_str})")
+            if day_end_closed:
+                r_str = f", Avg R: {day_end_avg_r:+.2f}R" if day_end_avg_r is not None else ""
+                lines.append(f"• Day-End: {len(day_end_closed)} trades ({day_end_wr:.1f}% win rate{r_str})")
         if buy_closed or sell_closed:
             lines.append("")
             lines.append("⚖️ <b>By Direction:</b>")

@@ -51,6 +51,12 @@ def simulate_period(
     allowed_directions: set[str] | None = None
     if raw_allowed is not None:
         allowed_directions = {str(d).upper() for d in raw_allowed}
+
+    trailing_stop_mode = str(bt.get("trailing_stop_mode", "none")).lower()
+    trailing_trigger_r = float(bt.get("trailing_trigger_r", 1.0))
+    breakeven_buffer_r = float(bt.get("breakeven_buffer_r", 0.0))
+    trail_atr_multiple = float(bt.get("trail_atr_multiple", 2.0))
+
     trades: list[dict[str, Any]] = []
     total_symbol_sessions = 0
     exposure_sessions = 0
@@ -104,36 +110,76 @@ def simulate_period(
             entry_fill = raw_entry * (1 + slip if side == 1 else 1 - slip)
             stop = float(risk["stop_reference"])
             target = float(risk["target_reference"])
+            risk_dist = float(risk["risk_distance"])
+            atr_val = float(risk["atr"])
+            current_stop = stop
+            is_ratcheted = False
+            triggered_1r = False
             exit_idx = len(frame) - 1
             exit_price = float(frame.iloc[-1]["close"])
             exit_reason = "period_end"
             for j in range(entry_idx, len(frame)):
                 bar = frame.iloc[j]
-                open_price, high, low = map(float, (bar["open"], bar["high"], bar["low"]))
+                open_price, high, low, close_p = map(float, (bar["open"], bar["high"], bar["low"], bar["close"]))
                 if side == 1:
-                    stop_hit, target_hit = low <= stop, high >= target
+                    stop_hit, target_hit = low <= current_stop, high >= target
                     if stop_hit:
-                        exit_price = min(open_price, stop)
-                        exit_reason, exit_idx = "stop", j
+                        exit_price = min(open_price, current_stop)
+                        exit_reason, exit_idx = "trailing_stop" if is_ratcheted else "stop", j
                         break
                     if target_hit:
                         exit_price = target
                         exit_reason, exit_idx = "target", j
                         break
                 else:
-                    stop_hit, target_hit = high >= stop, low <= target
+                    stop_hit, target_hit = high >= current_stop, low <= target
                     if stop_hit:
-                        exit_price = max(open_price, stop)
-                        exit_reason, exit_idx = "stop", j
+                        exit_price = max(open_price, current_stop)
+                        exit_reason, exit_idx = "trailing_stop" if is_ratcheted else "stop", j
                         break
                     if target_hit:
                         exit_price = target
                         exit_reason, exit_idx = "target", j
                         break
                 if max_hold_days is not None and (j - entry_idx + 1) >= max_hold_days:
-                    exit_price = float(bar["close"])
+                    exit_price = close_p
                     exit_reason, exit_idx = "time_expiry", j
                     break
+
+                # End-of-bar update: ratchet stop for bar j + 1 onward (zero intraday lookahead)
+                if trailing_stop_mode == "breakeven_1r":
+                    if side == 1:
+                        if high >= raw_entry + trailing_trigger_r * risk_dist:
+                            new_stop = max(current_stop, raw_entry + breakeven_buffer_r * risk_dist)
+                            if new_stop > current_stop:
+                                current_stop = new_stop
+                                is_ratcheted = True
+                    else:
+                        if low <= raw_entry - trailing_trigger_r * risk_dist:
+                            new_stop = min(current_stop, raw_entry - breakeven_buffer_r * risk_dist)
+                            if new_stop < current_stop:
+                                current_stop = new_stop
+                                is_ratcheted = True
+                elif trailing_stop_mode == "atr_trail":
+                    if side == 1:
+                        if high >= raw_entry + trailing_trigger_r * risk_dist:
+                            triggered_1r = True
+                        if triggered_1r:
+                            trail_stop = close_p - trail_atr_multiple * atr_val
+                            new_stop = max(current_stop, trail_stop)
+                            if new_stop > current_stop:
+                                current_stop = new_stop
+                                is_ratcheted = True
+                    else:
+                        if low <= raw_entry - trailing_trigger_r * risk_dist:
+                            triggered_1r = True
+                        if triggered_1r:
+                            trail_stop = close_p + trail_atr_multiple * atr_val
+                            new_stop = min(current_stop, trail_stop)
+                            if new_stop < current_stop:
+                                current_stop = new_stop
+                                is_ratcheted = True
+
             exit_fill = exit_price * (1 - slip if side == 1 else 1 + slip)
             gross_pct = side * (exit_price / raw_entry - 1.0) * 100.0
             # Slippage is represented in the actual fills above; charge fees
@@ -149,7 +195,10 @@ def simulate_period(
                 "exit_date": sessions.iloc[exit_idx].isoformat(),
                 "exit_price": exit_fill, "exit_reason": exit_reason,
                 "atr_at_signal": risk["atr"], "stop_reference": stop,
-                "target_reference": target, "gross_return_pct": gross_pct,
+                "target_reference": target,
+                "benchmark_regime_at_signal": signal.get("benchmark_regime_at_signal"),
+                "rs_rating_at_signal": signal.get("rs_rating_at_signal"),
+                "gross_return_pct": gross_pct,
                 "cost_pct": cost_pct, "net_return_pct": net_pct,
                 "net_r_multiple": net_pct / risk_pct if risk_pct > 0 else None,
                 "holding_sessions": exit_idx - entry_idx + 1,

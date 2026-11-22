@@ -161,6 +161,8 @@ class TelegramNotifier(BaseNotifier):
                 if payload.sector_relative_strength_pct is not None else ""
             )
             lines.append(f"🏭 Sector regime: {html.escape(payload.sector_regime or 'unavailable')}{strength}")
+        if payload.rs_rating is not None:
+            lines.append(f"💪 RS Rating: <b>{payload.rs_rating}/99</b> vs Nifty 50")
         if payload.derivatives_context:
             oi = payload.derivatives_context
             if oi.get("status") == "available":
@@ -190,14 +192,18 @@ class TelegramNotifier(BaseNotifier):
                 notional = risk.get("notional_inr")
                 actual_risk = risk.get("actual_risk_inr")
                 constraint = risk.get("sizing_constraint")
-                details = [f"risk budget ₹{budget:,.0f}"]
-                if notional is not None:
-                    details.append(f"notional ₹{notional:,.0f}")
-                if actual_risk is not None:
-                    details.append(f"actual risk ₹{actual_risk:,.0f}")
-                if constraint == "tranche_capped":
-                    details.append("tranche capped")
-                size = f" · quantity {qty} ({', '.join(details)})"
+                c_label = "tranche cap" if "tranche" in str(constraint) else "risk cap"
+                if notional is not None and actual_risk is not None:
+                    size = f" · quantity {qty} (₹{notional:,.0f} · risk ₹{actual_risk:,.0f} · {c_label})"
+                else:
+                    details = [f"risk budget ₹{budget:,.0f}"]
+                    if notional is not None:
+                        details.append(f"notional ₹{notional:,.0f}")
+                    if actual_risk is not None:
+                        details.append(f"actual risk ₹{actual_risk:,.0f}")
+                    if "tranche" in str(constraint):
+                        details.append("tranche cap")
+                    size = f" · quantity {qty} ({', '.join(details)})"
             elif risk.get("position_size_status") == "unconfigured":
                 size = " · quantity not configured"
             else:

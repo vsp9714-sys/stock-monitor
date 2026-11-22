@@ -436,14 +436,17 @@ def test_ensure_schema_migrations_upgrades_legacy_paper_trades_table(tmp_path):
         assert "net_r_multiple" in cols
         assert "fits_tranche_rules" in cols
         assert "strategy_version" in cols
+        assert "alert_type" in cols
+        assert "rs_rating_at_entry" in cols
 
         # Check existing row data in paper_trades
-        row = conn.execute(text("SELECT symbol, direction, entry_price, alert_tier FROM paper_trades WHERE symbol='INFY'")).fetchone()
+        row = conn.execute(text("SELECT symbol, direction, entry_price, alert_tier, alert_type FROM paper_trades WHERE symbol='INFY'")).fetchone()
         assert row is not None
         assert row[0] == "INFY"
         assert row[1] == "BUY"
         assert row[2] == 1500.0
         assert row[3] == "intraday_radar"
+        assert row[4] == "intraday"
 
         # Verify child table DDL in sqlite_master still references paper_trades (not paper_trades_old)
         milestone_sql = conn.execute(text("SELECT sql FROM sqlite_master WHERE type='table' AND name='paper_trade_milestones'")).scalar()

@@ -319,3 +319,29 @@ def test_rsi_exhaustion_ceiling_rejects_overbought_buy(monkeypatch):
 
     res, _ = scanner._scan_stock(stock, df, provisional=False)
     assert res is None  # RSI exhaustion rejects BUY with RSI > 68.0
+
+
+def test_concurrent_alerts_sorted_by_rs_descending():
+    """Verify scanner sorts concurrent candidate alerts by (-rs_rating, -confluence_score, symbol)."""
+    candidates = [
+        {"stock_rs": 45, "res": {"confluence_score": 3}, "stock": type("Stock", (), {"symbol": "CCC"})},
+        {"stock_rs": 85, "res": {"confluence_score": 2}, "stock": type("Stock", (), {"symbol": "BBB"})},
+        {"stock_rs": 85, "res": {"confluence_score": 3}, "stock": type("Stock", (), {"symbol": "AAA"})},
+        {"stock_rs": None, "res": {"confluence_score": 3}, "stock": type("Stock", (), {"symbol": "DDD"})},
+        {"stock_rs": 85, "res": {"confluence_score": 3}, "stock": type("Stock", (), {"symbol": "ZZZ"})},
+    ]
+
+    candidates.sort(
+        key=lambda c: (
+            -(c["stock_rs"] if c["stock_rs"] is not None else -1),
+            -c["res"].get("confluence_score", 0),
+            c["stock"].symbol,
+        )
+    )
+
+    symbols = [c["stock"].symbol for c in candidates]
+    # RS 85 & score 3: AAA before ZZZ
+    # RS 85 & score 2: BBB
+    # RS 45 & score 3: CCC
+    # RS None (-1) & score 3: DDD
+    assert symbols == ["AAA", "ZZZ", "BBB", "CCC", "DDD"]

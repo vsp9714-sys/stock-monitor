@@ -59,6 +59,7 @@ class AlertPayload:
     market_relative_strength_pct: Optional[float] = None
     sector_regime: Optional[str] = None
     sector_relative_strength_pct: Optional[float] = None
+    rs_rating: Optional[int] = None
     derivatives_context: dict = field(default_factory=dict)
     risk_context: dict = field(default_factory=dict)
 

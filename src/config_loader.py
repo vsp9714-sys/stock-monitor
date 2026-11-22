@@ -131,10 +131,18 @@ def validate_candidate_context_config(config: dict[str, Any]) -> None:
         raise ValueError("universe.tradability.unknown_policy must be 'exclude' or 'include'")
 
     context = config.get("market_context", {}) or {}
-    if context.get("mode", "informational") not in {"informational", "filter"}:
-        raise ValueError("market_context.mode must be 'informational' or 'filter'")
+    if context.get("mode", "informational") not in {"informational", "filter", "benchmark_filter"}:
+        raise ValueError("market_context.mode must be 'informational', 'filter', or 'benchmark_filter'")
     if context.get("filter_unknown_policy", "exclude") not in {"exclude", "include"}:
         raise ValueError("market_context.filter_unknown_policy must be 'exclude' or 'include'")
+    allowed_buy = context.get("allowed_buy_regimes")
+    if allowed_buy is not None:
+        if not isinstance(allowed_buy, list) or not all(r in {"bullish", "bearish", "mixed"} for r in allowed_buy):
+            raise ValueError("market_context.allowed_buy_regimes must be a list containing 'bullish', 'bearish', and/or 'mixed'")
+    allowed_sell = context.get("allowed_sell_regimes")
+    if allowed_sell is not None:
+        if not isinstance(allowed_sell, list) or not all(r in {"bullish", "bearish", "mixed"} for r in allowed_sell):
+            raise ValueError("market_context.allowed_sell_regimes must be a list containing 'bullish', 'bearish', and/or 'mixed'")
     short_window = int(context.get("short_sma_sessions", 20))
     long_window = int(context.get("long_sma_sessions", 50))
     lookback = int(context.get("lookback_sessions", 20))
@@ -143,6 +151,9 @@ def validate_candidate_context_config(config: dict[str, Any]) -> None:
 
     risk = config.get("risk", {}) or {}
     backtest = config.get("backtest", {}) or {}
+    bt_trail = backtest.get("trailing_stop_mode")
+    if bt_trail is not None and bt_trail not in {"none", "breakeven_1r", "atr_trail"}:
+        raise ValueError("backtest.trailing_stop_mode must be 'none', 'breakeven_1r', or 'atr_trail'")
     try:
         atr_period = int(risk.get("atr_period", backtest.get("atr_period", 14)))
         stop_multiple = float(risk.get("stop_atr_multiple", backtest.get("stop_atr_multiple", 1.5)))
@@ -224,12 +235,32 @@ def validate_guardrails_config(config: dict[str, Any]) -> None:
         if period < 1 or min_adx < 0 or strong < min_adx:
             raise ValueError("guardrails.adx_filter requires period >= 1 and 0 <= min_adx <= strong_trend_threshold")
 
+    # rs_filter
+    rs = guardrails.get("rs_filter", {}) or {}
+    if rs.get("enabled", False):
+        try:
+            min_buy = int(rs.get("min_rs_rating_buy", 60))
+            max_sell = int(rs.get("max_rs_rating_sell", 40))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("guardrails.rs_filter thresholds must be integers") from exc
+        if not (1 <= min_buy <= 99 and 1 <= max_sell <= 99):
+            raise ValueError("guardrails.rs_filter min_rs_rating_buy and max_rs_rating_sell must be between 1 and 99")
+        if rs.get("unknown_policy", "exclude") not in {"exclude", "include"}:
+            raise ValueError("guardrails.rs_filter.unknown_policy must be 'exclude' or 'include'")
+        weights = rs.get("lookback_weights")
+        if weights is not None:
+            if not isinstance(weights, dict) or not all(isinstance(k, int) and k > 0 for k in weights.keys()) or not all(float(v) > 0 for v in weights.values()):
+                raise ValueError("guardrails.rs_filter.lookback_weights must map positive integer lookbacks to positive weights")
+
 
 def validate_paper_trading_config(config: dict[str, Any]) -> None:
     """Validate paper trading parameters."""
     pt = config.get("paper_trading", {}) or {}
     if not pt.get("enabled", False):
         return
+    pt_trail = pt.get("trailing_stop_mode")
+    if pt_trail is not None and pt_trail not in {"none", "breakeven_1r", "atr_trail", "supertrend"}:
+        raise ValueError("paper_trading.trailing_stop_mode must be 'none', 'breakeven_1r', 'atr_trail', or 'supertrend'")
     directions = pt.get("allowed_directions")
     if directions is not None:
         if not isinstance(directions, list) or not all(str(d).upper() in {"BUY", "SELL"} for d in directions):
@@ -242,6 +273,14 @@ def validate_paper_trading_config(config: dict[str, Any]) -> None:
                 raise ValueError
         except (TypeError, ValueError) as exc:
             raise ValueError("paper_trading.round_trip_cost_pct must be non-negative numeric") from exc
+    max_hold = pt.get("max_hold_days")
+    if max_hold is not None:
+        try:
+            val = int(max_hold)
+            if val < 1:
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise ValueError("paper_trading.max_hold_days must be an integer >= 1 when configured") from exc
 
 
 def _apply_env_overrides(config: dict) -> None:

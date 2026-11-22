@@ -13,7 +13,7 @@ from src.config_loader import get_config
 from src.db import MarketContextCache, OHLCVCache, Stock, UniverseScanSnapshot, get_session
 from src.scanner import Scanner
 from src.backtest.engine import benchmark_return, simulate_period
-from src.market_context import average_traded_value
+from src.market_context import average_traded_value, compute_universe_rs_ratings, regime_for_candles
 
 
 def _bars_from_rows(rows) -> dict[str, list[dict]]:
@@ -94,6 +94,41 @@ def run_backtest(start_date: date, end_date: date, symbols: list[str] | None, ou
             "sector/fundamental mappings; use informational mode for a faithful replay."
         )
 
+    guardrails_cfg = cfg.get("guardrails", {}) or {}
+    rs_filter_cfg = guardrails_cfg.get("rs_filter", {}) or {}
+
+    # Precompute benchmark regimes by date using completed benchmark candles ts <= d
+    benchmark_regimes_by_date: dict[date, dict] = {}
+    if benchmark is not None and not benchmark.empty:
+        b_short = int(market_context_cfg.get("short_sma_sessions", 20))
+        b_long = int(market_context_cfg.get("long_sma_sessions", 50))
+        b_df = benchmark.copy().sort_values("ts").drop_duplicates(subset=["ts"], keep="last").reset_index(drop=True)
+        b_dates = [pd.Timestamp(t).date() for t in b_df["ts"]]
+        unique_b_dates = sorted({d for d in b_dates if d is not None})
+        for d in unique_b_dates:
+            if d <= end_date:
+                indices = [idx for idx, bd in enumerate(b_dates) if bd <= d]
+                b_prefix = b_df.iloc[indices]
+                benchmark_regimes_by_date[d] = regime_for_candles(b_prefix, short_window=b_short, long_window=b_long)
+
+    # Precompute universe cross-sectional RS rating for each session date
+    all_days = sorted({
+        pd.Timestamp(ts).date()
+        for frame in candles.values() for ts in frame["ts"]
+        if start_date <= pd.Timestamp(ts).date() <= end_date
+    })
+    rs_ratings_by_date: dict[date, dict[str, int]] = {}
+    if benchmark is not None and not benchmark.empty:
+        for d in all_days:
+            active_symbols = membership.get(d) if (membership and d in membership) else None
+            if active_symbols is not None:
+                sub_stocks = {s: candles[s] for s in active_symbols if s in candles}
+            else:
+                sub_stocks = candles
+            rs_ratings_by_date[d] = compute_universe_rs_ratings(
+                sub_stocks, benchmark, as_of_date=d, lookback_weights=rs_filter_cfg.get("lookback_weights")
+            )
+
     def evaluate(symbol: str, frame):
         tradability = (cfg.get("universe", {}) or {}).get("tradability", {}) or {}
         if tradability.get("enabled", False):
@@ -114,17 +149,51 @@ def run_backtest(start_date: date, end_date: date, symbols: list[str] | None, ou
                 return None
         stock = SimpleNamespace(symbol=symbol, company_name=symbol)
         result, _ = Scanner._scan_stock(evaluator, stock, frame, provisional=False)
+        if not result:
+            return None
+
+        signal_day = pd.Timestamp(frame.iloc[-1]["ts"]).date()
+        bench_res = benchmark_regimes_by_date.get(signal_day, {})
+        bench_regime = bench_res.get("regime") if bench_res.get("status") == "available" else None
+        result["benchmark_regime_at_signal"] = bench_regime
+
+        rs_val = rs_ratings_by_date.get(signal_day, {}).get(symbol)
+        result["rs_rating_at_signal"] = rs_val
+
+        # Benchmark Regime Gate
+        if market_context_cfg.get("mode") == "benchmark_filter":
+            allowed_buy = market_context_cfg.get("allowed_buy_regimes", ["bullish", "mixed"])
+            allowed_sell = market_context_cfg.get("allowed_sell_regimes", ["bearish", "mixed"])
+            unknown_policy = market_context_cfg.get("filter_unknown_policy", "exclude")
+            if bench_regime is None:
+                if unknown_policy == "exclude":
+                    return None
+            else:
+                if result["direction"] == "BUY" and bench_regime not in allowed_buy:
+                    return None
+                if result["direction"] == "SELL" and bench_regime not in allowed_sell:
+                    return None
+
+        # Cross-Sectional RS Filter
+        if rs_filter_cfg.get("enabled", False):
+            min_buy = int(rs_filter_cfg.get("min_rs_rating_buy", 60))
+            max_sell = int(rs_filter_cfg.get("max_rs_rating_sell", 40))
+            unknown_policy = rs_filter_cfg.get("unknown_policy", "exclude")
+            if rs_val is None:
+                if unknown_policy == "exclude":
+                    return None
+            else:
+                if result["direction"] == "BUY" and rs_val < min_buy:
+                    return None
+                if result["direction"] == "SELL" and rs_val > max_sell:
+                    return None
+
         return result
 
     bt_cfg = cfg.get("backtest", {})
     train_fraction = float(bt_cfg.get("train_fraction", 0.7))
     if not 0.5 <= train_fraction < 1.0:
         raise ValueError("backtest.train_fraction must be in [0.5, 1)")
-    all_days = sorted({
-        pd.Timestamp(ts).date()
-        for frame in candles.values() for ts in frame["ts"]
-        if start_date <= pd.Timestamp(ts).date() <= end_date
-    })
     total = simulate_period(candles, evaluate, start_date=start_date, end_date=end_date,
                             config=cfg, membership_by_date=membership)
     if len(all_days) >= 4:
@@ -140,7 +209,7 @@ def run_backtest(start_date: date, end_date: date, symbols: list[str] | None, ou
     else:
         walk_forward = {"status": "unavailable", "reason": "fewer_than_four_sessions"}
 
-    strategy_cfg = {key: cfg.get(key) for key in ("signals", "confluence", "guardrails", "backtest", "risk")}
+    strategy_cfg = {key: cfg.get(key) for key in ("signals", "confluence", "guardrails", "backtest", "risk", "market_context")}
     config_hash = hashlib.sha256(json.dumps(strategy_cfg, sort_keys=True, default=str).encode()).hexdigest()
     limits = [
         "Only locally cached daily OHLCV is used; the command performs no network requests and sends no alerts.",
@@ -166,6 +235,14 @@ def run_backtest(start_date: date, end_date: date, symbols: list[str] | None, ou
             "gap_stop": "fill at open when open has gapped beyond stop",
             "costs": {"fees_bps_per_side": bt_cfg.get("fee_bps_per_side", 5.0),
                       "slippage_bps_per_side": bt_cfg.get("slippage_bps_per_side", 5.0)},
+            "trailing_stop_mode": bt_cfg.get("trailing_stop_mode", "none"),
+            "benchmark_filter": {
+                "enabled": market_context_cfg.get("mode") == "benchmark_filter",
+                "mode": market_context_cfg.get("mode", "informational"),
+                "allowed_buy_regimes": market_context_cfg.get("allowed_buy_regimes", ["bullish", "mixed"]),
+                "allowed_sell_regimes": market_context_cfg.get("allowed_sell_regimes", ["bearish", "mixed"]),
+            },
+            "rs_filter": rs_filter_cfg,
             "concurrent_positions": "not modeled; drawdown is sequential closed-trade equity",
             "universe_membership_snapshots_found": len(snapshots),
         },

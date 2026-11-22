@@ -108,7 +108,7 @@ guardrails:
     min_clv_buy: 0.70    # Buy close must be in top 30% of day's range
     max_clv_sell: 0.30   # Sell close must be in bottom 30% of day's range
     apply_to_provisional: true
-    apply_to_daily: true
+    apply_to_daily: false
 
   # Time-weighted volume pace (R-Volume) based on NSE intraday U-curve
   volume_pace:
@@ -134,6 +134,16 @@ guardrails:
     apply_to_provisional: true
     apply_to_daily: true
 
+  # Cross-sectional Relative Strength Rating vs Nifty 50 (1-99 percentile)
+  rs_filter:
+    enabled: true
+    min_rs_rating_buy: 50       # integer 1..99
+    max_rs_rating_sell: 50      # integer 1..99
+    lookback_weights: {20: 0.4, 60: 0.4, 120: 0.2}
+    unknown_policy: "exclude"   # exclude | include
+    apply_to_provisional: true
+    apply_to_daily: true
+
   relative_strength:
     enabled: false            # Enable in Phase 3 (v2_enhanced)
     lookback_short: 20
@@ -153,7 +163,7 @@ paper_trading:
   enabled: true
   strategy_version: "v1_baseline"
   allowed_directions: ["BUY"] # Long-only CNC delivery validation
-  max_hold_days: 20              # Maximum holding duration in trading days
+  max_hold_days: 35              # Maximum holding duration in trading days
   cooldown_days: 3               # Minimum days before re-entering same symbol & direction
   round_trip_cost_pct: 0.30      # Statutory NSE CNC charges + slippage deduction
   trailing_stop_mode: "none"     # "none" | "breakeven_1r" | "supertrend"
@@ -193,8 +203,10 @@ universe:
 # ─── Benchmark and Sector Context ────────────────────────────────────────────
 market_context:
   enabled: true
-  mode: informational  # informational | filter (filter is opt-in)
-  filter_unknown_policy: exclude  # when filter mode is enabled, missing required context suppresses that candidate
+  mode: "benchmark_filter"  # informational | filter | benchmark_filter
+  allowed_buy_regimes: ["bullish", "mixed"]   # used when mode is benchmark_filter
+  allowed_sell_regimes: ["bearish", "mixed"]  # used when mode is benchmark_filter
+  filter_unknown_policy: "exclude"  # when filter mode is enabled, missing required context suppresses that candidate
   benchmark_key: "NSE_INDEX|Nifty 50"
   lookback_sessions: 20
   short_sma_sessions: 20
@@ -223,9 +235,9 @@ derivatives:
 risk:
   enabled: true
   atr_period: 14
-  stop_atr_multiple: 1.5
-  target_r_multiple: 2.0
-  account_capital_inr: null  # leave unset to omit quantity sizing
+  stop_atr_multiple: 2.0
+  target_r_multiple: 1.5
+  account_capital_inr: 500000
   risk_percent: 1.0           # ₹5,000 max risk on ₹5,00,000
   max_tranche_inr: 100000     # Hard ₹1,00,000 capital cap per trade
   max_risk_distance_pct: 6.0
@@ -234,7 +246,8 @@ risk:
 backtest:
   atr_period: 14
   stop_atr_multiple: 2.0
-  target_r_multiple: 2.0
+  target_r_multiple: 1.5
+  trailing_stop_mode: "none"  # "none" | "breakeven_1r" | "atr_trail"
   fee_bps_per_side: 5.0
   slippage_bps_per_side: 5.0
   train_fraction: 0.7

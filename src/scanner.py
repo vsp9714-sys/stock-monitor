@@ -59,7 +59,7 @@ from src.signals.rsi import detect_rsi_signal, compute_rsi
 from src.signals.confluence import evaluate_confluence
 from src.signals.volume_breakout import detect_volume_breakout, nse_expected_volume_fraction
 from src.signals.adx import adx_filter
-from src.paper_trading import record_paper_trade_entry, monitor_open_paper_trades
+from src.paper_trading import record_paper_trade_entry, monitor_open_paper_trades, alert_type_for_tier
 from src.universe import UniverseSelectionError, UniverseSelector
 from src.market_calendar import (
     CalendarUnavailable,
@@ -69,7 +69,12 @@ from src.market_calendar import (
     is_trading_day,
     latest_completed_session_day,
 )
-from src.market_context import average_traded_value, regime_for_candles, relative_strength
+from src.market_context import (
+    average_traded_value,
+    compute_universe_rs_ratings,
+    regime_for_candles,
+    relative_strength,
+)
 from src.derivatives import nearest_expiry, summarize_option_chain
 from src.risk import risk_reference
 
@@ -1531,6 +1536,22 @@ class Scanner:
             else:
                 tradable_candidates = list(stocks)
 
+            # Precompute cross-sectional Relative Strength Ratings across valid_frames vs benchmark
+            guardrails_cfg = getattr(self, "guardrails_cfg", {}) or self.cfg.get("guardrails", {})
+            rs_filter_cfg = guardrails_cfg.get("rs_filter", {})
+            benchmark_key = self.cfg.get("market_context", {}).get("benchmark_key", "NSE_INDEX|Nifty 50")
+            benchmark_frame = self._get_market_index_frame(benchmark_key, session_date - timedelta(days=1))
+            rs_ratings = (
+                compute_universe_rs_ratings(
+                    valid_frames,
+                    benchmark_frame,
+                    as_of_date=session_date - timedelta(days=1),
+                    lookback_weights=rs_filter_cfg.get("lookback_weights"),
+                )
+                if benchmark_frame is not None
+                else {}
+            )
+
             eligible_stocks = [
                 stock for stock in tradable_candidates
                 if stock.instrument_key in fresh_quotes
@@ -1655,6 +1676,7 @@ class Scanner:
             seed_legacy_deliveries(db, destinations)
 
             market_context_filtered = 0
+            surviving_candidates = []
             for stock, path_results in evaluations:
                 for res, df, provisional in path_results:
                     try:
@@ -1665,6 +1687,8 @@ class Scanner:
                             logger.info("Optional market context unavailable for %s: %s", stock.symbol, exc)
                             market_context = {"status": "unavailable", "reason": "context_error",
                                               "mode": self.cfg.get("market_context", {}).get("mode", "informational")}
+                        stock_rs = rs_ratings.get(stock.symbol)
+                        market_context["rs_rating"] = stock_rs
                         try:
                             derivatives_context = self._derivatives_context_for(stock, today)
                         except Exception as exc:
@@ -1681,154 +1705,224 @@ class Scanner:
                             if opposing or (unavailable_required and self.cfg.get("market_context", {}).get("filter_unknown_policy", "exclude") == "exclude"):
                                 market_context_filtered += 1
                                 continue
-                        signal_type = res["signal_type"]
-                        quote = fresh_quotes[stock.instrument_key]
-                        res = {**res, "price": float(quote["last_price"])}
-                        risk_context = risk_reference(
-                            valid_frames[stock.symbol], entry_price=float(quote["last_price"]),
-                            direction=res["direction"], config=self.cfg.get("risk", {}),
-                        )
-                        existing = db.query(Signal).filter_by(
-                            symbol=stock.symbol, signal_date=today, signal_type=signal_type
-                        ).first()
-                        old_score = int(existing.indicator_value or 0) if existing else 0
-                        if existing and res["confluence_score"] <= old_score:
-                            chart_path = existing.chart_path
-                        else:
-                            from charts.chart_generator import generate_signal_chart
-                            chart_path = generate_signal_chart(
-                                symbol=stock.symbol,
-                                company_name=stock.company_name or stock.symbol,
-                                df=df,
-                                signal_type=signal_type,
-                                direction=res["direction"],
-                                indicator_value=float(res["confluence_score"]),
-                            )
+                        elif market_context.get("mode") == "benchmark_filter":
+                            m_cfg = self.cfg.get("market_context", {})
+                            allowed_buy = m_cfg.get("allowed_buy_regimes", ["bullish", "mixed"])
+                            allowed_sell = m_cfg.get("allowed_sell_regimes", ["bearish", "mixed"])
+                            expected_allowed = allowed_buy if res["direction"] == "BUY" else allowed_sell
+                            bench = market_context.get("benchmark", {})
+                            if bench.get("status") != "available":
+                                if m_cfg.get("filter_unknown_policy", "exclude") == "exclude":
+                                    market_context_filtered += 1
+                                    continue
+                            elif bench.get("regime") not in expected_allowed:
+                                market_context_filtered += 1
+                                continue
 
-                        saved = upsert_signal(
-                            session=db,
-                            symbol=stock.symbol,
-                            signal_date=today,
-                            signal_type=signal_type,
-                            direction=res["direction"],
-                            price=res["price"],
-                            indicator_value=float(res["confluence_score"]),
-                            indicator_detail=json.dumps({
-                                "signal_horizon": res.get("signal_horizon", "provisional_intraday" if provisional else "confirmed_daily"),
-                                "alert_tier": res.get("alert_tier", "confirmed_daily"),
-                                "clv": res.get("clv"),
-                                "adx": res.get("adx"),
-                                "trend_gate": res.get("trend_gate"),
-                                "rsi_exhaustion": res.get("rsi_exhaustion"),
-                                "bar_status": "provisional" if provisional else "confirmed_daily_cache",
-                                "session_date": today.isoformat(),
-                                "quote_timestamp": res.get("quote_timestamp"),
-                                "confluence_score": res["confluence_score"],
-                                "total_signals": res["total_signals"],
-                                "group_votes": res.get("group_votes", {}),
-                                "conflicting_groups": res.get("conflicting_groups", []),
-                                "confluence_mode": res.get(
-                                    "confluence_mode", getattr(self, "confluence_cfg", {}).get("mode", "crossover")
-                                ),
-                                "score_version": res.get("score_version", 1),
-                                "checks": res["checks"],
-                                "market_context": market_context,
-                                "derivatives_context": derivatives_context,
-                                "risk_context": risk_context,
-                                "fundamental_provenance": {
-                                    key: fund.get(key) for key in (
-                                        "source_url", "fetched_at", "cache_age_hours", "freshness",
-                                        "data_basis", "quarterly_data_status"
-                                    )
-                                } if fund else {"freshness": "unavailable"},
-                                "average_traded_value": liquidity_metrics.get(stock.symbol),
-                            }, default=_json_default),
-                            chart_path=chart_path,
-                        )
-                        saved_detail = json.loads(saved.indicator_detail or "{}")
-                        saved_score = int(saved.indicator_value or 0)
-                        saved_checks = saved_detail.get("checks", res["checks"])
-                        saved_total = int(saved_detail.get("total_signals", res["total_signals"]))
-                        payload = AlertPayload(
+                        # Cross-sectional RS Filter check
+                        if rs_filter_cfg.get("enabled", False):
+                            apply_rs = (
+                                (provisional and rs_filter_cfg.get("apply_to_provisional", True)) or
+                                (not provisional and rs_filter_cfg.get("apply_to_daily", True))
+                            )
+                            if apply_rs:
+                                min_buy = int(rs_filter_cfg.get("min_rs_rating_buy", 60))
+                                max_sell = int(rs_filter_cfg.get("max_rs_rating_sell", 40))
+                                unknown_policy = rs_filter_cfg.get("unknown_policy", "exclude")
+                                if stock_rs is None:
+                                    if unknown_policy == "exclude":
+                                        continue
+                                else:
+                                    if res["direction"] == "BUY" and stock_rs < min_buy:
+                                        continue
+                                    if res["direction"] == "SELL" and stock_rs > max_sell:
+                                        continue
+
+                        surviving_candidates.append({
+                            "stock": stock,
+                            "res": res,
+                            "df": df,
+                            "provisional": provisional,
+                            "fund": fund,
+                            "market_context": market_context,
+                            "stock_rs": stock_rs,
+                            "derivatives_context": derivatives_context,
+                        })
+                    except Exception as exc:
+                        logger.error("Error evaluating candidate for %s: %s", stock.symbol, exc, exc_info=True)
+
+            universe_metadata["market_context_filtered_count"] = market_context_filtered
+
+            # Sort surviving candidates by (-rs_rating, -confluence_score, symbol)
+            surviving_candidates.sort(
+                key=lambda c: (
+                    -(c["stock_rs"] if c["stock_rs"] is not None else -1),
+                    -c["res"].get("confluence_score", 0),
+                    c["stock"].symbol,
+                )
+            )
+
+            for cand in surviving_candidates:
+                stock = cand["stock"]
+                res = cand["res"]
+                df = cand["df"]
+                provisional = cand["provisional"]
+                fund = cand["fund"]
+                market_context = cand["market_context"]
+                stock_rs = cand["stock_rs"]
+                derivatives_context = cand["derivatives_context"]
+                try:
+                    signal_type = res["signal_type"]
+                    quote = fresh_quotes[stock.instrument_key]
+                    res = {**res, "price": float(quote["last_price"])}
+                    risk_context = risk_reference(
+                        valid_frames[stock.symbol], entry_price=float(quote["last_price"]),
+                        direction=res["direction"], config=self.cfg.get("risk", {}),
+                    )
+                    existing = db.query(Signal).filter_by(
+                        symbol=stock.symbol, signal_date=today, signal_type=signal_type
+                    ).first()
+                    old_score = int(existing.indicator_value or 0) if existing else 0
+                    if existing and res["confluence_score"] <= old_score:
+                        chart_path = existing.chart_path
+                    else:
+                        from charts.chart_generator import generate_signal_chart
+                        chart_path = generate_signal_chart(
                             symbol=stock.symbol,
                             company_name=stock.company_name or stock.symbol,
+                            df=df,
                             signal_type=signal_type,
                             direction=res["direction"],
-                            price=res["price"],
-                            price_source="Upstox last_price",
-                            quote_timestamp=datetime.fromtimestamp(
-                                quote["last_trade_time"] / 1000, timezone.utc
-                            ).isoformat(),
-                            indicator_value=float(saved_score),
-                            indicator_detail={
-                                "confluence_score": saved_score,
-                                "checks": saved_checks,
-                                "clv": res.get("clv"),
-                                "adx": res.get("adx"),
-                                "alert_tier": res.get("alert_tier", "confirmed_daily"),
-                            },
-                            provisional=provisional,
-                            alert_tier=res.get("alert_tier", "confirmed_daily"),
-                            clv=res.get("clv"),
-                            signal_session_date=today.isoformat(),
-                            bar_status="provisional" if provisional else "confirmed_daily_cache",
-                            confluence_score=saved_score,
-                            total_signals=saved_total,
-                            confluence_mode=saved_detail.get(
-                                "confluence_mode", res.get(
-                                    "confluence_mode", getattr(self, "confluence_cfg", {}).get("mode", "crossover")
-                                )
-                            ),
-                            checks=saved_checks,
-                            chart_path=saved.chart_path,
-                            mcap_cr=fund.get("mcap_cr") if fund else None,
-                            cap_category=fund.get("cap_category") if fund else None,
-                            sector=fund.get("sector") if fund else None,
-                            industry=fund.get("industry") if fund else None,
-                            pe_ratio=fund.get("pe_ratio") if fund else None,
-                            pb_ratio=fund.get("pb_ratio") if fund else None,
-                            roe=fund.get("roe") if fund else None,
-                            profit_q1_cr=fund.get("profit_q1_cr") if fund else None,
-                            profit_q2_cr=fund.get("profit_q2_cr") if fund else None,
-                            profit_q3_cr=fund.get("profit_q3_cr") if fund else None,
-                            profit_q4_cr=fund.get("profit_q4_cr") if fund else None,
-                            profit_ttm_cr=fund.get("profit_ttm_cr") if fund else None,
-                            promoter_holding_pct=fund.get("promoter_holding_pct") if fund else None,
-                            screener_url=fund.get("screener_url") if fund else None,
-                            fundamentals_fetched_at=fund.get("fetched_at") if fund else None,
-                            fundamentals_cache_age_hours=fund.get("cache_age_hours") if fund else None,
-                            fundamentals_freshness=fund.get("freshness", "unavailable") if fund else "unavailable",
-                            fundamentals_data_basis=fund.get("data_basis", "unknown") if fund else "unknown",
-                            market_regime=market_context.get("benchmark", {}).get("regime"),
-                            market_relative_strength_pct=market_context.get("benchmark_relative_strength", {}).get("relative_strength_pct"),
-                            sector_regime=market_context.get("sector_regime", {}).get("regime"),
-                            sector_relative_strength_pct=market_context.get("sector_relative_strength", {}).get("relative_strength_pct"),
-                            derivatives_context=derivatives_context,
-                            risk_context=risk_context,
+                            indicator_value=float(res["confluence_score"]),
                         )
-                        if self._dispatch_alert(payload, db, saved.id):
-                            new_signal_count += 1
-                            logger.info(
-                                "Confluence alert/update dispatched for %s: %s (%s/%s groups)",
-                                stock.symbol, res["direction"], saved_score, saved_total,
-                            )
-                            try:
-                                record_paper_trade_entry(
-                                    session=db,
-                                    signal_id=saved.id,
-                                    symbol=stock.symbol,
-                                    direction=res["direction"],
-                                    entry_price=res["price"],
-                                    risk_ref=risk_context,
-                                    confluence_result=res,
-                                    alert_tier=res.get("alert_tier", "confirmed_daily"),
-                                    session_date=today,
-                                    config=self.cfg,
+
+                    saved = upsert_signal(
+                        session=db,
+                        symbol=stock.symbol,
+                        signal_date=today,
+                        signal_type=signal_type,
+                        direction=res["direction"],
+                        price=res["price"],
+                        indicator_value=float(res["confluence_score"]),
+                        indicator_detail=json.dumps({
+                            "signal_horizon": res.get("signal_horizon", "provisional_intraday" if provisional else "confirmed_daily"),
+                            "alert_tier": res.get("alert_tier", "confirmed_daily"),
+                            "clv": res.get("clv"),
+                            "adx": res.get("adx"),
+                            "trend_gate": res.get("trend_gate"),
+                            "rsi_exhaustion": res.get("rsi_exhaustion"),
+                            "bar_status": "provisional" if provisional else "confirmed_daily_cache",
+                            "session_date": today.isoformat(),
+                            "quote_timestamp": res.get("quote_timestamp"),
+                            "confluence_score": res["confluence_score"],
+                            "total_signals": res["total_signals"],
+                            "group_votes": res.get("group_votes", {}),
+                            "conflicting_groups": res.get("conflicting_groups", []),
+                            "confluence_mode": res.get(
+                                "confluence_mode", getattr(self, "confluence_cfg", {}).get("mode", "crossover")
+                            ),
+                            "score_version": res.get("score_version", 1),
+                            "checks": res["checks"],
+                            "market_context": market_context,
+                            "derivatives_context": derivatives_context,
+                            "risk_context": risk_context,
+                            "fundamental_provenance": {
+                                key: fund.get(key) for key in (
+                                    "source_url", "fetched_at", "cache_age_hours", "freshness",
+                                    "data_basis", "quarterly_data_status"
                                 )
-                            except Exception as pe:
-                                logger.error("Failed to record paper trade entry for %s: %s", stock.symbol, pe)
-                    except Exception as exc:
-                        logger.error("Error processing alert for %s: %s", stock.symbol, exc, exc_info=True)
+                            } if fund else {"freshness": "unavailable"},
+                            "average_traded_value": liquidity_metrics.get(stock.symbol),
+                        }, default=_json_default),
+                        chart_path=chart_path,
+                    )
+                    saved_detail = json.loads(saved.indicator_detail or "{}")
+                    saved_score = int(saved.indicator_value or 0)
+                    saved_checks = saved_detail.get("checks", res["checks"])
+                    saved_total = int(saved_detail.get("total_signals", res["total_signals"]))
+                    payload = AlertPayload(
+                        symbol=stock.symbol,
+                        company_name=stock.company_name or stock.symbol,
+                        signal_type=signal_type,
+                        direction=res["direction"],
+                        price=res["price"],
+                        price_source="Upstox last_price",
+                        quote_timestamp=datetime.fromtimestamp(
+                            quote["last_trade_time"] / 1000, timezone.utc
+                        ).isoformat(),
+                        indicator_value=float(saved_score),
+                        indicator_detail={
+                            "confluence_score": saved_score,
+                            "checks": saved_checks,
+                            "clv": res.get("clv"),
+                            "adx": res.get("adx"),
+                            "alert_tier": res.get("alert_tier", "confirmed_daily"),
+                        },
+                        provisional=provisional,
+                        alert_tier=res.get("alert_tier", "confirmed_daily"),
+                        clv=res.get("clv"),
+                        signal_session_date=today.isoformat(),
+                        bar_status="provisional" if provisional else "confirmed_daily_cache",
+                        confluence_score=saved_score,
+                        total_signals=saved_total,
+                        confluence_mode=saved_detail.get(
+                            "confluence_mode", res.get(
+                                "confluence_mode", getattr(self, "confluence_cfg", {}).get("mode", "crossover")
+                            )
+                        ),
+                        checks=saved_checks,
+                        chart_path=saved.chart_path,
+                        mcap_cr=fund.get("mcap_cr") if fund else None,
+                        cap_category=fund.get("cap_category") if fund else None,
+                        sector=fund.get("sector") if fund else None,
+                        industry=fund.get("industry") if fund else None,
+                        pe_ratio=fund.get("pe_ratio") if fund else None,
+                        pb_ratio=fund.get("pb_ratio") if fund else None,
+                        roe=fund.get("roe") if fund else None,
+                        profit_q1_cr=fund.get("profit_q1_cr") if fund else None,
+                        profit_q2_cr=fund.get("profit_q2_cr") if fund else None,
+                        profit_q3_cr=fund.get("profit_q3_cr") if fund else None,
+                        profit_q4_cr=fund.get("profit_q4_cr") if fund else None,
+                        profit_ttm_cr=fund.get("profit_ttm_cr") if fund else None,
+                        promoter_holding_pct=fund.get("promoter_holding_pct") if fund else None,
+                        screener_url=fund.get("screener_url") if fund else None,
+                        fundamentals_fetched_at=fund.get("fetched_at") if fund else None,
+                        fundamentals_cache_age_hours=fund.get("cache_age_hours") if fund else None,
+                        fundamentals_freshness=fund.get("freshness", "unavailable") if fund else "unavailable",
+                        fundamentals_data_basis=fund.get("data_basis", "unknown") if fund else "unknown",
+                        market_regime=market_context.get("benchmark", {}).get("regime"),
+                        market_relative_strength_pct=market_context.get("benchmark_relative_strength", {}).get("relative_strength_pct"),
+                        sector_regime=market_context.get("sector_regime", {}).get("regime"),
+                        sector_relative_strength_pct=market_context.get("sector_relative_strength", {}).get("relative_strength_pct"),
+                        rs_rating=stock_rs,
+                        derivatives_context=derivatives_context,
+                        risk_context=risk_context,
+                    )
+                    if self._dispatch_alert(payload, db, saved.id):
+                        new_signal_count += 1
+                        logger.info(
+                            "Confluence alert/update dispatched for %s: %s (%s/%s groups)",
+                            stock.symbol, res["direction"], saved_score, saved_total,
+                        )
+                        try:
+                            record_paper_trade_entry(
+                                session=db,
+                                signal_id=saved.id,
+                                symbol=stock.symbol,
+                                direction=res["direction"],
+                                entry_price=res["price"],
+                                risk_ref=risk_context,
+                                confluence_result=res,
+                                alert_tier=res.get("alert_tier", "confirmed_daily"),
+                                session_date=today,
+                                config=self.cfg,
+                                alert_type=alert_type_for_tier(res.get("alert_tier")),
+                                rs_rating=stock_rs,
+                            )
+                        except Exception as pe:
+                            logger.error("Failed to record paper trade entry for %s: %s", stock.symbol, pe)
+                except Exception as exc:
+                    logger.error("Error processing alert for %s: %s", stock.symbol, exc, exc_info=True)
 
             universe_metadata["market_context_filtered_count"] = market_context_filtered
 

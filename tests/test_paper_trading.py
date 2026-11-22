@@ -165,6 +165,24 @@ class TestPaperTradeEntryCreation:
         )
         assert t_confirmed is not None
         assert t_confirmed.id != t_radar.id
+        assert t_radar.alert_type == "intraday"
+        assert t_confirmed.alert_type == "day_end"
+        assert db_session.query(PaperTrade).filter_by(symbol="INFY").count() == 2
+
+        # Second intraday_radar on same day is deduplicated
+        t_radar_dup = record_paper_trade_entry(
+            session=db_session,
+            signal_id=3,
+            symbol="INFY",
+            direction="BUY",
+            entry_price=1502.0,
+            risk_ref=risk_ref,
+            confluence_result=confluence_res,
+            alert_tier="intraday_radar",
+            session_date=date(2026, 11, 20),
+            config=sample_config,
+        )
+        assert t_radar_dup.id == t_radar.id
         assert db_session.query(PaperTrade).filter_by(symbol="INFY").count() == 2
 
     def test_record_paper_trade_open_guard(self, db_session, sample_config):
