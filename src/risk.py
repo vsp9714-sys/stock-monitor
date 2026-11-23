@@ -74,8 +74,17 @@ def risk_reference(
         try:
             mrdp = float(max_risk_dist_pct)
             if math.isfinite(mrdp) and mrdp > 0:
+                if risk_distance_pct > mrdp:
+                    return {
+                        "status": "unavailable",
+                        "reason": "risk_distance_exceeds_max",
+                        "atr": atr,
+                        "risk_distance": distance,
+                        "risk_distance_pct": risk_distance_pct,
+                        "max_risk_distance_pct": mrdp,
+                    }
                 result["max_risk_distance_pct"] = mrdp
-                result["fits_risk_distance_cap"] = risk_distance_pct <= mrdp
+                result["fits_risk_distance_cap"] = True
         except (TypeError, ValueError):
             pass
 

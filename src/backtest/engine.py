@@ -1,6 +1,7 @@
 """No-lookahead event replay with explicit daily-bar execution assumptions."""
 from __future__ import annotations
 
+import math
 from datetime import date
 from typing import Any, Callable
 
@@ -52,6 +53,16 @@ def simulate_period(
     if raw_allowed is not None:
         allowed_directions = {str(d).upper() for d in raw_allowed}
 
+    raw_max_risk_dist = bt.get("max_risk_distance_pct", risk_cfg.get("max_risk_distance_pct"))
+    max_risk_distance_pct: float | None = None
+    if raw_max_risk_dist is not None:
+        try:
+            val = float(raw_max_risk_dist)
+            if math.isfinite(val) and val > 0:
+                max_risk_distance_pct = val
+        except (ValueError, TypeError):
+            max_risk_distance_pct = None
+
     trailing_stop_mode = str(bt.get("trailing_stop_mode", "none")).lower()
     trailing_trigger_r = float(bt.get("trailing_trigger_r", 1.0))
     breakeven_buffer_r = float(bt.get("breakeven_buffer_r", 0.0))
@@ -60,7 +71,7 @@ def simulate_period(
     trades: list[dict[str, Any]] = []
     total_symbol_sessions = 0
     exposure_sessions = 0
-    skipped = {"no_next_bar": 0, "atr_unavailable": 0, "invalid_entry": 0}
+    skipped = {"no_next_bar": 0, "atr_unavailable": 0, "invalid_entry": 0, "risk_distance_exceeds_max": 0}
 
     for symbol, original in sorted(candles.items()):
         if original is None or original.empty:
@@ -95,14 +106,22 @@ def simulate_period(
                 skipped["invalid_entry"] += 1
                 i += 1
                 continue
+            risk_ref_cfg = {
+                "enabled": True, "atr_period": atr_period,
+                "stop_atr_multiple": stop_multiple, "target_r_multiple": target_multiple,
+            }
+            if max_risk_distance_pct is not None:
+                risk_ref_cfg["max_risk_distance_pct"] = max_risk_distance_pct
             risk = risk_reference(
                 frame.iloc[: i + 1], entry_price=raw_entry,
                 direction=signal["direction"],
-                config={"enabled": True, "atr_period": atr_period,
-                        "stop_atr_multiple": stop_multiple, "target_r_multiple": target_multiple},
+                config=risk_ref_cfg,
             )
             if risk.get("status") != "available":
-                skipped["atr_unavailable"] += 1
+                if risk.get("reason") == "risk_distance_exceeds_max":
+                    skipped["risk_distance_exceeds_max"] += 1
+                else:
+                    skipped["atr_unavailable"] += 1
                 i += 1
                 continue
             side = 1 if signal["direction"] == "BUY" else -1

@@ -643,6 +643,7 @@ def test_scan_skips_missing_symbol_but_dispatches_for_quoted_symbols(monkeypatch
         "id": 1, "indicator_detail": '{"checks": [], "total_signals": 6}',
         "indicator_value": 2, "chart_path": "chart.png"})())
     monkeypatch.setattr("charts.chart_generator.generate_signal_chart", lambda **kwargs: "chart.png")
+    monkeypatch.setattr("src.scanner.is_market_open", lambda *args, **kwargs: False)
 
     result = scanner.run_scan()
     assert result.complete is False

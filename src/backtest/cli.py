@@ -236,6 +236,7 @@ def run_backtest(start_date: date, end_date: date, symbols: list[str] | None, ou
             "costs": {"fees_bps_per_side": bt_cfg.get("fee_bps_per_side", 5.0),
                       "slippage_bps_per_side": bt_cfg.get("slippage_bps_per_side", 5.0)},
             "trailing_stop_mode": bt_cfg.get("trailing_stop_mode", "none"),
+            "max_risk_distance_pct": bt_cfg.get("max_risk_distance_pct", cfg.get("risk", {}).get("max_risk_distance_pct")),
             "benchmark_filter": {
                 "enabled": market_context_cfg.get("mode") == "benchmark_filter",
                 "mode": market_context_cfg.get("mode", "informational"),

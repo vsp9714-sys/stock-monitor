@@ -39,13 +39,22 @@ def cached_scan(self, stock, frame, provisional=False, current_time=None, is_pow
         )
     return scan_cache[key]
 
-Scanner._scan_stock = cached_scan
+def enable_scan_cache():
+    if Scanner._scan_stock is not cached_scan:
+        Scanner._scan_stock = cached_scan
 
 
 def simulate_5slot_portfolio(trades: list[dict], starting_capital: float = 500_000.0,
                              max_tranche: float = 100_000.0, max_risk: float = 5_000.0,
                              cost_pct: float = 0.0030) -> dict:
-    """Simulate realistic 5-slot cash-constrained portfolio with T+1 slot release and RS tie-breaker."""
+    """
+    Realistic portfolio simulation: ₹5L capital, ₹1L tranche cap, ₹5k risk budget, 0.30% round-trip CNC cost.
+    Enforces:
+    - Strict 5-slot simultaneous cap (slot released when day > prev_exit_date for T+1 CNC settlement).
+    - RS-descending tie-breaker on same-day entry candidates.
+    - Sizing: qty = min(floor(max_risk / (2.0 * atr_at_signal)), floor(min(max_tranche, cash) / entry_price)).
+    - Accounting invariant: ending_capital_inr == starting_capital_inr + sum(trade_pnl_inr).
+    """
     if not trades:
         return {
             "starting_capital_inr": starting_capital,
@@ -59,12 +68,12 @@ def simulate_5slot_portfolio(trades: list[dict], starting_capital: float = 500_0
             "total_signals": 0,
         }
 
-    # Collect all calendar dates between min entry and max exit
-    dates_seen = set()
+    # Group trades by entry_date
     trades_by_entry: dict[str, list[dict]] = {}
+    dates_seen = set()
     for t in trades:
-        ed = t["entry_date"]
-        xd = t["exit_date"]
+        ed = str(t["entry_date"])
+        xd = str(t["exit_date"])
         dates_seen.add(ed)
         dates_seen.add(xd)
         trades_by_entry.setdefault(ed, []).append(t)
@@ -80,22 +89,20 @@ def simulate_5slot_portfolio(trades: list[dict], starting_capital: float = 500_0
         all_calendar_days.append(cur.isoformat())
         cur += timedelta(days=1)
 
-    # Active open positions: list of dicts
-    open_positions: list[dict] = []
-    # Settlement queue: list of (settle_date_str, cash_returned)
-    settlement_queue: list[tuple[str, float]] = []
-
     cash = starting_capital
     peak_equity = starting_capital
     max_dd = 0.0
-    total_net_pnl = 0.0
     trades_taken = 0
     skipped_slots = 0
     skipped_cash = 0
 
-    daily_history = []
+    # open_positions holds trades currently active in slots
+    open_positions: list[dict] = []
+    # settlement_queue holds (settle_date_str, cash_returned)
+    settlement_queue: list[tuple[str, float]] = []
+    taken_trades: list[dict] = []
 
-    for idx, day_str in enumerate(all_calendar_days):
+    for day_str in all_calendar_days:
         # 1. Process settlements due on or before today
         remaining_settlements = []
         for s_date, cash_back in settlement_queue:
@@ -105,14 +112,9 @@ def simulate_5slot_portfolio(trades: list[dict], starting_capital: float = 500_0
                 remaining_settlements.append((s_date, cash_back))
         settlement_queue = remaining_settlements
 
-        # 2. Release open positions that exited strictly before today (T+1 release)
-        remaining_open = []
-        for pos in open_positions:
-            if pos["exit_date"] < day_str:
-                pass  # Slot is now free
-            else:
-                remaining_open.append(pos)
-        open_positions = remaining_open
+        # 2. Identify active slots: trades whose exit_date >= day_str.
+        # Trades with exit_date < day_str have already exited and released their slot.
+        active_slots = [p for p in open_positions if p["exit_date"] >= day_str]
 
         # 3. Process candidate entries triggering on this day
         candidates = trades_by_entry.get(day_str, [])
@@ -120,17 +122,18 @@ def simulate_5slot_portfolio(trades: list[dict], starting_capital: float = 500_0
             # Sort candidates by (-rs_rating, symbol)
             sorted_candidates = sorted(
                 candidates,
-                key=lambda c: (-(c.get("rs_rating_at_signal") or 0), c["symbol"])
+                key=lambda c: (-(c.get("rs_rating_at_signal") or 0), c.get("symbol", ""))
             )
 
             for cand in sorted_candidates:
-                if len(open_positions) >= 5:
+                if len(active_slots) >= 5:
                     skipped_slots += 1
                     continue
 
                 entry_p = float(cand["entry_price"])
+                atr = float(cand.get("atr_at_signal") or 0.0)
                 stop_p = float(cand.get("stop_reference", entry_p * 0.94))
-                risk_dist = abs(entry_p - stop_p)
+                risk_dist = 2.0 * atr if atr > 0 else abs(entry_p - stop_p)
                 if risk_dist <= 0:
                     risk_dist = entry_p * 0.02
 
@@ -139,58 +142,57 @@ def simulate_5slot_portfolio(trades: list[dict], starting_capital: float = 500_0
                 qty = min(qty_risk, qty_tranche)
 
                 notional = qty * entry_p
-                entry_fee = notional * (cost_pct / 2.0)
-                total_entry_cost = notional + entry_fee
-
-                if qty < 1 or total_entry_cost > cash:
+                if qty < 1 or notional > cash:
                     skipped_cash += 1
                     continue
 
-                # Execute entry
-                cash -= total_entry_cost
+                gross_pct = float(cand.get("gross_return_pct", 0.0))
+                # Statutory round-trip charges (cost_pct = 0.0030 -> 0.30%)
+                net_pnl = round(notional * ((gross_pct - (cost_pct * 100.0)) / 100.0), 2)
+
+                cash -= notional
                 trades_taken += 1
 
-                exit_p = float(cand["exit_price"])
-                gross_exit = qty * exit_p
-                exit_fee = gross_exit * (cost_pct / 2.0)
-                net_exit = gross_exit - exit_fee
-                net_pnl = net_exit - total_entry_cost
-
-                # Next calendar day for settlement
-                exit_dt = datetime.fromisoformat(cand["exit_date"]).date()
-                settle_dt = (exit_dt + timedelta(days=1)).isoformat()
-                settlement_queue.append((settle_dt, net_exit))
-
-                open_positions.append({
+                pos_record = {
                     "symbol": cand["symbol"],
                     "entry_date": cand["entry_date"],
                     "exit_date": cand["exit_date"],
                     "qty": qty,
                     "notional": notional,
-                    "entry_price": entry_p,
                     "net_pnl": net_pnl,
-                })
+                }
+                open_positions.append(pos_record)
+                active_slots.append(pos_record)
+                taken_trades.append(pos_record)
 
-        # Calculate current equity: cash + cost basis of open positions + pending settlement cash
-        pending_settle_cash = sum(cb for _, cb in settlement_queue)
-        open_notional = sum(p["notional"] for p in open_positions if p["exit_date"] >= day_str)
-        current_equity = cash + open_notional + pending_settle_cash
+        # 4. Handle end-of-day exits: positions exiting today (exit_date == day_str)
+        # Move them to settlement_queue for T+1 settlement (exit_date + 1 calendar day)
+        still_open = []
+        for pos in open_positions:
+            if pos["exit_date"] == day_str:
+                exit_dt = datetime.fromisoformat(pos["exit_date"]).date()
+                settle_dt = (exit_dt + timedelta(days=1)).isoformat()
+                settlement_queue.append((settle_dt, pos["notional"] + pos["net_pnl"]))
+            elif pos["exit_date"] > day_str:
+                still_open.append(pos)
+        open_positions = still_open
 
+        # 5. Calculate current equity: cash + cost basis of open positions + pending settlement cash
+        current_equity = (
+            cash
+            + sum(p["notional"] for p in open_positions)
+            + sum(cb for _, cb in settlement_queue)
+        )
         peak_equity = max(peak_equity, current_equity)
         dd = (peak_equity - current_equity) / peak_equity * 100.0 if peak_equity > 0 else 0.0
         max_dd = max(max_dd, dd)
 
-        daily_history.append({
-            "date": day_str,
-            "equity": round(current_equity, 2),
-            "cash": round(cash, 2),
-            "open_positions": len(open_positions),
-            "drawdown_pct": round(dd, 2),
-        })
-
-    # Total net PnL from trades taken
-    # At end of backtest, all settlement queues are processed
-    final_equity = cash + sum(cb for _, cb in settlement_queue) + sum(p["notional"] + p["net_pnl"] for p in open_positions)
+    # 6. Final equity after all settlements process
+    final_equity = (
+        cash
+        + sum(cb for _, cb in settlement_queue)
+        + sum(p["notional"] + p["net_pnl"] for p in open_positions)
+    )
     net_pnl = final_equity - starting_capital
     roi_pct = (net_pnl / starting_capital) * 100.0
 
@@ -240,6 +242,7 @@ def compute_monthly_breakdown(trades: list[dict]) -> dict:
 
 
 def run_test(name: str, test_id: str, start_d: date, end_d: date, out_dir: Path, cfg_overrides: dict | None = None) -> dict:
+    enable_scan_cache()
     base_cfg = load_config()
     current_cfg = copy.deepcopy(base_cfg)
     if cfg_overrides:

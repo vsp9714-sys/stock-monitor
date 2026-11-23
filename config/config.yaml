@@ -161,9 +161,9 @@ guardrails:
 # ─── Paper Trading & Alert Validation ─────────────────────────────────────────
 paper_trading:
   enabled: true
-  strategy_version: "v1_baseline"
+  strategy_version: "v2_p3_5_bear_rs50"
   allowed_directions: ["BUY"] # Long-only CNC delivery validation
-  max_hold_days: 35              # Maximum holding duration in trading days
+  max_hold_days: 35              # Maximum holding duration in calendar days (~25 trading sessions)
   cooldown_days: 3               # Minimum days before re-entering same symbol & direction
   round_trip_cost_pct: 0.30      # Statutory NSE CNC charges + slippage deduction
   trailing_stop_mode: "none"     # "none" | "breakeven_1r" | "supertrend"
@@ -240,13 +240,14 @@ risk:
   account_capital_inr: 500000
   risk_percent: 1.0           # ₹5,000 max risk on ₹5,00,000
   max_tranche_inr: 100000     # Hard ₹1,00,000 capital cap per trade
-  max_risk_distance_pct: 6.0
+  max_risk_distance_pct: 8.0
 
 # ─── Offline backtest assumptions ────────────────────────────────────────────
 backtest:
   atr_period: 14
   stop_atr_multiple: 2.0
   target_r_multiple: 1.5
+  max_risk_distance_pct: 8.0
   trailing_stop_mode: "none"  # "none" | "breakeven_1r" | "atr_trail"
   fee_bps_per_side: 5.0
   slippage_bps_per_side: 5.0

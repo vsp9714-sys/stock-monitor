@@ -78,6 +78,7 @@ def test_wick_filter_clv_rejection_and_acceptance():
     scanner.universe_cfg = {"min_price": 10}
     scanner.confluence_cfg = {"mode": "crossover", "min_groups_to_alert": 1, "direction_consensus": True}
     scanner.guardrails_cfg = {
+        "adx_filter": {"enabled": False},
         "wick_filter": {
             "enabled": True,
             "min_clv_buy": 0.70,

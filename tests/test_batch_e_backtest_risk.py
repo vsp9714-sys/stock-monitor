@@ -1,4 +1,5 @@
-from datetime import date
+from datetime import date, datetime
+import pytest
 
 import pandas as pd
 
@@ -140,15 +141,15 @@ def test_risk_reference_tranche_capping_and_risk_distance():
     assert sized["fits_risk_distance_cap"] is True
 
     # When risk distance is wide, e.g. entry 100, ATR 5, stop 1.5 ATR -> distance = 7.5 (risk_dist_pct = 7.5%)
-    # qty_by_risk = floor(5000 / 7.5) = 666 shares -> notional 66,600 INR (< 100,000 INR) -> risk_capped!
+    # Under standardized cap (max_risk_distance_pct=6.0), this setup is rejected as unavailable!
     frame_wide = _bars()
     frame_wide.loc[:, "high"] = 102.5
     frame_wide.loc[:, "low"] = 97.5
     sized_wide = risk_reference(frame_wide, entry_price=100.0, direction="BUY", config=cfg)
-    assert sized_wide["sizing_constraint"] == "risk_capped"
-    assert sized_wide["quantity"] == 666
+    assert sized_wide["status"] == "unavailable"
+    assert sized_wide["reason"] == "risk_distance_exceeds_max"
     assert sized_wide["risk_distance_pct"] == 7.5
-    assert sized_wide["fits_risk_distance_cap"] is False
+    assert sized_wide["max_risk_distance_pct"] == 6.0
 
 
 def test_simulate_period_max_hold_days_and_allowed_directions():
@@ -249,3 +250,247 @@ def test_run_backtest_sets_guardrails_cfg_and_changes_config_hash(monkeypatch, t
     hash2 = rep2["config_hash_sha256"]
 
     assert hash1 != hash2
+
+
+def test_risk_reference_max_risk_distance_cap_variations():
+    """Verify max_risk_distance_pct behavior across None, higher cap, and lower cap."""
+    frame = _bars()
+    # entry 100, ATR 2, stop 2.0 ATR -> distance = 4.0, risk_dist_pct = 4.0%
+    base_cfg = {
+        "enabled": True,
+        "atr_period": 2,
+        "stop_atr_multiple": 2.0,
+        "target_r_multiple": 1.5,
+    }
+
+    # Case 1: max_risk_distance_pct is None (uncapped)
+    res_none = risk_reference(frame, entry_price=100.0, direction="BUY", config=base_cfg)
+    assert res_none["status"] == "available"
+    assert res_none["risk_distance_pct"] == 4.0
+    assert "max_risk_distance_pct" not in res_none
+
+    # Case 2: max_risk_distance_pct is 8.0 (risk_dist_pct 4.0 <= 8.0)
+    res_pass = risk_reference(
+        frame, entry_price=100.0, direction="BUY",
+        config={**base_cfg, "max_risk_distance_pct": 8.0},
+    )
+    assert res_pass["status"] == "available"
+    assert res_pass["risk_distance_pct"] == 4.0
+    assert res_pass["max_risk_distance_pct"] == 8.0
+    assert res_pass["fits_risk_distance_cap"] is True
+
+    # Case 3: max_risk_distance_pct is 3.0 (risk_dist_pct 4.0 > 3.0) -> rejected
+    res_fail = risk_reference(
+        frame, entry_price=100.0, direction="BUY",
+        config={**base_cfg, "max_risk_distance_pct": 3.0},
+    )
+    assert res_fail["status"] == "unavailable"
+    assert res_fail["reason"] == "risk_distance_exceeds_max"
+    assert res_fail["risk_distance_pct"] == 4.0
+    assert res_fail["max_risk_distance_pct"] == 3.0
+
+
+def test_simulate_period_skips_wide_atr_on_risk_distance_cap():
+    """Verify backtest engine skips signals exceeding max_risk_distance_pct and tracks count."""
+    frame = _bars(45)
+
+    def evaluate(_symbol, prefix):
+        if len(prefix) == 30:
+            return {"direction": "BUY"}
+        return None
+
+    # Entry is 100, ATR is 2, stop is 2.0 ATR -> distance 4.0 (4.0% risk distance).
+    # With max_risk_distance_pct = 3.0%, the trade must be skipped.
+    res = simulate_period(
+        {"AAA": frame}, evaluate, start_date=date(2026, 1, 1), end_date=date(2026, 2, 14),
+        config={"backtest": {
+            "atr_period": 2, "stop_atr_multiple": 2.0, "target_r_multiple": 1.5,
+            "max_risk_distance_pct": 3.0, "allowed_directions": ["BUY"],
+        }},
+    )
+    assert len(res["trades"]) == 0
+    assert res["summary"]["skipped"]["risk_distance_exceeds_max"] == 1
+
+
+def test_scanner_suppresses_alerts_on_risk_distance_exceeds_max(monkeypatch):
+    """Verify live Scanner suppresses alerts and creates no paper trade when risk distance exceeds cap."""
+    from src.scanner import Scanner
+    from src.db import Base, create_sqlite_engine, Stock, PaperTrade
+    from sqlalchemy.orm import sessionmaker
+
+    engine = create_sqlite_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    stock = Stock(symbol="WIDE_RISK", company_name="Wide Risk Co", is_active=True, instrument_key="NSE_EQ|WIDE_RISK")
+    session.add(stock)
+    session.commit()
+
+    scanner = object.__new__(Scanner)
+    scanner.cfg = {
+        "upstox": {"quote_batch_size": 100, "max_quote_age_seconds": 999999},
+        "scan": {"min_coverage": 0.0},
+        "universe": {"tradability": {"enabled": False}},
+        "signals": {}, "guardrails": {}, "confluence": {},
+        "paper_trading": {"enabled": True, "strategy_version": "v2_p3_5_bear_rs50"},
+        "risk": {
+            "enabled": True,
+            "atr_period": 14,
+            "stop_atr_multiple": 2.0,
+            "target_r_multiple": 1.5,
+            "max_risk_distance_pct": 5.0,  # Cap at 5.0%
+        },
+    }
+    scanner.paper_trading_cfg = scanner.cfg["paper_trading"]
+    scanner.universe_cfg = scanner.cfg["universe"]
+    scanner.scan_cfg = scanner.cfg["scan"]
+    scanner.signal_cfg = scanner.cfg["signals"]
+    scanner.guardrails_cfg = scanner.cfg["guardrails"]
+    scanner.confluence_cfg = scanner.cfg["confluence"]
+    scanner.notifiers = []
+    scanner.notifiers_cfg = {}
+
+    class FakeFund:
+        def get_fundamentals(self, symbol, isin):
+            return None
+
+    scanner.fundamentals = FakeFund()
+    scanner.cfg["market_context"] = {"enabled": False}
+    scanner.cfg["derivatives"] = {"enabled": False}
+
+    # Candidate with high ATR: entry 100, ATR 5.0 -> 2.0 * ATR = 10.0 (10.0% > 5.0% cap)
+    frame = _bars(40)
+    frame.loc[:, "high"] = 105.0
+    frame.loc[:, "low"] = 95.0
+    frame.loc[:, "close"] = 100.0
+
+    class FakeFetcher:
+        def get_full_market_quotes(self, keys, **kwargs):
+            from datetime import timezone
+            now_ts = int(datetime(2026, 11, 20, 10, 0, tzinfo=timezone.utc).timestamp() * 1000)
+            return {
+                "NSE_EQ|WIDE_RISK": {
+                    "open": 100.0,
+                    "high": 105.0,
+                    "low": 95.0,
+                    "close": 100.0,
+                    "last_price": 100.0,
+                    "prev_close_price": 100.0,
+                    "volume": 10000.0,
+                    "last_trade_time": now_ts,
+                    "ts": now_ts,
+                }
+            }
+
+    scanner.fetcher = FakeFetcher()
+    dispatched_alerts = []
+    scanner._dispatch_alert = lambda payload, db, sig_id: dispatched_alerts.append(payload) or True
+    scanner.get_active_stocks = lambda limit=None: [stock]
+    scanner.required_daily_candles = lambda: 30
+    scanner._load_cached_daily_frames = lambda stocks, db: {"WIDE_RISK": frame}
+
+    # Signal evaluation returns a BUY confluence candidate
+    def fake_scan(stock_arg, df, provisional=False, **kwargs):
+        return {
+            "symbol": stock_arg.symbol,
+            "signal_type": "CONFLUENCE_BUY",
+            "direction": "BUY",
+            "confluence_score": 3,
+            "total_signals": 4,
+            "checks": {},
+        }, df
+
+    scanner._scan_stock = fake_scan
+    monkeypatch.setattr("src.scanner.get_session", lambda: session)
+    monkeypatch.setattr("src.scanner.is_market_open", lambda *args, **kwargs: True)
+
+    from datetime import timezone
+    summary = scanner.run_scan(now=datetime(2026, 11, 20, 10, 0, tzinfo=timezone.utc))
+
+    # Assert candidate was suppressed
+    assert len(dispatched_alerts) == 0
+    assert summary.universe_metadata.get("risk_distance_filtered_count") >= 1
+    # Assert no paper trade was recorded
+    paper_trades = session.query(PaperTrade).filter_by(symbol="WIDE_RISK").all()
+    assert len(paper_trades) == 0
+
+
+def test_portfolio_5l_simulation_math():
+    """Verify 5-slot simulator math: ending_capital == starting_capital + sum(pnl) and losses cannot produce positive ROI."""
+    from scripts.run_h1_and_ytd_verification import simulate_5slot_portfolio
+
+    # 1. Test losing trades set: 2 losing trades
+    losing_trades = [
+        {
+            "symbol": "LOSS1",
+            "entry_date": "2026-02-01",
+            "exit_date": "2026-02-05",
+            "entry_price": 100.0,
+            "exit_price": 95.0,
+            "gross_return_pct": -5.0,
+            "atr_at_signal": 2.5,
+            "rs_rating_at_signal": 70,
+        },
+        {
+            "symbol": "LOSS2",
+            "entry_date": "2026-02-02",
+            "exit_date": "2026-02-06",
+            "entry_price": 200.0,
+            "exit_price": 190.0,
+            "gross_return_pct": -5.0,
+            "atr_at_signal": 5.0,
+            "rs_rating_at_signal": 65,
+        },
+    ]
+    res_loss = simulate_5slot_portfolio(losing_trades, starting_capital=500_000.0)
+    assert res_loss["trades_taken"] == 2
+    assert res_loss["net_pnl_inr"] < 0
+    assert res_loss["roi_pct"] < 0
+    assert res_loss["ending_capital_inr"] < 500_000.0
+    assert res_loss["ending_capital_inr"] == pytest.approx(500_000.0 + res_loss["net_pnl_inr"], rel=1e-5)
+
+    # 2. Test mixed trades set
+    mixed_trades = [
+        {
+            "symbol": "WIN1",
+            "entry_date": "2026-01-05",
+            "exit_date": "2026-01-15",
+            "entry_price": 100.0,
+            "exit_price": 110.0,
+            "gross_return_pct": 10.0,
+            "atr_at_signal": 2.0,
+            "rs_rating_at_signal": 80,
+        },
+        {
+            "symbol": "LOSS3",
+            "entry_date": "2026-01-10",
+            "exit_date": "2026-01-20",
+            "entry_price": 50.0,
+            "exit_price": 48.0,
+            "gross_return_pct": -4.0,
+            "atr_at_signal": 1.0,
+            "rs_rating_at_signal": 75,
+        },
+    ]
+    res_mixed = simulate_5slot_portfolio(mixed_trades, starting_capital=500_000.0)
+    assert res_mixed["ending_capital_inr"] == pytest.approx(500_000.0 + res_mixed["net_pnl_inr"], rel=1e-5)
+
+    # 3. Test 5-slot constraint: 6 simultaneous trades on same day
+    six_trades = [
+        {
+            "symbol": f"STOCK{i}",
+            "entry_date": "2026-03-01",
+            "exit_date": "2026-03-10",
+            "entry_price": 100.0,
+            "exit_price": 105.0,
+            "gross_return_pct": 5.0,
+            "atr_at_signal": 2.0,
+            "rs_rating_at_signal": 50 + i,
+        }
+        for i in range(6)
+    ]
+    res_six = simulate_5slot_portfolio(six_trades, starting_capital=500_000.0)
+    assert res_six["trades_taken"] == 5
+    assert res_six["trades_skipped_slots"] == 1
+    assert res_six["ending_capital_inr"] == pytest.approx(500_000.0 + res_six["net_pnl_inr"], rel=1e-5)

@@ -1752,7 +1752,7 @@ class Scanner:
                         logger.error("Error evaluating candidate for %s: %s", stock.symbol, exc, exc_info=True)
 
             universe_metadata["market_context_filtered_count"] = market_context_filtered
-
+            universe_metadata.setdefault("risk_distance_filtered_count", 0)
             # Sort surviving candidates by (-rs_rating, -confluence_score, symbol)
             surviving_candidates.sort(
                 key=lambda c: (
@@ -1779,6 +1779,17 @@ class Scanner:
                         valid_frames[stock.symbol], entry_price=float(quote["last_price"]),
                         direction=res["direction"], config=self.cfg.get("risk", {}),
                     )
+                    if risk_context.get("reason") == "risk_distance_exceeds_max":
+                        universe_metadata["risk_distance_filtered_count"] = (
+                            universe_metadata.get("risk_distance_filtered_count", 0) + 1
+                        )
+                        logger.info(
+                            "Candidate %s suppressed: risk distance %.2f%% exceeds cap %.2f%%",
+                            stock.symbol,
+                            float(risk_context.get("risk_distance_pct") or 0.0),
+                            float(risk_context.get("max_risk_distance_pct") or 0.0),
+                        )
+                        continue
                     existing = db.query(Signal).filter_by(
                         symbol=stock.symbol, signal_date=today, signal_type=signal_type
                     ).first()
@@ -1925,7 +1936,7 @@ class Scanner:
                     logger.error("Error processing alert for %s: %s", stock.symbol, exc, exc_info=True)
 
             universe_metadata["market_context_filtered_count"] = market_context_filtered
-
+            universe_metadata.setdefault("risk_distance_filtered_count", 0)
             # Monitor open paper trades during every scan cycle
             try:
                 quotes_by_symbol = {

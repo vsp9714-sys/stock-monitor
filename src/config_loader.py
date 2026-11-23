@@ -195,6 +195,14 @@ def validate_candidate_context_config(config: dict[str, Any]) -> None:
                 raise ValueError
         except (TypeError, ValueError) as exc:
             raise ValueError("risk.max_risk_distance_pct must be positive numeric when configured") from exc
+    bt_max_risk_dist = backtest.get("max_risk_distance_pct")
+    if bt_max_risk_dist is not None:
+        try:
+            val = float(bt_max_risk_dist)
+            if not math.isfinite(val) or val <= 0:
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise ValueError("backtest.max_risk_distance_pct must be positive numeric when configured") from exc
 
 
 def validate_guardrails_config(config: dict[str, Any]) -> None:
