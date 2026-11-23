@@ -27,12 +27,13 @@ import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
-from typing import Optional
+import hashlib
+from typing import Optional, Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import numpy as np
-from sqlalchemy import func
+from sqlalchemy import func, text
 
 from src.config_loader import get_config
 from src.db import (
@@ -874,6 +875,7 @@ class Scanner:
         provisional: bool = False,
         current_time: Optional[datetime] = None,
         is_power_hour: bool = False,
+        diagnostic: bool = False,
     ) -> tuple[Optional[dict], pd.DataFrame]:
         """
         Scan a single stock across all indicator checks and evaluate confluence.
@@ -1169,7 +1171,8 @@ class Scanner:
                                 "%s: %s rejected by trend gate (price %.2f, EMA%d %.2f, EMA%d %.2f)",
                                 stock.symbol, consensus_dir, current_price, fast_p, ema_fast, slow_p, ema_slow,
                             )
-                            return None, df
+                            if not diagnostic:
+                                return None, df
 
             # ── RSI Exhaustion Ceiling ──────────────────────────────────
             rsi_ex_cfg = guardrails_cfg.get("rsi_exhaustion", {})
@@ -1209,7 +1212,8 @@ class Scanner:
                                 "%s: %s rejected by RSI exhaustion (RSI %.2f)",
                                 stock.symbol, consensus_dir, val_to_check,
                             )
-                            return None, df
+                            if not diagnostic:
+                                return None, df
 
             # ── Wick Rejection Filter (Close Location Value / CLV) ───────
             wick_cfg = guardrails_cfg.get("wick_filter", {})
@@ -1229,21 +1233,37 @@ class Scanner:
                 (provisional and wick_cfg.get("apply_to_provisional", True)) or
                 (not provisional and wick_cfg.get("apply_to_daily", False))
             )
-            if apply_wick and clv is not None:
+            wick_filter_info = None
+            if clv is not None:
                 min_buy_clv = float(wick_cfg.get("min_clv_buy", 0.70))
                 max_sell_clv = float(wick_cfg.get("max_clv_sell", 0.30))
-                if consensus_dir == "BUY" and clv < min_buy_clv:
-                    logger.debug(
-                        "%s: BUY signal rejected by wick filter (CLV %.2f < %.2f; upper wick rejection)",
-                        stock.symbol, clv, min_buy_clv,
-                    )
-                    return None, df
-                elif consensus_dir == "SELL" and clv > max_sell_clv:
-                    logger.debug(
-                        "%s: SELL signal rejected by wick filter (CLV %.2f > %.2f; lower wick rejection)",
-                        stock.symbol, clv, max_sell_clv,
-                    )
-                    return None, df
+                passed_wick = True
+                if apply_wick:
+                    if consensus_dir == "BUY" and clv < min_buy_clv:
+                        passed_wick = False
+                        logger.debug(
+                            "%s: BUY signal rejected by wick filter (CLV %.2f < %.2f; upper wick rejection)",
+                            stock.symbol, clv, min_buy_clv,
+                        )
+                        if not diagnostic:
+                            return None, df
+                    elif consensus_dir == "SELL" and clv > max_sell_clv:
+                        passed_wick = False
+                        logger.debug(
+                            "%s: SELL signal rejected by wick filter (CLV %.2f > %.2f; lower wick rejection)",
+                            stock.symbol, clv, max_sell_clv,
+                        )
+                        if not diagnostic:
+                            return None, df
+                wick_filter_info = {
+                    "enabled": wick_cfg.get("enabled", True),
+                    "apply_to_daily": wick_cfg.get("apply_to_daily", False),
+                    "apply_to_provisional": wick_cfg.get("apply_to_provisional", True),
+                    "clv": round(clv, 2),
+                    "passed": passed_wick,
+                    "min_clv_buy": min_buy_clv,
+                    "max_clv_sell": max_sell_clv,
+                }
 
             # ── ADX Trend Strength Filter ───────────────────────────────
             adx_cfg = guardrails_cfg.get("adx_filter", {})
@@ -1268,7 +1288,8 @@ class Scanner:
                             stock.symbol, consensus_dir, adx_info.get("adx") or 0.0,
                             float(adx_cfg.get("min_adx", 20.0)), adx_info.get("trend_strength", "weak"),
                         )
-                        return None, df
+                        if not diagnostic:
+                            return None, df
 
             # Determine signal type, tier, and horizon
             if provisional:
@@ -1305,6 +1326,13 @@ class Scanner:
                 "adx": adx_info,
                 "trend_gate": trend_gate_info,
                 "rsi_exhaustion": rsi_exhaustion_info,
+                "wick_filter": wick_filter_info,
+                "passed_stock_guardrails": (
+                    (trend_gate_info is None or trend_gate_info.get("passed", True))
+                    and (rsi_exhaustion_info is None or rsi_exhaustion_info.get("passed", True))
+                    and (wick_filter_info is None or wick_filter_info.get("passed", True))
+                    and (adx_info is None or adx_info.get("passed", True))
+                ),
             }
             return result, df
 
@@ -1319,6 +1347,7 @@ class Scanner:
         provisional: bool = False,
         current_time: Optional[datetime] = None,
         is_power_hour: bool = False,
+        diagnostic: bool = False,
     ) -> tuple[Optional[dict], pd.DataFrame]:
         """Safely call _scan_stock, adapting to legacy or test mocks with fewer parameters."""
         sig = inspect.signature(self._scan_stock)
@@ -1333,6 +1362,8 @@ class Scanner:
             kwargs["current_time"] = current_time
         if has_varkw or "is_power_hour" in param_names:
             kwargs["is_power_hour"] = is_power_hour
+        if has_varkw or "diagnostic" in param_names:
+            kwargs["diagnostic"] = diagnostic
 
         return self._scan_stock(stock, df, **kwargs)
 
@@ -1993,3 +2024,409 @@ class Scanner:
                     logger.error(f"Notifier {type(notifier).__name__} failed for {target}: {e}")
         refresh_signal_notified_state(db, signal_id, destinations)
         return sent_any
+
+    def audit_daily_candidates(
+        self,
+        session_date: Optional[date] = None,
+        completed_frames: Optional[dict[str, pd.DataFrame]] = None,
+        active_stocks: Optional[list[Stock]] = None,
+    ) -> dict[str, Any]:
+        """
+        Deterministic post-market diagnostic evaluation across the entire universe
+        using completed daily candles for session_date. Zero live alerts, zero paper trades.
+        """
+        session_date = session_date or date.today()
+        stocks = list(active_stocks if active_stocks is not None else self.get_active_stocks())
+        db = get_session()
+        try:
+            # 1. Load completed daily frames
+            if completed_frames is not None:
+                valid_frames = {s.symbol: completed_frames[s.symbol].copy() for s in stocks if s.symbol in completed_frames}
+            else:
+                valid_frames = self._load_cached_daily_frames(stocks, db)
+                has_session = any(
+                    not df.empty and pd.to_datetime(df["ts"].iloc[-1]).date() >= session_date
+                    for df in valid_frames.values()
+                )
+                if not has_session and session_date == date.today():
+                    keys = [s.instrument_key for s in stocks if getattr(s, "instrument_key", None)]
+                    try:
+                        raw_quotes = self.fetcher.get_full_market_quotes(keys, allow_missing=True)
+                        for s in stocks:
+                            q = raw_quotes.get(s.instrument_key)
+                            if q and q.get("close") and q.get("high") and q.get("low"):
+                                quote_bar = {
+                                    "ts": pd.Timestamp(session_date),
+                                    "open": float(q.get("open") or q.get("close")),
+                                    "high": float(q["high"]),
+                                    "low": float(q["low"]),
+                                    "close": float(q["close"]),
+                                    "volume": float(q.get("volume") or 0),
+                                }
+                                if s.symbol in valid_frames:
+                                    valid_frames[s.symbol] = pd.concat(
+                                        [valid_frames[s.symbol], pd.DataFrame([quote_bar])],
+                                        ignore_index=True,
+                                    )
+                    except Exception as exc:
+                        logger.warning("Quote fetch during audit fallback failed: %s", exc)
+
+            # Filter each frame to ts <= session_date
+            for sym in list(valid_frames.keys()):
+                df = valid_frames[sym]
+                if not df.empty:
+                    valid_frames[sym] = df.loc[
+                        df["ts"].map(lambda v: _daily_timestamp(v).date() <= session_date)
+                    ].reset_index(drop=True)
+
+            # 2. Universe and Tradability Screening
+            minimum = self.required_daily_candles()
+            universe_cfg = getattr(self, "universe_cfg", {}) or {}
+            tradability_cfg = universe_cfg.get("tradability", {}) or {}
+            tradability_enabled = bool(tradability_cfg.get("enabled", False))
+            sessions = int(tradability_cfg.get("average_traded_value_sessions", 20))
+            min_obs = int(tradability_cfg.get("minimum_observations", sessions))
+            min_val = float(tradability_cfg.get("minimum_average_traded_value_inr", 10_000_000))
+            unknown_policy = tradability_cfg.get("unknown_policy", "exclude")
+
+            tradable_candidates = []
+            liquidity_excluded = {}
+            for stock in stocks:
+                if not tradability_enabled:
+                    tradable_candidates.append(stock)
+                else:
+                    metric = average_traded_value(
+                        valid_frames.get(stock.symbol), sessions=sessions,
+                        minimum_observations=min_obs,
+                    )
+                    if metric.get("status") != "available":
+                        if unknown_policy == "include":
+                            tradable_candidates.append(stock)
+                        else:
+                            liquidity_excluded[stock.symbol] = metric.get("reason", "liquidity_unavailable")
+                    elif metric.get("average_inr", 0) >= min_val:
+                        tradable_candidates.append(stock)
+                    else:
+                        liquidity_excluded[stock.symbol] = "below_average_traded_value_threshold"
+
+            eligible_stocks = [
+                s for s in tradable_candidates
+                if s.symbol in valid_frames and len(valid_frames[s.symbol]) >= minimum
+            ]
+            failed_symbols = [
+                s.symbol for s in stocks
+                if s.symbol not in valid_frames or len(valid_frames[s.symbol]) < minimum
+            ]
+            universe_size = len(stocks)
+            eligible_count = len(tradable_candidates)
+            evaluated_count = len(eligible_stocks)
+            coverage_ratio = evaluated_count / eligible_count if eligible_count else 0.0
+            coverage_percent = round(coverage_ratio * 100, 2)
+            min_coverage = float(self.cfg.get("scan", {}).get("min_coverage", 0.95))
+            coverage_healthy = coverage_ratio >= min_coverage
+
+            # 3. Benchmark Context & Regime Gate
+            benchmark_key = self.cfg.get("market_context", {}).get("benchmark_key", "NSE_INDEX|Nifty 50")
+            benchmark_frame = self._get_market_index_frame(benchmark_key, session_date)
+            m_cfg = self.cfg.get("market_context", {}) or {}
+            b_short = int(m_cfg.get("short_sma_sessions", 20))
+            b_long = int(m_cfg.get("long_sma_sessions", 50))
+            if benchmark_frame is not None and not benchmark_frame.empty:
+                regime_data = regime_for_candles(benchmark_frame, short_window=b_short, long_window=b_long)
+                bench_close = float(regime_data.get("close") or 0.0)
+                bench_sma20 = float(regime_data.get("short_sma") or 0.0)
+                bench_sma50 = float(regime_data.get("long_sma") or 0.0)
+                bench_regime = str(regime_data.get("regime") or "unknown")
+            else:
+                bench_close, bench_sma20, bench_sma50, bench_regime = 0.0, 0.0, 0.0, "unknown"
+
+            allowed_buy_regimes = m_cfg.get("allowed_buy_regimes", ["bullish", "mixed"])
+            allowed_sell_regimes = m_cfg.get("allowed_sell_regimes", ["bearish", "mixed"])
+            buy_regime_allowed = bench_regime in allowed_buy_regimes
+            sell_regime_allowed = bench_regime in allowed_sell_regimes
+
+            # 4. Cross-Sectional RS Ratings
+            guardrails_cfg = getattr(self, "guardrails_cfg", {}) or self.cfg.get("guardrails", {}) or {}
+            rs_filter_cfg = guardrails_cfg.get("rs_filter", {}) or {}
+            rs_ratings = (
+                compute_universe_rs_ratings(
+                    valid_frames,
+                    benchmark_frame,
+                    as_of_date=session_date - timedelta(days=1),
+                    lookback_weights=rs_filter_cfg.get("lookback_weights"),
+                )
+                if (benchmark_frame is not None and not benchmark_frame.empty)
+                else {}
+            )
+
+            # 5. Evaluate Raw Confluence & Per-Guardrail Outlets
+            allowed_directions = list(
+                self.cfg.get("paper_trading", {}).get("allowed_directions", ["BUY"])
+            )
+            raw_candidates = []
+            filter_drop_counts = {
+                "allowed_directions": 0,
+                "trend_gate": 0,
+                "rsi_exhaustion": 0,
+                "wick_filter": 0,
+                "adx_filter": 0,
+                "market_context": 0,
+                "rs_filter": 0,
+                "risk_distance": 0,
+            }
+
+            for stock in eligible_stocks:
+                frame = valid_frames[stock.symbol]
+                res, _ = self._scan_stock(stock, frame, provisional=False, diagnostic=True)
+                if not res or not res.get("direction"):
+                    continue
+
+                direction = res["direction"]
+                score = res["confluence_score"]
+                total_signals = res["total_signals"]
+                checks = res.get("checks", [])
+                triggered_inds = [
+                    c["name"] for c in checks
+                    if c.get("met") and c.get("direction") == direction
+                ]
+                curr_price = float(frame["close"].iloc[-1])
+
+                # 5.1 allowed_directions
+                pass_allowed = direction in allowed_directions
+                if not pass_allowed:
+                    filter_drop_counts["allowed_directions"] += 1
+
+                # 5.2 trend_gate
+                tg_info = res.get("trend_gate") or {"passed": True, "status": "disabled"}
+                pass_trend = tg_info.get("passed", True)
+                if not pass_trend:
+                    filter_drop_counts["trend_gate"] += 1
+
+                # 5.3 rsi_exhaustion
+                rsi_info = res.get("rsi_exhaustion") or {"passed": True, "status": "disabled"}
+                pass_rsi = rsi_info.get("passed", True)
+                if not pass_rsi:
+                    filter_drop_counts["rsi_exhaustion"] += 1
+
+                # 5.4 adx_filter
+                adx_info = res.get("adx") or {"passed": True, "status": "disabled"}
+                pass_adx = adx_info.get("passed", True)
+                adx_val = float(adx_info.get("adx") or 0.0)
+                if not pass_adx:
+                    filter_drop_counts["adx_filter"] += 1
+
+                # 5.5 wick_filter
+                wick_info = res.get("wick_filter") or {"passed": True, "status": "disabled"}
+                pass_wick = wick_info.get("passed", True)
+                clv_val = wick_info.get("clv")
+                if not pass_wick:
+                    filter_drop_counts["wick_filter"] += 1
+
+                # 5.6 market_context
+                mc_mode = m_cfg.get("mode", "informational")
+                if mc_mode == "benchmark_filter":
+                    pass_regime = buy_regime_allowed if direction == "BUY" else sell_regime_allowed
+                else:
+                    pass_regime = True
+                if not pass_regime:
+                    filter_drop_counts["market_context"] += 1
+
+                # 5.7 rs_filter
+                stock_rs = rs_ratings.get(stock.symbol)
+                rs_enabled = rs_filter_cfg.get("enabled", False)
+                min_buy_rs = int(rs_filter_cfg.get("min_rs_rating_buy", 50))
+                max_sell_rs = int(rs_filter_cfg.get("max_rs_rating_sell", 50))
+                pass_rs = True
+                if rs_enabled:
+                    if direction == "BUY":
+                        pass_rs = (stock_rs is not None and stock_rs >= min_buy_rs)
+                    else:
+                        pass_rs = (stock_rs is not None and stock_rs <= max_sell_rs)
+                if not pass_rs:
+                    filter_drop_counts["rs_filter"] += 1
+
+                # 5.8 risk_reference
+                risk_cfg = self.cfg.get("risk", {}) or {}
+                max_risk_dist = float(risk_cfg.get("max_risk_distance_pct", 8.0))
+                risk_ctx = risk_reference(frame, entry_price=curr_price, direction=direction, config=risk_cfg)
+                pass_risk = (risk_ctx.get("reason") != "risk_distance_exceeds_max")
+                risk_dist_pct = float(risk_ctx.get("risk_distance_pct") or 0.0)
+                if not pass_risk:
+                    filter_drop_counts["risk_distance"] += 1
+
+                # Final determination
+                final_passed = (
+                    pass_allowed and pass_trend and pass_rsi and pass_adx
+                    and pass_wick and pass_regime and pass_rs and pass_risk
+                )
+
+                # Format detailed diagnostic string
+                failed_checks = []
+                if not pass_allowed:
+                    failed_checks.append(f"Direction {direction} not in allowed_directions {allowed_directions}")
+                if not pass_trend:
+                    failed_checks.append(
+                        f"Trend Gate (Price ₹{curr_price:.1f} vs EMA50 ₹{tg_info.get('ema_fast', 0):.1f} vs EMA200 ₹{tg_info.get('ema_slow', 0):.1f})"
+                    )
+                if not pass_rsi:
+                    failed_checks.append(f"RSI Exhaustion ({rsi_info.get('rsi', 0):.1f})")
+                if not pass_adx:
+                    failed_checks.append(f"ADX Filter (ADX {adx_val:.1f} < {adx_info.get('min_adx', 20.0)} or DI misaligned)")
+                if not pass_wick:
+                    failed_checks.append(f"Wick Filter (CLV {clv_val})")
+                if not pass_regime:
+                    failed_checks.append(f"Benchmark Regime Gate (Nifty is {bench_regime})")
+                if not pass_rs:
+                    failed_checks.append(f"RS Filter (RS {stock_rs} {'<' if direction == 'BUY' else '>'} {min_buy_rs if direction == 'BUY' else max_sell_rs})")
+                if not pass_risk:
+                    failed_checks.append(f"Risk Distance ({risk_dist_pct:.1f}% > {max_risk_dist:.1f}%)")
+
+                if final_passed:
+                    diag_text = (
+                        f"✅ PASSED / DISPATCHED: Stop ₹{risk_ctx.get('stop_loss', 0):.2f} | "
+                        f"Target ₹{risk_ctx.get('target_price', 0):.2f} | "
+                        f"Qty {risk_ctx.get('quantity', 0)} (₹{risk_ctx.get('actual_risk_inr', 0):,.0f} Risk)"
+                    )
+                else:
+                    diag_text = "❌ REJECTED: " + "; ".join(failed_checks)
+
+                raw_candidates.append({
+                    "symbol": stock.symbol,
+                    "company_name": stock.company_name or stock.symbol,
+                    "direction": direction,
+                    "confluence_score": score,
+                    "total_signals": total_signals,
+                    "triggered_indicators": triggered_inds,
+                    "close": curr_price,
+                    "adx_14": adx_val,
+                    "rs_rating": stock_rs,
+                    "risk_distance_pct": risk_dist_pct,
+                    "final_status": "✅ PASSED / DISPATCHED" if final_passed else "❌ REJECTED",
+                    "final_passed": final_passed,
+                    "failed_checks": failed_checks,
+                    "diagnostic_details": diag_text,
+                    "guardrails": {
+                        "allowed_directions": {"passed": pass_allowed, "configured": allowed_directions, "value": direction},
+                        "trend_gate": {"passed": pass_trend, "info": tg_info},
+                        "rsi_exhaustion": {"passed": pass_rsi, "info": rsi_info},
+                        "adx_filter": {"passed": pass_adx, "info": adx_info},
+                        "wick_filter": {"passed": pass_wick, "info": wick_info},
+                        "market_context": {"passed": pass_regime, "regime": bench_regime, "close": bench_close, "sma_20": bench_sma20, "sma_50": bench_sma50},
+                        "rs_filter": {"passed": pass_rs, "rs_rating": stock_rs, "min_buy": min_buy_rs, "max_sell": max_sell_rs},
+                        "risk_reference": {"passed": pass_risk, "risk_distance_pct": risk_dist_pct, "max_cap": max_risk_dist, "risk_ctx": risk_ctx},
+                    },
+                })
+
+            # Sort BUY candidates by rs_rating descending
+            buy_candidates = sorted(
+                [c for c in raw_candidates if c["direction"] == "BUY"],
+                key=lambda x: (-(x["rs_rating"] if x["rs_rating"] is not None else -1), -x["confluence_score"], x["symbol"]),
+            )
+            sell_candidates = sorted(
+                [c for c in raw_candidates if c["direction"] == "SELL"],
+                key=lambda x: (-(x["rs_rating"] if x["rs_rating"] is not None else -1), -x["confluence_score"], x["symbol"]),
+            )
+
+            # 6. Database Live Executions & Integrity Check
+            signals_db = [
+                {
+                    "symbol": s.symbol,
+                    "signal_type": s.signal_type,
+                    "direction": s.direction,
+                    "price": s.price,
+                    "confluence_score": int(s.indicator_value or 0),
+                    "created_at": s.created_at.isoformat() if s.created_at else None,
+                }
+                for s in db.query(Signal).filter_by(signal_date=session_date).all()
+            ]
+            paper_trades_db = [
+                {
+                    "symbol": pt.symbol,
+                    "direction": pt.direction,
+                    "entry_price": pt.entry_price,
+                    "alert_type": pt.alert_type,
+                    "alert_tier": pt.alert_tier,
+                    "status": pt.status,
+                    "confluence_score": pt.confluence_score,
+                    "rs_rating_at_entry": pt.rs_rating_at_entry,
+                }
+                for pt in db.query(PaperTrade).filter_by(entry_date=session_date).all()
+            ]
+            open_paper_trades = [
+                {
+                    "symbol": pt.symbol,
+                    "direction": pt.direction,
+                    "entry_date": pt.entry_date.isoformat(),
+                    "entry_price": pt.entry_price,
+                    "alert_type": pt.alert_type,
+                }
+                for pt in db.query(PaperTrade).filter_by(status="open").all()
+            ]
+            sqlite_integrity = str(db.execute(text("PRAGMA quick_check")).scalar() or "ok")
+
+            # 7. Ablation States Comparison
+            pre_phase_3a_passed = []
+            for c in raw_candidates:
+                g = c["guardrails"]
+                # In Pre-Phase-3A: stop_atr_multiple was 1.5 (vs 2.0 in Phase 3A), max_risk_distance_pct was 6.0%
+                pre_3a_dist = c["risk_distance_pct"] * (1.5 / 2.0)
+                if (
+                    g["trend_gate"]["passed"]
+                    and g["rsi_exhaustion"]["passed"]
+                    and g["wick_filter"]["passed"]
+                    and g["adx_filter"]["passed"]
+                    and pre_3a_dist <= 6.0
+                ):
+                    pre_phase_3a_passed.append(c["symbol"])
+
+            locked_prod_passed = [c["symbol"] for c in raw_candidates if c["final_passed"]]
+
+            ablation = {
+                "raw_confluence_count": len(raw_candidates),
+                "pre_phase_3a_count": len(pre_phase_3a_passed),
+                "pre_phase_3a_symbols": sorted(pre_phase_3a_passed),
+                "locked_prod_count": len(locked_prod_passed),
+                "locked_prod_symbols": sorted(locked_prod_passed),
+            }
+
+            # 8. Strategy Config Hash
+            strategy_cfg = {
+                key: self.cfg.get(key)
+                for key in ("signals", "confluence", "guardrails", "backtest", "risk", "market_context")
+            }
+            config_hash = hashlib.sha256(json.dumps(strategy_cfg, sort_keys=True, default=str).encode()).hexdigest()
+
+            return {
+                "session_date": session_date.isoformat(),
+                "strategy_version": str(self.cfg.get("paper_trading", {}).get("strategy_version", "v2_p3_5_bear_rs50")),
+                "config_hash_sha256": config_hash,
+                "universe_size": universe_size,
+                "eligible_count": eligible_count,
+                "evaluated_count": evaluated_count,
+                "coverage_ratio": coverage_ratio,
+                "coverage_percent": coverage_percent,
+                "coverage_healthy": coverage_healthy,
+                "failed_symbols": failed_symbols,
+                "market_context": {
+                    "benchmark_key": benchmark_key,
+                    "benchmark_close": bench_close,
+                    "sma_20": bench_sma20,
+                    "sma_50": bench_sma50,
+                    "regime": bench_regime,
+                    "allowed_buy_regimes": allowed_buy_regimes,
+                    "allowed_sell_regimes": allowed_sell_regimes,
+                    "buy_allowed": buy_regime_allowed,
+                    "sell_allowed": sell_regime_allowed,
+                },
+                "raw_candidates": raw_candidates,
+                "buy_candidates": buy_candidates,
+                "sell_candidates": sell_candidates,
+                "filter_drop_counts": filter_drop_counts,
+                "dispatched_signals_db": signals_db,
+                "paper_trades_db": paper_trades_db,
+                "open_paper_trades": open_paper_trades,
+                "sqlite_integrity": sqlite_integrity,
+                "ablation": ablation,
+            }
+        finally:
+            db.close()

@@ -185,6 +185,27 @@ def generate_weekly_report_job() -> None:
         logger.error(f"Weekly paper trading report job failed: {e}", exc_info=True)
 
 
+def run_daily_audit_job() -> None:
+    """Scheduled post-market job (16:05 IST): generate daily guardrail audit report & Telegram digest."""
+    now_ist = datetime.now(IST).date()
+    cfg = get_config()
+    try:
+        from src.market_calendar import is_trading_day
+        if not is_trading_day(now_ist, cfg.get("market", {})):
+            logger.info("Non-trading day (%s) — skipping scheduled daily audit report.", now_ist)
+            return
+    except Exception as exc:
+        logger.warning("Could not check market calendar for daily audit: %s", exc)
+
+    logger.info("Generating scheduled post-market daily scan & guardrail audit report for %s...", now_ist)
+    try:
+        from src.daily_audit_report import generate_daily_audit_report
+        result = generate_daily_audit_report(session_date=now_ist, scanner=scanner, send_telegram=True)
+        logger.info("Daily audit report job completed: %s", result)
+    except Exception as e:
+        logger.error(f"Daily audit report job failed: {e}", exc_info=True)
+
+
 def refresh_daily_cache_job() -> None:
     """Probe provider readiness and refresh the latest completed session before market open."""
     if not _daily_refresh_lock.acquire(blocking=False):
@@ -267,6 +288,13 @@ def main() -> None:
         else:
             schedule.every().saturday.at(rep_time, "Asia/Kolkata").do(generate_weekly_report_job)
         logger.info(f"Weekly paper trading report scheduled: every {rep_day} at {rep_time} IST.")
+
+    # Daily post-market scan & guardrail audit report (16:05 IST on trading days)
+    audit_cfg = cfg.get("daily_audit", {}) or {}
+    if audit_cfg.get("enabled", True):
+        audit_time = str(audit_cfg.get("schedule_time", "16:05"))
+        schedule.every().day.at(audit_time, "Asia/Kolkata").do(run_daily_audit_job)
+        logger.info(f"Daily post-market audit report scheduled: every trading day at {audit_time} IST.")
 
     # Prepare instruments and configured membership before the market opens.
     schedule.every().day.at("08:15", "Asia/Kolkata").do(refresh_instruments_job)

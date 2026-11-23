@@ -173,6 +173,13 @@ paper_trading:
   weekly_report_day: "saturday"  # Day of week for weekly performance report
   weekly_report_time: "09:00"    # Time of day (Asia/Kolkata)
 
+# ─── Daily Audit & Post-Market Report ─────────────────────────────────────────
+daily_audit:
+  enabled: true
+  send_telegram_summary: true
+  report_dir: "reports/daily_audits"
+  schedule_time: "16:05"
+
 # ─── Stock Universe ──────────────────────────────────────────────────────────
 universe:
   # Modes: all_nse (legacy/default), nifty500, custom, composed
